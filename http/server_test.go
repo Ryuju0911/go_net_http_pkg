@@ -15,6 +15,16 @@ type testHandler struct {
 
 func (h *testHandler) ServeHTTP(w ResponseWriter, r *Request) {}
 
+func TestHandleFunc(t *testing.T) {
+	pattern := "/test"
+	handler := func(w ResponseWriter, r *Request) {}
+
+	HandleFunc(pattern, handler)
+	if _, ok := DefaultServeMux.m[pattern]; !ok {
+		t.Errorf("The specified URL: %s is not registered.", pattern)
+	}
+}
+
 func TestListenAndServe(t *testing.T) {
 	addr := "localhost:80"
 	handler := new(testHandler)
