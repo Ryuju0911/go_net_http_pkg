@@ -6,7 +6,10 @@
 
 package http
 
-import "sync"
+import (
+	"go_net"
+	"sync"
+)
 
 // A Handler responds to an HTTP request.
 type Handler interface {
@@ -100,9 +103,38 @@ type Server struct {
 	Handler Handler // handler to invoke, http.DefaultServeMux if nil
 }
 
-func ListenAndServe(addr string, handler Handler) *Server {
-	server := &Server{Addr: addr, Handler: handler}
+// ListenAndServe listens on the TCP network address srv.Addr and then
+// calls Serve to handle requests on incoming connections.
+// Accepted connections are configured to enable TCP keep-alives.
+//
+// If srv.Addr is blank, ":http" is used.
+//
+// ListenAndServe always returns a non-nil error. After Shutdown or Close,
+// the returned error is ErrServerClosed.
+func (srv *Server) ListenAndServe() error {
+	// if srv.shuttingDown() {
+	// 	return ErrServerClosed
+	// }
+	addr := srv.Addr
+	if addr == "" {
+		addr = ":http"
+	}
+	_, err := go_net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	// TODO: Implement Server.Serve and call it here.
+	return nil
+}
 
-	//TODO: Implement Server.ListenAndServe and call it here.
-	return server
+// ListenAndServe listens on the TCP network address addr and then calls
+// Serve with handler to handle requests on incoming connections.
+// Accepted connections are configured to enable TCP keep-alives.
+//
+// The handler is typically nil, in which case the DefaultServeMux is used.
+//
+// ListenAndServe always returns a non-nil error.
+func ListenAndServe(addr string, handler Handler) error {
+	server := &Server{Addr: addr, Handler: handler}
+	return server.ListenAndServe()
 }

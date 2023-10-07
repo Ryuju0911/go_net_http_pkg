@@ -29,8 +29,8 @@ func TestListenAndServe(t *testing.T) {
 	addr := "localhost:80"
 	handler := new(testHandler)
 
-	server := ListenAndServe(addr, handler)
-	if server == nil {
-		t.Fatal("failed in creating Server")
+	err := ListenAndServe(addr, handler)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
