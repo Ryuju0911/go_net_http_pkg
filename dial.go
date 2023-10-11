@@ -17,9 +17,27 @@ type ListenConfig struct {
 }
 
 func (lc *ListenConfig) Listen(ctx context.Context, network, address string) (Listener, error) {
-	// TODO: Implement logic.
+	// TODO: Implement Resolver.resolveAddrList and call it here.
+
+	sl := &sysListener{
+		ListenConfig: *lc,
+		network:      network,
+		address:      address,
+	}
 	var l Listener
+	la := &TCPAddr{}
+	l, err := sl.listenTCP(ctx, la)
+	if err != nil {
+		return nil, err
+	}
+
 	return l, nil
+}
+
+// sysListener contains a Listen's parameters and configuration.
+type sysListener struct {
+	ListenConfig
+	network, address string
 }
 
 func Listen(network, address string) (Listener, error) {
