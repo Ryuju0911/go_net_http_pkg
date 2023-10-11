@@ -6,7 +6,6 @@ package go_net
 
 import (
 	"context"
-	"os"
 	"syscall"
 )
 
@@ -18,7 +17,6 @@ func internetSocket(
 	proto int,
 	mode string,
 	ctrlCtxFn func(context.Context, string, string, syscall.RawConn) error,
-) (fd *os.File, err error) {
-	var res *os.File
-	return res, nil
+) (fd *netFD, err error) {
+	return socket(ctx, net, syscall.AF_INET, sotype, proto, false, laddr, raddr, nil)
 }

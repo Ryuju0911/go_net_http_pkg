@@ -4,8 +4,6 @@
 
 package go_net
 
-import "os"
-
 // TCPAddr represents the address of a TCP end point.
 type TCPAddr struct {
 	IP   IP
@@ -16,7 +14,6 @@ type TCPAddr struct {
 // TCPListener is a TCP network listener. Clients should typically
 // use variables of type Listener instead of assuming TCP.
 type TCPListener struct {
-	// fd *netFD
-	fd *os.File
+	fd *netFD
 	lc ListenConfig
 }
