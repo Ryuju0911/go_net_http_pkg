@@ -5,13 +5,13 @@
 // This file implements sysSocket for platforms that do not provide a fast path
 // for setting SetNonblock and CloseOnExec.
 
-package go_net
+//go:build aix || darwin
 
-import "syscall"
+package go_net
 
 // Wrapper around the socket system call that marks the returned file
 // descriptor as nonblocking and close-on-exec.
 func sysSocket(family, sotype, proto int) (int, error) {
-	s, err := syscall.Socket(family, sotype, proto)
+	s, err := socketFunc(family, sotype, proto)
 	return s, err
 }
