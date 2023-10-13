@@ -8,6 +8,7 @@ package net
 
 import (
 	"context"
+	"go_net/internal/poll"
 	"syscall"
 )
 
@@ -25,8 +26,12 @@ func socket(
 	if err != nil {
 		return nil, err
 	}
+	if err = setDefaultSockopts(s, family, sotype, ipv6only); err != nil {
+		poll.CloseFunc(s)
+		return nil, err
+	}
 	if fd, err = newFD(s, family, sotype, net); err != nil {
-		// poll.CloseFunc(s)
+		poll.CloseFunc(s)
 		return nil, err
 	}
 
