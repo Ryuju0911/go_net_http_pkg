@@ -10,6 +10,7 @@
 package net
 
 import (
+	"go_net/internal/poll"
 	"os"
 	"syscall"
 )
@@ -28,7 +29,7 @@ func sysSocket(family, sotype, proto int) (int, error) {
 		return -1, os.NewSyscallError("socket", err)
 	}
 	if err = syscall.SetNonblock(s, true); err != nil {
-		// poll.CloseFunc(s)
+		poll.CloseFunc(s)
 		return -1, os.NewSyscallError("setnonblock", err)
 	}
 	return s, nil
