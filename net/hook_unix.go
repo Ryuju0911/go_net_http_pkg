@@ -4,7 +4,7 @@
 
 //go:build unix || (js && wasm)
 
-package go_net
+package net
 
 import "syscall"
 

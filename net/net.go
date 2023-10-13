@@ -6,7 +6,7 @@
 //
 // Multiple goroutines may invoke methods on a Listener simultaneously.
 
-package go_net
+package net
 
 type Listener interface {
 }

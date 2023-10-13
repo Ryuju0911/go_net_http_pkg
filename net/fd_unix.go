@@ -4,7 +4,7 @@
 
 //go:build unix
 
-package go_net
+package net
 
 func newFD(sysfd, family, sotype int, net string) (*netFD, error) {
 	ret := &netFD{

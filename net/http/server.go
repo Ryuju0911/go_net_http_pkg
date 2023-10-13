@@ -7,7 +7,7 @@
 package http
 
 import (
-	"go_net"
+	net "go_net/net"
 	"sync"
 )
 
@@ -119,7 +119,7 @@ func (srv *Server) ListenAndServe() error {
 	if addr == "" {
 		addr = ":http"
 	}
-	_, err := go_net.Listen("tcp", addr)
+	_, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}

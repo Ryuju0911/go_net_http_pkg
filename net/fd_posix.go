@@ -1,4 +1,4 @@
-package go_net
+package net
 
 // Network file descriptor.
 type netFD struct {

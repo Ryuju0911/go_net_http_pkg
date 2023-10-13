@@ -4,7 +4,7 @@
 
 //go:build unix || windows
 
-package go_net
+package net
 
 import (
 	"context"

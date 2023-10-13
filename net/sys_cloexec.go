@@ -7,11 +7,29 @@
 
 //go:build aix || darwin
 
-package go_net
+package net
+
+import (
+	"os"
+	"syscall"
+)
 
 // Wrapper around the socket system call that marks the returned file
 // descriptor as nonblocking and close-on-exec.
 func sysSocket(family, sotype, proto int) (int, error) {
+	// See ../syscall/exec_unix.go for description of ForkLock.
+	syscall.ForkLock.RLock()
 	s, err := socketFunc(family, sotype, proto)
-	return s, err
+	if err == nil {
+		syscall.CloseOnExec(s)
+	}
+	syscall.ForkLock.RUnlock()
+	if err != nil {
+		return -1, os.NewSyscallError("socket", err)
+	}
+	if err = syscall.SetNonblock(s, true); err != nil {
+		// poll.CloseFunc(s)
+		return -1, os.NewSyscallError("setnonblock", err)
+	}
+	return s, nil
 }
