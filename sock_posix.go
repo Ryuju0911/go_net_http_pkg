@@ -16,12 +16,9 @@ import (
 func socket(
 	ctx context.Context,
 	net string,
-	family,
-	sotype,
-	proto int,
+	family, sotype, proto int,
 	ipv6only bool,
-	laddr,
-	raddr sockaddr,
+	laddr, raddr sockaddr,
 	ctrlCtxFn func(context.Context, string, string, syscall.RawConn) error,
 ) (fd *netFD, err error) {
 	s, err := sysSocket(family, sotype, proto)

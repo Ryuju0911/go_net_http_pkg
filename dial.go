@@ -6,12 +6,6 @@ package go_net
 
 import "context"
 
-// A Listener is a generic network listener for stream-oriented protocols.
-//
-// Multiple goroutines may invoke methods on a Listener simultaneously.
-type Listener interface {
-}
-
 // ListenConfig contains options for listening to an address.
 type ListenConfig struct {
 }
@@ -25,7 +19,13 @@ func (lc *ListenConfig) Listen(ctx context.Context, network, address string) (Li
 		address:      address,
 	}
 	var l Listener
-	la := &TCPAddr{}
+
+	// Temporarily hard coded.
+	la := &TCPAddr{
+		IP:   IP{},
+		Port: 8080,
+	}
+
 	l, err := sl.listenTCP(ctx, la)
 	if err != nil {
 		return nil, err
