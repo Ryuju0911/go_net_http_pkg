@@ -6,13 +6,18 @@
 
 package net
 
+import (
+	"go_net/internal/poll"
+	"syscall"
+)
+
 func newFD(sysfd, family, sotype int, net string) (*netFD, error) {
 	ret := &netFD{
-		// pfd: poll.FD{
-		// 	Sysfd:         sysfd,
-		// 	IsStream:      sotype == syscall.SOCK_STREAM,
-		// 	ZeroReadIsEOF: sotype != syscall.SOCK_DGRAM && sotype != syscall.SOCK_RAW,
-		// },
+		pfd: poll.FD{
+			Sysfd:         sysfd,
+			IsStream:      sotype == syscall.SOCK_STREAM,
+			ZeroReadIsEOF: sotype != syscall.SOCK_DGRAM && sotype != syscall.SOCK_RAW,
+		},
 		family: family,
 		sotype: sotype,
 		net:    net,

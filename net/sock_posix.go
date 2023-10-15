@@ -35,5 +35,27 @@ func socket(
 		return nil, err
 	}
 
+	if laddr != nil && raddr == nil {
+		switch sotype {
+		case syscall.SOCK_STREAM:
+			if err := fd.listenStream(ctx, laddr, listenerBacklog(), ctrlCtxFn); err != nil {
+				// fd.Close()
+				return nil, err
+			}
+			return fd, nil
+		}
+		// TODO: Implement the cases when syscall.SOCK_SEQPACKET or syscall.SOCK_DGRAM.
+	}
+	// TODO: Implement netFD.dial and call it here.
 	return fd, nil
+}
+
+func (fd *netFD) listenStream(
+	ctx context.Context,
+	laddr sockaddr,
+	backlog int,
+	ctrlCtxFn func(context.Context, string, string, syscall.RawConn) error,
+) error {
+	var err error
+	return err
 }

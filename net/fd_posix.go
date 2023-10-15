@@ -1,8 +1,10 @@
 package net
 
+import "go_net/internal/poll"
+
 // Network file descriptor.
 type netFD struct {
-	// pfd poll.FD
+	pfd poll.FD
 
 	// immutable until Close
 	family int
