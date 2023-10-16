@@ -21,3 +21,19 @@ func listenerBacklog() int {
 
 type Listener interface {
 }
+
+type AddrError struct {
+	Err  string
+	Addr string
+}
+
+func (e *AddrError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	s := e.Err
+	if e.Addr != "" {
+		s = "address " + e.Addr + ": " + s
+	}
+	return s
+}
