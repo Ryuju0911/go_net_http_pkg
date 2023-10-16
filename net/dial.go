@@ -24,6 +24,7 @@ func (lc *ListenConfig) Listen(ctx context.Context, network, address string) (Li
 	la := &TCPAddr{
 		IP:   IP{},
 		Port: 8080,
+		Zone: "",
 	}
 
 	l, err := sl.listenTCP(ctx, la)

@@ -8,7 +8,7 @@ package net
 type TCPAddr struct {
 	IP   IP
 	Port int
-	// Zone string // IPv6 scoped addressing zone
+	Zone string // IPv6 scoped addressing zone
 }
 
 // TCPListener is a TCP network listener. Clients should typically

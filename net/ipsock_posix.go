@@ -27,3 +27,20 @@ func internetSocket(
 	family, ipv6only := syscall.AF_INET6, false
 	return socket(ctx, net, family, sotype, proto, ipv6only, laddr, raddr, nil)
 }
+
+func ipToSockaddrInet6(ip IP, port int, zone string) (syscall.SockaddrInet6, error) {
+	// TODO: Implement logic
+	return syscall.SockaddrInet6{}, nil
+}
+
+func ipToSockaddr(family int, ip IP, port int, zone string) (syscall.Sockaddr, error) {
+	switch family {
+	case syscall.AF_INET6:
+		sa, err := ipToSockaddrInet6(ip, port, zone)
+		if err != nil {
+			return nil, err
+		}
+		return &sa, nil
+	}
+	return nil, nil
+}
