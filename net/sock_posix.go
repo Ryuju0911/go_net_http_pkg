@@ -9,6 +9,7 @@ package net
 import (
 	"context"
 	"go_net/internal/poll"
+	"os"
 	"syscall"
 )
 
@@ -57,5 +58,34 @@ func (fd *netFD) listenStream(
 	ctrlCtxFn func(context.Context, string, string, syscall.RawConn) error,
 ) error {
 	var err error
-	return err
+	if err = setDefaultListenerSockopts(fd.pfd.Sysfd); err != nil {
+		return err
+	}
+	var lsa syscall.Sockaddr
+	if lsa, err = laddr.sockaddr(fd.family); err != nil {
+		return err
+	}
+
+	// if ctrlCtxFn != nil {
+	// 	c, err := newRawConn(fd)
+	// 	if err != nil {
+	// 		return err
+	// 	}
+	// 	if err := ctrlCtxFn(ctx, fd.ctrlNetwork(), laddr.String(), c); err != nil {
+	// 		return err
+	// 	}
+	// }
+
+	if err = syscall.Bind(fd.pfd.Sysfd, lsa); err != nil {
+		return os.NewSyscallError("bind", err)
+	}
+	if err = listenFunc(fd.pfd.Sysfd, backlog); err != nil {
+		return os.NewSyscallError("listen", err)
+	}
+	if err = fd.init(); err != nil {
+		return err
+	}
+	// lsa, _ = syscall.Getsockname(fd.pfd.Sysfd)
+	// fd.setAddr(fd.addrFunc()(lsa), nil)
+	return nil
 }

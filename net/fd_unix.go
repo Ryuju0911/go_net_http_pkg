@@ -24,3 +24,7 @@ func newFD(sysfd, family, sotype int, net string) (*netFD, error) {
 	}
 	return ret, nil
 }
+
+func (fd *netFD) init() error {
+	return fd.pfd.Init(fd.net, true)
+}

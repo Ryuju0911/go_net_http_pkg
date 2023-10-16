@@ -15,6 +15,6 @@ var (
 	// Placeholders for socket system calls.
 	socketFunc func(int, int, int) (int, error) = syscall.Socket
 	// connectFunc       func(int, syscall.Sockaddr) error = syscall.Connect
-	// listenFunc        func(int, int) error              = syscall.Listen
+	listenFunc func(int, int) error = syscall.Listen
 	// getsockoptIntFunc func(int, int, int) (int, error)  = syscall.GetsockoptInt
 )
