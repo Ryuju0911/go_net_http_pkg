@@ -30,6 +30,10 @@ func internetSocket(
 
 func ipToSockaddrInet6(ip IP, port int, zone string) (syscall.SockaddrInet6, error) {
 	// TODO: Implement logic
+	if len(ip) == 0 {
+		ip = IPv6zero
+	}
+
 	ip6 := ip.To16()
 	if ip6 == nil {
 		// TODO: Implement ip.String and call it here.

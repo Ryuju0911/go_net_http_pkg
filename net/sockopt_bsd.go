@@ -14,5 +14,5 @@ func setDefaultSockopts(s, family, sotype int, ipv6only bool) error {
 
 func setDefaultListenerSockopts(s int) error {
 	// Allow reuse of recently-used addresses.
-	return os.NewSyscallError("setsockopt", syscall.SetsockoptInt(s, syscall.SOCK_STREAM, syscall.SO_REUSEADDR, 1))
+	return os.NewSyscallError("setsockopt", syscall.SetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1))
 }

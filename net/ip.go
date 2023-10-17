@@ -35,6 +35,11 @@ func IPv4(a, b, c, d byte) IP {
 
 var v4InV6Prefix = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff}
 
+// Well-known IPv6 addresses
+var (
+	IPv6zero = IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+)
+
 func (ip IP) To16() IP {
 	if len(ip) == IPv4len {
 		return IPv4(ip[0], ip[1], ip[2], ip[3])
