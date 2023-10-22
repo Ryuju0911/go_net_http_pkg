@@ -23,6 +23,9 @@ func listenerBacklog() int {
 //
 // Multiple goroutines may invoke methods on a Listener simultaneously.
 type Listener interface {
+	// Close closes the listener.
+	// Any blocked Accept operations will be unblocked and return errors.
+	Close() error
 }
 
 type AddrError struct {

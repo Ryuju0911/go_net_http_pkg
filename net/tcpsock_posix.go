@@ -24,6 +24,14 @@ func (a *TCPAddr) sockaddr(family int) (syscall.Sockaddr, error) {
 	return ipToSockaddr(family, a.IP, a.Port, a.Zone)
 }
 
+func (ln *TCPListener) ok() bool {
+	return ln != nil && ln.fd != nil
+}
+
+func (ln *TCPListener) close() error {
+	return ln.fd.Close()
+}
+
 func (sl *sysListener) listenTCP(ctx context.Context, laddr *TCPAddr) (*TCPListener, error) {
 	// TODO: Implement logic (create a context and sockets).
 	fd, err := internetSocket(ctx, sl.network, laddr, nil, syscall.SOCK_STREAM, 0, "listen", nil)

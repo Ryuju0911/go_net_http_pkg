@@ -4,6 +4,8 @@
 
 package net
 
+import "syscall"
+
 // TCPAddr represents the address of a TCP end point.
 type TCPAddr struct {
 	IP   IP
@@ -16,4 +18,14 @@ type TCPAddr struct {
 type TCPListener struct {
 	fd *netFD
 	lc ListenConfig
+}
+
+func (l *TCPListener) Close() error {
+	if !l.ok() {
+		return syscall.EINVAL
+	}
+	if err := l.close(); err != nil {
+		return err
+	}
+	return nil
 }
