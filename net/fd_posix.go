@@ -1,6 +1,9 @@
 package net
 
-import "go_net/internal/poll"
+import (
+	"internal/poll"
+	"runtime"
+)
 
 // Network file descriptor.
 type netFD struct {
@@ -10,7 +13,19 @@ type netFD struct {
 	family int
 	sotype int
 	// isConnected bool // handshake completed or use of association with peer
-	net string
-	// laddr       Addr
-	// raddr       Addr
+	net   string
+	laddr Addr
+	raddr Addr
+}
+
+func (fd *netFD) setAddr(laddr, raddr Addr) {
+	fd.laddr = laddr
+	fd.raddr = raddr
+	runtime.SetFinalizer(fd, (*netFD).Close)
+}
+
+func (fd *netFD) Close() error {
+	runtime.SetFinalizer(fd, nil)
+	// return fd.pfd.Close()
+	return nil
 }

@@ -7,7 +7,7 @@
 package http
 
 import (
-	net "go_net/net"
+	"net"
 	"sync"
 )
 

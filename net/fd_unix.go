@@ -2,12 +2,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build unix
-
 package net
 
 import (
-	"go_net/internal/poll"
+	"internal/poll"
 	"syscall"
 )
 

@@ -2,11 +2,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// A Listener is a generic network listener for stream-oriented protocols.
-//
-// Multiple goroutines may invoke methods on a Listener simultaneously.
-
 package net
+
+// Addr represents a network end point address.
+type Addr interface {
+}
 
 // listenerBackLog returns the length of the listen queue, which represents
 // the queue to which pending connections are joined.
@@ -19,6 +19,9 @@ func listenerBacklog() int {
 	return 128
 }
 
+// A Listener is a generic network listener for stream-oriented protocols.
+//
+// Multiple goroutines may invoke methods on a Listener simultaneously.
 type Listener interface {
 }
 
