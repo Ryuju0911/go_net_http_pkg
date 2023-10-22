@@ -9,6 +9,14 @@ import (
 	"syscall"
 )
 
+func sockaddrToTCP(sa syscall.Sockaddr) Addr {
+	switch sa := sa.(type) {
+	case *syscall.SockaddrInet6:
+		return &TCPAddr{IP: sa.Addr[0:], Port: sa.Port}
+	}
+	return nil
+}
+
 func (a *TCPAddr) sockaddr(family int) (syscall.Sockaddr, error) {
 	if a == nil {
 		return nil, nil

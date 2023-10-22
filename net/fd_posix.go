@@ -26,6 +26,5 @@ func (fd *netFD) setAddr(laddr, raddr Addr) {
 
 func (fd *netFD) Close() error {
 	runtime.SetFinalizer(fd, nil)
-	// return fd.pfd.Close()
-	return nil
+	return fd.pfd.Close()
 }

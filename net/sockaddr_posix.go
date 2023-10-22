@@ -16,3 +16,14 @@ type sockaddr interface {
 	// nil.
 	sockaddr(family int) (syscall.Sockaddr, error)
 }
+
+func (fd *netFD) addrFunc() func(syscall.Sockaddr) Addr {
+	switch fd.family {
+	case syscall.AF_INET, syscall.AF_INET6:
+		switch fd.sotype {
+		case syscall.SOCK_STREAM:
+			return sockaddrToTCP
+		}
+	}
+	return func(syscall.Sockaddr) Addr { return nil }
+}

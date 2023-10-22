@@ -38,14 +38,15 @@ func socket(
 		switch sotype {
 		case syscall.SOCK_STREAM:
 			if err := fd.listenStream(ctx, laddr, listenerBacklog(), ctrlCtxFn); err != nil {
-				// fd.Close()
+				fd.Close()
 				return nil, err
 			}
 			return fd, nil
 		}
 		// TODO: Implement the cases when syscall.SOCK_SEQPACKET or syscall.SOCK_DGRAM.
 	}
-	// TODO: Implement netFD.dial and call it here.
+
+	// TODO: Implement fd.dial and call it here.
 	return fd, nil
 }
 
@@ -83,7 +84,7 @@ func (fd *netFD) listenStream(
 	if err = fd.init(); err != nil {
 		return err
 	}
-	// lsa, _ = syscall.Getsockname(fd.pfd.Sysfd)
-	// fd.setAddr(fd.addrFunc()(lsa), nil)
+	lsa, _ = syscall.Getsockname(fd.pfd.Sysfd)
+	fd.setAddr(fd.addrFunc()(lsa), nil)
 	return nil
 }
