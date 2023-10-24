@@ -8,6 +8,16 @@ package net
 type Addr interface {
 }
 
+// Conn is a generic stream-oriented network connection.
+//
+// Multiple goroutines may invoke methods on a Conn simultaneously.
+type Conn interface {
+}
+
+type conn struct {
+	fd *netFD
+}
+
 // listenerBackLog returns the length of the listen queue, which represents
 // the queue to which pending connections are joined.
 // If the length limit of this queue is small, the server will reject requests
@@ -23,6 +33,9 @@ func listenerBacklog() int {
 //
 // Multiple goroutines may invoke methods on a Listener simultaneously.
 type Listener interface {
+	// Accept waits for and returns the next connection to the listener.
+	Accept() (Conn, error)
+
 	// Close closes the listener.
 	// Any blocked Accept operations will be unblocked and return errors.
 	Close() error

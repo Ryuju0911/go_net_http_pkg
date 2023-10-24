@@ -4,13 +4,26 @@
 
 package net
 
-import "syscall"
+import (
+	"syscall"
+	"time"
+)
 
 // TCPAddr represents the address of a TCP end point.
 type TCPAddr struct {
 	IP   IP
 	Port int
 	Zone string // IPv6 scoped addressing zone
+}
+
+// TCPConn is an implementation of the Conn interface for TCP network
+// connections.
+type TCPConn struct {
+	conn
+}
+
+func newTCPConn(fd *netFD, keepalive time.Duration, keepAliveHook func(time.Duration)) *TCPConn {
+	return &TCPConn{conn{fd}}
 }
 
 // TCPListener is a TCP network listener. Clients should typically
@@ -20,6 +33,21 @@ type TCPListener struct {
 	lc ListenConfig
 }
 
+// Accept implements the Accept method in the Listener interface; it
+// waits for the next call and returns a generic Conn.
+func (l *TCPListener) Accept() (Conn, error) {
+	if !l.ok() {
+		return nil, syscall.EINVAL
+	}
+	c, err := l.accept()
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// Close stops listening on the TCP address.
+// Already Accepted connections are not closed.
 func (l *TCPListener) Close() error {
 	if !l.ok() {
 		return syscall.EINVAL

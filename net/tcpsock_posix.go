@@ -28,6 +28,14 @@ func (ln *TCPListener) ok() bool {
 	return ln != nil && ln.fd != nil
 }
 
+func (ln *TCPListener) accept() (*TCPConn, error) {
+	fd, err := ln.fd.accept()
+	if err != nil {
+		return nil, err
+	}
+	return newTCPConn(fd, ln.lc.KeepAlive, nil), nil
+}
+
 func (ln *TCPListener) close() error {
 	return ln.fd.Close()
 }

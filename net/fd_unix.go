@@ -26,3 +26,24 @@ func newFD(sysfd, family, sotype int, net string) (*netFD, error) {
 func (fd *netFD) init() error {
 	return fd.pfd.Init(fd.net, true)
 }
+
+func (fd *netFD) accept() (netfd *netFD, err error) {
+	d, rsa, _, err := fd.pfd.Accept()
+	if err != nil {
+		// if errcall != "" {
+		// 	err = wrapSyscallError(errcall, err)
+		// }
+		return nil, err
+	}
+
+	if netfd, err = newFD(d, fd.family, fd.sotype, fd.net); err != nil {
+		poll.CloseFunc(d)
+		return nil, err
+	}
+	if err = netfd.init(); err != nil {
+		return nil, err
+	}
+	lsa, _ := syscall.Getsockname(netfd.pfd.Sysfd)
+	netfd.setAddr(netfd.addrFunc()(lsa), netfd.addrFunc()(rsa))
+	return netfd, nil
+}

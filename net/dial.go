@@ -4,10 +4,20 @@
 
 package net
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // ListenConfig contains options for listening to an address.
 type ListenConfig struct {
+	// KeepAlive specifies the keep-alive period for network
+	// connections accepted by this listener.
+	// If zero, keep-alives are enabled if supported by the protocol
+	// and operating system. Network protocols or operating systems
+	// that do not support keep-alives ignore this field.
+	// If negative, keep-alives are disabled.
+	KeepAlive time.Duration
 }
 
 func (lc *ListenConfig) Listen(ctx context.Context, network, address string) (Listener, error) {

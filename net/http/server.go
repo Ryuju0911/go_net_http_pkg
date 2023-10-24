@@ -7,6 +7,7 @@
 package http
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"net"
@@ -23,6 +24,14 @@ type Handler interface {
 // construct an HTTP response.
 type ResponseWriter interface {
 }
+
+var (
+	// ServerContextKey is a context key. It can be used in HTTP
+	// handlers with Context.Value to access the server that
+	// started the handler. The associated value will be of
+	// type *Server.
+	ServerContextKey = &contextKey{"http-server"}
+)
 
 // The HandlerFunc type is an adapter to allow the use of
 // ordinary functions as HTTP handlers. If f is a function
@@ -130,11 +139,22 @@ type Server struct {
 	// zero, there is no timeout.
 	IdleTimeout time.Duration
 
+	// BaseContext optionally specifies a function that returns
+	// the base context for incoming requests on this server.
+	// The provided Listener is the specific Listener that's
+	// about to start accepting requests.
+	// If BaseContext is nil, the default is context.Background().
+	// If non-nil, it must return a non-nil context.
+	BaseContext func(net.Listener) context.Context
+
 	nextProtoOnce sync.Once // guards setupHTTP2_* init
 	nextProtoErr  error     // result of http2.ConfigureServer if used
 
 	mu         sync.Mutex
+	listeners  map[*net.Listener]struct{}
 	onShutdown []func()
+
+	listenerGroup sync.WaitGroup
 }
 
 // RegisterOnShutdown registers a function to call on Shutdown.
@@ -187,7 +207,7 @@ var ErrServerClosed = errors.New("http: Server closed")
 // Serve always returns a non-nil error and closes l.
 // After Shutdown or Close, the returned error is ErrServerClosed.
 func (srv *Server) Serve(l net.Listener) error {
-	// origListener := l
+	origListener := l
 	l = &onceCloseListener{Listener: l}
 	defer l.Close()
 
@@ -198,11 +218,37 @@ func (srv *Server) Serve(l net.Listener) error {
 	if !srv.trackListener(&l, true) {
 		return ErrServerClosed
 	}
+
+	baseCtx := context.Background()
+	if srv.BaseContext != nil {
+		baseCtx = srv.BaseContext(origListener)
+		if baseCtx == nil {
+			panic("BaseContext returened a nil context")
+		}
+	}
+
+	var tempDelay time.Duration // how long to sleep on accept failuer
+
+	ctx := context.WithValue(baseCtx, ServerContextKey, srv)
+	for {
+		rw, err := l.Accept()
+	}
 	return nil
 }
 
 func (s *Server) trackListener(ln *net.Listener, add bool) bool {
-	// TODO: Implement the logic.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listeners == nil {
+		s.listeners = make(map[*net.Listener]struct{})
+	}
+	if add {
+		// if s.shuttingDown() {
+		// 	return false
+		// }
+		s.listeners[ln] = struct{}{}
+		s.listenerGroup.Add(1)
+	}
 	return true
 }
 
