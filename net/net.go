@@ -4,6 +4,8 @@
 
 package net
 
+import "syscall"
+
 // Addr represents a network end point address.
 type Addr interface {
 }
@@ -12,10 +14,37 @@ type Addr interface {
 //
 // Multiple goroutines may invoke methods on a Conn simultaneously.
 type Conn interface {
+	// Write writes data to the connection.
+	// Write can be made to time out and return an error after a fixed
+	// time limit; see SetDeadline and SetWriteDeadline.
+	Write(b []byte) (n int, err error)
+
+	// LocalAddr returns the local network address, if known.
+	LocalAddr() Addr
 }
 
 type conn struct {
 	fd *netFD
+}
+
+func (c *conn) ok() bool { return c != nil && c.fd != nil }
+
+func (c *conn) Write(b []byte) (int, error) {
+	if !c.ok() {
+		return 0, syscall.EINVAL
+	}
+	n, err := c.fd.Write(b)
+	// if err != nil {
+	// 	err = &OpError{Op: "write", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
+	// }
+	return n, err
+}
+
+func (c *conn) LocalAddr() Addr {
+	if !c.ok() {
+		return nil
+	}
+	return c.fd.laddr
 }
 
 // listenerBackLog returns the length of the listen queue, which represents

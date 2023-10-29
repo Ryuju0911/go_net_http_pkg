@@ -28,3 +28,9 @@ func (fd *netFD) Close() error {
 	runtime.SetFinalizer(fd, nil)
 	return fd.pfd.Close()
 }
+
+func (fd *netFD) Write(p []byte) (nn int, err error) {
+	nn, err = fd.pfd.Write(p)
+	runtime.KeepAlive(fd)
+	return nn, wrapSyscallError(writeSyscallName, err)
+}

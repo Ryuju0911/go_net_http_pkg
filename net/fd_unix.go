@@ -9,6 +9,15 @@ import (
 	"syscall"
 )
 
+const (
+	readSyscallName     = "read"
+	readFromSyscallName = "recvfrom"
+	readMsgSyscallName  = "recvmsg"
+	writeSyscallName    = "write"
+	writeToSyscallName  = "sendto"
+	writeMsgSyscallName = "sendmsg"
+)
+
 func newFD(sysfd, family, sotype int, net string) (*netFD, error) {
 	ret := &netFD{
 		pfd: poll.FD{
