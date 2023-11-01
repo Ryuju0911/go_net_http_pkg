@@ -2,6 +2,7 @@ package http
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net/textproto"
@@ -76,6 +77,22 @@ type Request struct {
 	// for the Request.Write method.
 	Header Header
 
+	// Body is the request's body.
+	//
+	// For client requests, a nil body means the request has no
+	// body, such as a GET request. The HTTP Client's Transport
+	// is responsible for calling the Close method.
+	//
+	// For server requests, the Request Body is always non-nil
+	// but will return EOF immediately when no body is present.
+	// The Server will close the request body. The ServeHTTP
+	// Handler does not need to.
+	//
+	// Body must allow Read to be called concurrently with Close.
+	// In particular, calling Close should unblock a Read waiting
+	// for input.
+	Body io.ReadCloser
+
 	// For server requests, Host specifies the host on which the
 	// URL is sought. For HTTP/1 (per RFC 7230, section 5.4), this
 	// is either the value of the "Host" header or the host name
@@ -102,6 +119,12 @@ type Request struct {
 	// to a server. Usually the URL field should be used instead.
 	// It is an error to set this field in an HTTP client request.
 	RequestURI string
+
+	// ctx is either the client or server context. It should only
+	// be modified via copying the whole Request using Clone or WithContext.
+	// It is unexported to prevent people from using Context wrong
+	// and mutating the contexts held by callers of the same request.
+	ctx context.Context
 }
 
 // ParseHTTPVersion parses an HTTP version string according to RFC 7230, section 2.6.

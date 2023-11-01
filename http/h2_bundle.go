@@ -239,13 +239,13 @@ func http2ConfigureServer(s *Server, conf *http2Server) error {
 		conf = new(http2Server)
 	}
 	conf.state = &http2serverInternalState{activeConns: make(map[*http2serverConn]struct{})}
-	if h1, h2 := s, conf; h2.IdleTimeout == 0 {
-		if h1.IdleTimeout != 0 {
-			h2.IdleTimeout = h1.IdleTimeout
-		} else {
-			h2.IdleTimeout = h1.ReadTimeout
-		}
-	}
+	// if h1, h2 := s, conf; h2.IdleTimeout == 0 {
+	// 	if h1.IdleTimeout != 0 {
+	// 		h2.IdleTimeout = h1.IdleTimeout
+	// 	} else {
+	// 		h2.IdleTimeout = h1.ReadTimeout
+	// 	}
+	// }
 	s.RegisterOnShutdown(conf.state.startGracefulShutdown)
 
 	// if s.TLSConfig == nil {

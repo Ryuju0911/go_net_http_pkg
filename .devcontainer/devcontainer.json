@@ -8,7 +8,7 @@
 		"ghcr.io/devcontainers/features/go:1": {}
 	},
 	"privileged": true,
-	"workspaceMount": "source=${localWorkspaceFolder}/net,target=/usr/local/go/src/net,type=bind",
+	"workspaceMount": "source=${localWorkspaceFolder},target=/usr/local/go/src/net,type=bind",
 	"workspaceFolder": "/usr/local/go/src/net"
 	
 	// Features to add to the dev container. More info: https://containers.dev/features.
