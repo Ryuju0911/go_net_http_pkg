@@ -13,8 +13,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/url"
-	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -82,7 +80,7 @@ type conn struct {
 	// on this connection, if any.
 	lastMethod string
 
-	curReq atomic.Pointer[response] // (which has a Request in it)
+	// curReq atomic.Pointer[response] // (which has a Request in it)
 
 	// curState atomic.Uint64 // packed (unixtime<<8|uint8(ConnState))
 
@@ -150,11 +148,11 @@ func (cw *chunkWriter) Write(p []byte) (n int, err error) {
 
 // A response represents the server side of an HTTP response.
 type response struct {
-	conn      *conn
-	req       *Request // request for this response
-	reqBody   io.ReadCloser
-	cancelCtx context.CancelFunc // when ServeHTTP exits
-	// wroteHeader      bool               // a non-1xx header has been (logically) written
+	conn        *conn
+	req         *Request // request for this response
+	reqBody     io.ReadCloser
+	cancelCtx   context.CancelFunc // when ServeHTTP exits
+	wroteHeader bool               // a non-1xx header has been (logically) written
 	// wroteContinue    bool               // 100 Continue response was written
 	// wants10KeepAlive bool               // HTTP/1.0 w/ Connection "keep-alive"
 	// wantsClose       bool               // HTTP request has Connection "close"
@@ -208,7 +206,7 @@ type response struct {
 	// // written.
 	// trailers []string
 
-	// handlerDone atomic.Bool // set true when the handler exits
+	handlerDone atomic.Bool // set true when the handler exits
 
 	// // Buffers for Date, Content-Length, and status code
 	// dateBuf   [len(TimeFormat)]byte
@@ -244,8 +242,12 @@ type connReader struct {
 	// cond   *sync.Cond
 	// inRead bool
 	// aborted bool  // set true before conn.rwc deadline is set to past
-	// remain int64 // bytes remaining
+	remain int64 // bytes remaining
 }
+
+func (cr *connReader) setReadLimit(remain int64) { cr.remain = remain }
+func (cr *connReader) setInfiniteReadLimit()     { cr.remain = maxInt64 }
+func (cr *connReader) hitReadLimit() bool        { return cr.remain <= 0 }
 
 func (cr *connReader) Read(p []byte) (n int, err error) {
 	// TODO: Implement logic
@@ -291,8 +293,11 @@ func newBufioWriterSize(w io.Writer, size int) *bufio.Writer {
 	return bufio.NewWriterSize(w, size)
 }
 
+var errTooLarge = errors.New("http: request too large")
+
 // Read next request from connection.
 func (c *conn) readRequst(ctx context.Context) (w *response, err error) {
+	c.r.setInfiniteReadLimit() // Instead of setReadLimit(c.server.initialReadLimitSize())
 	// if c.lastMethod == "POST" {
 	// 	// RFC 7230 section 3 tolerance for old buggy clients.
 	// 	peek, _ := c.bufr.Peek(4) // ReadRequst will get err below
@@ -300,34 +305,14 @@ func (c *conn) readRequst(ctx context.Context) (w *response, err error) {
 	// }
 	req, err := readRequest(c.bufr)
 	if err != nil {
-		// if c.r.hitReadLimit() {
-		// 	return nil, errTooLarge
-		// }
+		if c.r.hitReadLimit() {
+			return nil, errTooLarge
+		}
 		return nil, err
 	}
 
 	c.lastMethod = req.Method
-	// c.r.setInfiniteReadLimit()
-
-	// hosts, haveHost := req.Header["Host"]
-	// isH2Upgrade := req.isH2Upgrade()
-	// if req.ProtoAtLeast(1, 1) && (!haveHost || len(hosts) == 0) && !isH2Upgrade && req.Method != "CONNECT" {
-	// 	return nil, badRequestError("missing required Host header")
-	// }
-	// if len(hosts) == 1 && !httpguts.ValidHostHeader(hosts[0]) {
-	// 	return nil, badRequestError("malformed Host header")
-	// }
-	// for k, vv := range req.Header {
-	// 	if !httpguts.ValidHeaderFieldName(k) {
-	// 		return nil, badRequestError("invalid header name")
-	// 	}
-	// 	for _, v := range vv {
-	// 		if !httpguts.ValidHeaderFieldValue(v) {
-	// 			return nil, badRequestError("invalid header value")
-	// 		}
-	// 	}
-	// }
-	// delete(req.Header, "Host")
+	c.r.setInfiniteReadLimit()
 
 	ctx, cancelCtx := context.WithCancel(ctx)
 	req.ctx = ctx
@@ -335,11 +320,6 @@ func (c *conn) readRequst(ctx context.Context) (w *response, err error) {
 	// req.TLS = c.tlsState
 	// if body, ok := req.Body.(*body); ok {
 	// 	body.doEarlyClose = true
-	// }
-
-	// // Adjust the read deadline if necessary.
-	// if !hdrDeadline.Equal(wholeReqDeadline) {
-	// 	c.rwc.SetReadDeadline(wholeReqDeadline)
 	// }
 
 	w = &response{
@@ -365,16 +345,8 @@ func (c *conn) readRequst(ctx context.Context) (w *response, err error) {
 	return w, nil
 }
 
-// maxPostHandlerReadBytes is the max number of Request.Body bytes not
-// consumed by a handler that the server will read from the client
-// in order to keep a connection alive. If there are more bytes than
-// this then the server to be paranoid instead sends a "Connection:
-// close" response.
-//
-// This number is approximately what a typical machine's TCP buffer
-// size is anyway.  (if we have the bytes on the machine, we might as
-// well read them)
-const maxPostHandlerReadBytes = 256 << 10
+func (w *response) finishRequest() {
+}
 
 // Serve a new connection.
 func (c *conn) serve(ctx context.Context) {
@@ -408,21 +380,6 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 
-		// Expect 100 Continue support
-		// req := w.req
-		// if req.expectsContinue() {
-		// 	if req.ProtoAtLeast(1, 1) && req.ContentLength != 0 {
-		// 		// Wrap the Body reader with one that replies on the connection
-		// 		req.Body = &expectContinueReader{readCloser: req.Body, resp: w}
-		// 		w.canWriteContinue.Store(true)
-		// 	}
-		// } else if req.Header.get("Expect") != "" {
-		// 	w.sendExpectationFailed()
-		// 	return
-		// }
-
-		c.curReq.Store(w)
-
 		// if requestBodyRemains(req.Body) {
 		// 	registerOnHitEOF(req.Body, w.conn.r.startBackgroundRead)
 		// } else {
@@ -431,6 +388,9 @@ func (c *conn) serve(ctx context.Context) {
 
 		// inFlightResponse = w
 		serverHandler{c.server}.ServeHTTP(w, w.req)
+		w.cancelCtx()
+		w.finishRequest()
+		return
 	}
 }
 
@@ -449,10 +409,8 @@ func (f HandlerFunc) ServeHTTP(w ResponseWriter, r *Request) {
 // patterns and calls the handler for the pattern that
 // most closely matches the URL.
 type ServeMux struct {
-	mu    sync.RWMutex
-	tree  routingNode
-	index routingNode
-	m     map[string]muxEntry
+	mu sync.RWMutex
+	m  map[string]muxEntry
 	// es    []muxEntry // slice of entries sorted from longest to shortest.
 	// hosts bool       // whether any patterns contain hostnames
 }
@@ -467,41 +425,15 @@ var DefaultServeMux = &defaultServeMux
 
 var defaultServeMux ServeMux
 
-// stripHostPort returns h without any trailing ":<port>".
-func stripHostPort(h string) string {
-	// If no port on host, return unchanged
-	if !strings.Contains(h, ":") {
-		return h
-	}
-	host := strings.Split(h, ":")[0]
-	return host
-}
+func (mux *ServeMux) Handler(r *Request) (h Handler, pattern string) {
+	path := r.URL.Path
 
-func (mux *ServeMux) findHandler(r *Request) (h Handler, patStr string, _ *pattern, matches []string) {
-	var n *routingNode
-	host := r.URL.Host
-	escapedPath := r.URL.EscapedPath()
-	path := escapedPath
-
-	// All other requests have any port stripped and path cleaned
-	// before passing to mux.handler.
-	host = stripHostPort(r.Host)
-	// path = cleanPath(path)
-
-	var u *url.URL
-	n, matches, u = mux.matchOrRedirect(host, r.Method, path, r.URL)
-}
-
-func (mux *ServeMux) matchOrRedirect(host, method, path string, u *url.URL) (_ *routingNode, mathces []string, redirectTo url.URL) {
-	mux.mu.RLock()
-	defer mux.mu.RUnlock()
-
-	n.matches := mux.tree.match(host, method, path)
+	mux_entry := mux.m[path]
+	return mux_entry.h, mux_entry.pattern
 }
 
 func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
-	var h Handler
-	h, _, r.pat, r.matches = mux.findHandler(r)
+	h, _ := mux.Handler(r)
 	h.ServeHTTP(w, r)
 }
 
@@ -783,17 +715,6 @@ func (w checkConnErrorWriter) Write(p []byte) (n int, err error) {
 	if err != nil && w.c.werr == nil {
 		w.c.werr = err
 		w.c.cancelCtx()
-	}
-	return
-}
-
-func numLeadingCRorLF(v []byte) (n int) {
-	for _, b := range v {
-		if b == '\r' || b == '\n' {
-			n++
-			continue
-		}
-		break
 	}
 	return
 }

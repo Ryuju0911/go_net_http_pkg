@@ -8,6 +8,10 @@ import (
 	"golang.org/x/net/http/httpguts"
 )
 
+// maxInt64 is the effective "infinite" value for the Server and
+// Transport's byte-limiting readers.
+const maxInt64 = 1<<63 - 1
+
 // contextKey is a value for use with context.WithValue. It's used as
 // a pointer so it fits in an interface{} without allocation.
 type contextKey struct {
