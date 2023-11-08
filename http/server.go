@@ -25,6 +25,7 @@ type Handler interface {
 // A ResponseWriter interface is used by an HTTP handler to
 // construct an HTTP response.
 type ResponseWriter interface {
+	Write([]byte) (int, error)
 }
 
 var (
@@ -80,7 +81,7 @@ type conn struct {
 	// on this connection, if any.
 	lastMethod string
 
-	// curReq atomic.Pointer[response] // (which has a Request in it)
+	curReq atomic.Pointer[response] // (which has a Request in it)
 
 	// curState atomic.Uint64 // packed (unixtime<<8|uint8(ConnState))
 
@@ -108,16 +109,16 @@ type chunkWriter struct {
 	// at the time of res.writeHeader, if res.writeHeader is
 	// called and extra buffering is being done to calculate
 	// Content-Type and/or Content-Length.
-	header Header
+	// header Header
 
 	// wroteHeader tells whether the header's been written to "the
 	// wire" (or rather: w.conn.buf). this is unlike
 	// (*response).wroteHeader, which tells only whether it was
 	// logically written.
-	wroteHeader bool
+	// wroteHeader bool
 
 	// set by the writeHeader method:
-	chunking bool // using chunked transfer encoding for reply body
+	// chunking bool // using chunked transfer encoding for reply body
 }
 
 func (cw *chunkWriter) Write(p []byte) (n int, err error) {
@@ -179,7 +180,7 @@ type response struct {
 
 	// written       int64 // number of bytes written in body
 	contentLength int64 // explicitly-declared Content-Length; or -1
-	// status        int   // status code passed to WriteHeader
+	status        int   // status code passed to WriteHeader
 
 	// // close connection after this reply.  set on request and
 	// // updated after response from handler if there's a
@@ -206,7 +207,7 @@ type response struct {
 	// // written.
 	// trailers []string
 
-	handlerDone atomic.Bool // set true when the handler exits
+	// handlerDone atomic.Bool // set true when the handler exits
 
 	// // Buffers for Date, Content-Length, and status code
 	// dateBuf   [len(TimeFormat)]byte
@@ -216,8 +217,8 @@ type response struct {
 	// closeNotifyCh is the channel returned by CloseNotify.
 	// TODO(bradfitz): this is currently (for Go 1.8) always
 	// non-nil. Make this lazily-created again as it used to be?
-	closeNotifyCh chan bool
-	// didCloseNotify atomic.Bool // atomic (only false->true winner should send)
+	closeNotifyCh  chan bool
+	didCloseNotify atomic.Bool // atomic (only false->true winner should send)
 }
 
 func (srv *Server) newConn(rwc net.Conn) *conn {
@@ -236,22 +237,87 @@ func (srv *Server) newConn(rwc net.Conn) *conn {
 type connReader struct {
 	conn *conn
 
-	// mu sync.Mutex // guards following
-	// hasByte bool
-	// byteBuf [1]byte
-	// cond   *sync.Cond
-	// inRead bool
+	mu      sync.Mutex // guards following
+	hasByte bool
+	byteBuf [1]byte
+	cond    *sync.Cond
+	inRead  bool
 	// aborted bool  // set true before conn.rwc deadline is set to past
 	remain int64 // bytes remaining
 }
+
+func (cr *connReader) lock() {
+	cr.mu.Lock()
+	if cr.cond == nil {
+		cr.cond = sync.NewCond(&cr.mu)
+	}
+}
+
+func (cr *connReader) unlock() { cr.mu.Unlock() }
 
 func (cr *connReader) setReadLimit(remain int64) { cr.remain = remain }
 func (cr *connReader) setInfiniteReadLimit()     { cr.remain = maxInt64 }
 func (cr *connReader) hitReadLimit() bool        { return cr.remain <= 0 }
 
+// handleReadError is called whenever a Read from the client returns a
+// non-nil error.
+//
+// The provided non-nil err is almost always io.EOF or a "use of
+// closed network connection". In any case, the error is not
+// particularly interesting, except perhaps for debugging during
+// development. Any error means the connection is dead and we should
+// down its context.
+//
+// It may be called from multiple goroutines.
+func (cr *connReader) handleReadError(_ error) {
+	cr.conn.cancelCtx()
+	cr.closeNotify()
+}
+
+func (cr *connReader) closeNotify() {
+	res := cr.conn.curReq.Load()
+	if res != nil && res.didCloseNotify.Swap(true) {
+		res.closeNotifyCh <- true
+	}
+}
+
 func (cr *connReader) Read(p []byte) (n int, err error) {
-	// TODO: Implement logic
-	return len(p), nil
+	cr.lock()
+	if cr.inRead {
+		cr.unlock()
+		panic("invalid concurrent Body.Read call")
+	}
+	if cr.hitReadLimit() {
+		cr.unlock()
+		return 0, io.EOF
+	}
+	if len(p) == 0 {
+		cr.unlock()
+		return 0, nil
+	}
+	if int64(len(p)) > cr.remain {
+		p = p[:cr.remain]
+	}
+	if cr.hasByte {
+		p[0] = cr.byteBuf[0]
+		cr.hasByte = false
+		cr.unlock()
+		return 1, nil
+	}
+	cr.inRead = true
+	cr.unlock()
+	n, err = cr.conn.rwc.Read(p)
+
+	cr.lock()
+	cr.inRead = false
+	if err != nil {
+		cr.handleReadError(err)
+	}
+	cr.remain -= int64(n)
+	cr.unlock()
+
+	cr.cond.Broadcast()
+	return n, err
 }
 
 var (
@@ -345,7 +411,38 @@ func (c *conn) readRequst(ctx context.Context) (w *response, err error) {
 	return w, nil
 }
 
-func (w *response) finishRequest() {
+func (w *response) WriteHeader(code int) {
+	// TODO: Handle the case when 100 <= code <= 199.
+
+	w.wroteHeader = true
+	w.status = code
+}
+
+func (w *response) Write(data []byte) (n int, err error) {
+	return w.write(len(data), data, "")
+}
+
+// either dataB or dataS is non-zero.
+func (w *response) write(lenData int, dataB []byte, dataS string) (n int, err error) {
+	if !w.wroteHeader {
+		w.WriteHeader(StatusOK)
+	}
+	if lenData == 0 {
+		return 0, nil
+	}
+	// if !w.bodyAllowed() {
+	// 	return 0, ErrBodyNotAllowed
+	// }
+
+	// w.written += int64(lenData) // ignoring errors, for errorKludge
+	// if w.contentLength != -1 && w.written > w.contentLength {
+	// 	return 0, ErrContentLength
+	// }
+	if dataB != nil {
+		return w.w.Write(dataB)
+	} else {
+		return w.w.WriteString(dataS)
+	}
 }
 
 // Serve a new connection.
@@ -354,7 +451,6 @@ func (c *conn) serve(ctx context.Context) {
 	// 	c.remoteAddr = ra.String()
 	// }
 	ctx = context.WithValue(ctx, LocalAddrContextKey, c.rwc.LocalAddr())
-	// var inFlightResponse *response
 
 	// HTTP/1.x from here on.
 
@@ -380,17 +476,16 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 
+		c.curReq.Store(w)
+
 		// if requestBodyRemains(req.Body) {
 		// 	registerOnHitEOF(req.Body, w.conn.r.startBackgroundRead)
 		// } else {
 		// 	w.conn.r.startBackgroundRead()
 		// }
 
-		// inFlightResponse = w
 		serverHandler{c.server}.ServeHTTP(w, w.req)
 		w.cancelCtx()
-		w.finishRequest()
-		return
 	}
 }
 
@@ -538,12 +633,11 @@ func (srv *Server) ListenAndServe() error {
 	if addr == "" {
 		addr = ":http"
 	}
-	_, err := net.Listen("tcp", addr)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
-	// TODO: Implement Server.Serve and call it here.
-	return nil
+	return srv.Serve(ln)
 }
 
 // ErrServerClosed is returned by the Server's Serve, ServeTLS, ListenAndServe,

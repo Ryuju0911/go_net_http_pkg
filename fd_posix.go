@@ -29,6 +29,12 @@ func (fd *netFD) Close() error {
 	return fd.pfd.Close()
 }
 
+func (fd *netFD) Read(p []byte) (n int, err error) {
+	n, err = fd.pfd.Read(p)
+	runtime.KeepAlive(fd)
+	return n, wrapSyscallError(readSyscallName, err)
+}
+
 func (fd *netFD) Write(p []byte) (nn int, err error) {
 	nn, err = fd.pfd.Write(p)
 	runtime.KeepAlive(fd)

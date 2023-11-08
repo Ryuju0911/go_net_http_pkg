@@ -4,10 +4,6 @@
 
 package http
 
-import (
-	"golang.org/x/net/http/httpguts"
-)
-
 // maxInt64 is the effective "infinite" value for the Server and
 // Transport's byte-limiting readers.
 const maxInt64 = 1<<63 - 1
@@ -18,6 +14,6 @@ type contextKey struct {
 	name string
 }
 
-func isNotToken(r rune) bool {
-	return !httpguts.IsTokenRune(r)
-}
+// func isNotToken(r rune) bool {
+// 	return !httpguts.IsTokenRune(r)
+// }

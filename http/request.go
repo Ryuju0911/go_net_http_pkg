@@ -157,22 +157,22 @@ func ParseHTTPVersion(vers string) (major, minor int, ok bool) {
 	return int(maj), int(min), true
 }
 
-func validMethod(method string) bool {
-	/*
-	     Method         = "OPTIONS"                ; Section 9.2
-	                    | "GET"                    ; Section 9.3
-	                    | "HEAD"                   ; Section 9.4
-	                    | "POST"                   ; Section 9.5
-	                    | "PUT"                    ; Section 9.6
-	                    | "DELETE"                 ; Section 9.7
-	                    | "TRACE"                  ; Section 9.8
-	                    | "CONNECT"                ; Section 9.9
-	                    | extension-method
-	   extension-method = token
-	     token          = 1*<any CHAR except CTLs or separators>
-	*/
-	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
-}
+// func validMethod(method string) bool {
+// 	/*
+// 	     Method         = "OPTIONS"                ; Section 9.2
+// 	                    | "GET"                    ; Section 9.3
+// 	                    | "HEAD"                   ; Section 9.4
+// 	                    | "POST"                   ; Section 9.5
+// 	                    | "PUT"                    ; Section 9.6
+// 	                    | "DELETE"                 ; Section 9.7
+// 	                    | "TRACE"                  ; Section 9.8
+// 	                    | "CONNECT"                ; Section 9.9
+// 	                    | extension-method
+// 	   extension-method = token
+// 	     token          = 1*<any CHAR except CTLs or separators>
+// 	*/
+// 	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
+// }
 
 func parseRequestLine(line string) (method, requestURI, proto string, ok bool) {
 	method, rest, ok1 := strings.Cut(line, " ")
@@ -221,9 +221,9 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 	if !ok {
 		return nil, badStringError("malformed HTTP request", s)
 	}
-	if !validMethod(req.Method) {
-		return nil, badStringError("invalid method", req.Method)
-	}
+	// if !validMethod(req.Method) {
+	// 	return nil, badStringError("invalid method", req.Method)
+	// }
 	rawurl := req.RequestURI
 	if req.ProtoMajor, req.ProtoMinor, ok = ParseHTTPVersion(req.Proto); !ok {
 		return nil, badStringError("malformed HTTP version", req.Proto)

@@ -4,7 +4,9 @@
 
 package net
 
-import "syscall"
+import (
+	"syscall"
+)
 
 // Addr represents a network end point address.
 type Addr interface {
@@ -14,6 +16,11 @@ type Addr interface {
 //
 // Multiple goroutines may invoke methods on a Conn simultaneously.
 type Conn interface {
+	// Read reads data from the connection.
+	// Read can be made to time out and return an error after a fixed
+	// time limit; see SetDeadline and SetReadDeadline.
+	Read(b []byte) (n int, err error)
+
 	// Write writes data to the connection.
 	// Write can be made to time out and return an error after a fixed
 	// time limit; see SetDeadline and SetWriteDeadline.
@@ -28,6 +35,14 @@ type conn struct {
 }
 
 func (c *conn) ok() bool { return c != nil && c.fd != nil }
+
+func (c *conn) Read(b []byte) (int, error) {
+	if !c.ok() {
+		return 0, syscall.EINVAL
+	}
+	n, err := c.fd.Read(b)
+	return n, err
+}
 
 func (c *conn) Write(b []byte) (int, error) {
 	if !c.ok() {
