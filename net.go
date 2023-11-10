@@ -6,6 +6,7 @@ package net
 
 import (
 	"syscall"
+	"time"
 )
 
 // Addr represents a network end point address.
@@ -26,8 +27,24 @@ type Conn interface {
 	// time limit; see SetDeadline and SetWriteDeadline.
 	Write(b []byte) (n int, err error)
 
+	// Close closes the connection.
+	// Any blocked Read or Write operations will be unblocked and return errors.
+	Close() error
+
 	// LocalAddr returns the local network address, if known.
 	LocalAddr() Addr
+
+	// SetReadDeadline sets the deadline for future Read calls
+	// and any currently-blocked Read call.
+	// A zero value for t means Read will not time out.
+	SetReadDeadline(t time.Time) error
+
+	// SetWriteDeadline sets the deadline for future Write calls
+	// and any currently-blocked Write call.
+	// Even if write times out, it may return n > 0, indicating that
+	// some of the data was successfully written.
+	// A zero value for t means Write will not time out.
+	SetWriteDeadline(t time.Time) error
 }
 
 type conn struct {
@@ -55,11 +72,43 @@ func (c *conn) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// Close closes the connection.
+func (c *conn) Close() error {
+	if !c.ok() {
+		return syscall.EINVAL
+	}
+	err := c.fd.Close()
+	return err
+}
+
 func (c *conn) LocalAddr() Addr {
 	if !c.ok() {
 		return nil
 	}
 	return c.fd.laddr
+}
+
+// SetReadDeadline implements the Conn SetReadDeadline method.
+func (c *conn) SetReadDeadline(t time.Time) error {
+	if !c.ok() {
+		return syscall.EINVAL
+	}
+	if err := c.fd.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return nil
+}
+
+// SetWriteDeadline implements the Conn SetWriteDeadline method.
+
+func (c *conn) SetWriteDeadline(t time.Time) error {
+	if !c.ok() {
+		return syscall.EINVAL
+	}
+	if err := c.fd.SetWriteDeadline(t); err != nil {
+		return err
+	}
+	return nil
 }
 
 // listenerBackLog returns the length of the listen queue, which represents

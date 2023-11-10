@@ -15,6 +15,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // A Handler responds to an HTTP request.
@@ -109,42 +110,41 @@ type chunkWriter struct {
 	// at the time of res.writeHeader, if res.writeHeader is
 	// called and extra buffering is being done to calculate
 	// Content-Type and/or Content-Length.
-	// header Header
+	header Header
 
 	// wroteHeader tells whether the header's been written to "the
 	// wire" (or rather: w.conn.buf). this is unlike
 	// (*response).wroteHeader, which tells only whether it was
 	// logically written.
-	// wroteHeader bool
+	wroteHeader bool
 
 	// set by the writeHeader method:
 	// chunking bool // using chunked transfer encoding for reply body
 }
 
+var (
+	crlf = []byte("\r\n")
+)
+
 func (cw *chunkWriter) Write(p []byte) (n int, err error) {
-	// if !cw.wroteHeader {
-	// 	cw.writeHeader(p)
-	// }
-	// if cw.res.req.Method == "HEAD" {
-	// 	// Eat writes.
-	// 	return len(p), nil
-	// }
-	// if cw.chunking {
-	// 	_, err = fmt.Fprintf(cw.res.conn.bufw, "%x\r\n", len(p))
-	// 	if err != nil {
-	// 		cw.res.conn.rwc.Close()
-	// 		return
-	// 	}
-	// }
-	// n, err = cw.res.conn.bufw.Write(p)
-	// if cw.chunking && err == nil {
-	// 	_, err = cw.res.conn.bufw.Write(crlf)
-	// }
-	// if err != nil {
-	// 	cw.res.conn.rwc.Close()
-	// }
-	// return
-	return len(p), nil
+	if !cw.wroteHeader {
+		cw.writeHeader(p)
+	}
+	if cw.res.req.Method == "HEAD" {
+		// Eat writes.
+		return len(p), nil
+	}
+	n, err = cw.res.conn.bufw.Write(p)
+	if err != nil {
+		cw.res.conn.rwc.Close()
+	}
+	return
+}
+
+func (cw *chunkWriter) close() {
+	if !cw.wroteHeader {
+		cw.writeHeader(nil)
+	}
 }
 
 // A response represents the server side of an HTTP response.
@@ -207,7 +207,7 @@ type response struct {
 	// // written.
 	// trailers []string
 
-	// handlerDone atomic.Bool // set true when the handler exits
+	handlerDone atomic.Bool // set true when the handler exits
 
 	// // Buffers for Date, Content-Length, and status code
 	// dateBuf   [len(TimeFormat)]byte
@@ -242,8 +242,8 @@ type connReader struct {
 	byteBuf [1]byte
 	cond    *sync.Cond
 	inRead  bool
-	// aborted bool  // set true before conn.rwc deadline is set to past
-	remain int64 // bytes remaining
+	aborted bool  // set true before conn.rwc deadline is set to past
+	remain  int64 // bytes remaining
 }
 
 func (cr *connReader) lock() {
@@ -254,6 +254,20 @@ func (cr *connReader) lock() {
 }
 
 func (cr *connReader) unlock() { cr.mu.Unlock() }
+
+func (cr *connReader) abortPendingRead() {
+	cr.lock()
+	defer cr.unlock()
+	if !cr.inRead {
+		return
+	}
+	cr.aborted = true
+	cr.conn.rwc.SetReadDeadline(aLongTimeAgo)
+	for cr.inRead {
+		cr.cond.Wait()
+	}
+	cr.conn.rwc.SetReadDeadline(time.Time{})
+}
 
 func (cr *connReader) setReadLimit(remain int64) { cr.remain = remain }
 func (cr *connReader) setInfiniteReadLimit()     { cr.remain = maxInt64 }
@@ -359,6 +373,13 @@ func newBufioWriterSize(w io.Writer, size int) *bufio.Writer {
 	return bufio.NewWriterSize(w, size)
 }
 
+func putBufioWriter(bw *bufio.Writer) {
+	bw.Reset(nil)
+	if pool := bufioWriterPool(bw.Available()); pool != nil {
+		pool.Put(bw)
+	}
+}
+
 var errTooLarge = errors.New("http: request too large")
 
 // Read next request from connection.
@@ -418,6 +439,24 @@ func (w *response) WriteHeader(code int) {
 	w.status = code
 }
 
+// writeHeader finalizes the header sent to the client and writes it
+// to cw.res.conn.bufw.
+//
+// p is not written by writeHeader, but is the first chunk of the body
+// that will be written. It is sniffed for a Content-Type if none is
+// set explicitly. It's also used to set the Content-Length, if the
+// total body size was small and the handler has already finished
+// running.
+func (cw *chunkWriter) writeHeader(p []byte) {
+	if cw.wroteHeader {
+		return
+	}
+	cw.wroteHeader = true
+
+	w := cw.res
+	w.conn.bufw.Write(crlf)
+}
+
 func (w *response) Write(data []byte) (n int, err error) {
 	return w.write(len(data), data, "")
 }
@@ -443,6 +482,25 @@ func (w *response) write(lenData int, dataB []byte, dataS string) (n int, err er
 	} else {
 		return w.w.WriteString(dataS)
 	}
+}
+
+func (w *response) finishRequest() {
+	w.handlerDone.Store(true)
+
+	if !w.wroteHeader {
+		w.WriteHeader(StatusOK)
+	}
+
+	w.w.Flush()
+	putBufioWriter(w.w)
+	w.cw.close()
+	w.conn.bufw.Flush()
+
+	w.conn.r.abortPendingRead()
+}
+
+func (c *conn) closeWriteAndWait() {
+	time.Sleep(500 * time.Millisecond)
 }
 
 // Serve a new connection.
@@ -486,6 +544,12 @@ func (c *conn) serve(ctx context.Context) {
 
 		serverHandler{c.server}.ServeHTTP(w, w.req)
 		w.cancelCtx()
+		w.finishRequest()
+		c.rwc.SetWriteDeadline(time.Time{})
+		c.closeWriteAndWait()
+		// c.curReq.Store(nil)
+		// c.rwc.SetReadDeadline(time.Time{})
+		c.rwc.Close()
 	}
 }
 

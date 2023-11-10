@@ -3,6 +3,7 @@ package net
 import (
 	"internal/poll"
 	"runtime"
+	"time"
 )
 
 // Network file descriptor.
@@ -39,4 +40,12 @@ func (fd *netFD) Write(p []byte) (nn int, err error) {
 	nn, err = fd.pfd.Write(p)
 	runtime.KeepAlive(fd)
 	return nn, wrapSyscallError(writeSyscallName, err)
+}
+
+func (fd *netFD) SetReadDeadline(t time.Time) error {
+	return fd.pfd.SetReadDeadline(t)
+}
+
+func (fd *netFD) SetWriteDeadline(t time.Time) error {
+	return fd.pfd.SetWriteDeadline(t)
 }
