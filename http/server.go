@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -84,7 +85,7 @@ type conn struct {
 
 	curReq atomic.Pointer[response] // (which has a Request in it)
 
-	// curState atomic.Uint64 // packed (unixtime<<8|uint8(ConnState))
+	curState atomic.Uint64 // packed (unixtime<<8|uint8(ConnState))
 
 	// // mu guards hijackedv
 	// mu sync.Mutex
@@ -503,6 +504,37 @@ func (c *conn) closeWriteAndWait() {
 	time.Sleep(500 * time.Millisecond)
 }
 
+const (
+	runHooks  = true
+	skipHooks = false
+)
+
+func (c *conn) setState(nc net.Conn, state ConnState, runHook bool) {
+	srv := c.server
+	switch state {
+	case StateNew:
+		srv.trackConn(c, true)
+	case StateHijacked, StateClosed:
+		srv.trackConn(c, false)
+	}
+	if state > 0xff || state < 0 {
+		panic("internal error")
+	}
+	packedState := uint64(time.Now().Unix()<<8) | uint64(state)
+	c.curState.Store(packedState)
+	if !runHook {
+		return
+	}
+	if hook := srv.ConnState; hook != nil {
+		hook(nc, state)
+	}
+}
+
+func (c *conn) getState() (state ConnState, unixSec int64) {
+	packedState := c.curState.Load()
+	return ConnState(packedState & 0xff), int64(packedState >> 8)
+}
+
 // Serve a new connection.
 func (c *conn) serve(ctx context.Context) {
 	// if ra := c.rwc.RemoteAddr(); ra != nil {
@@ -547,7 +579,8 @@ func (c *conn) serve(ctx context.Context) {
 		w.finishRequest()
 		c.rwc.SetWriteDeadline(time.Time{})
 		c.closeWriteAndWait()
-		// c.curReq.Store(nil)
+		c.setState(c.rwc, StateIdle, runHooks)
+		c.curReq.Store(nil)
 		// c.rwc.SetReadDeadline(time.Time{})
 		c.rwc.Close()
 	}
@@ -644,6 +677,11 @@ type Server struct {
 	// See net.Dial for details of the address format.
 	Addr string
 
+	// ConnState specifies an optional callback function that is
+	// called when a client connection changes state. See the
+	// ConnState type and associated constants for details.
+	ConnState func(net.Conn, ConnState)
+
 	Handler Handler // handler to invoke, http.DefaultServeMux if nil
 
 	// BaseContext optionally specifies a function that returns
@@ -660,14 +698,84 @@ type Server struct {
 	// value.
 	ConnContext func(ctx context.Context, c net.Conn) context.Context
 
+	inShutdown atomic.Bool // true when server is in shutdown
+
 	nextProtoOnce sync.Once // guards setupHTTP2_* init
 	nextProtoErr  error     // result of http2.ConfigureServer if used
 
 	mu         sync.Mutex
 	listeners  map[*net.Listener]struct{}
+	activeConn map[*conn]struct{}
 	onShutdown []func()
 
 	listenerGroup sync.WaitGroup
+}
+
+// shutdownPollIntervalMax is the max polling interval when checking
+// quiescence during Server.Shutdown. Polling starts with a small
+// interval and backs off to the max.
+// Ideally we could find a solution that doesn't involve polling,
+// but which also doesn't have a high runtime cost (and doesn't
+// involve any contentious mutexes), but that is left as an
+// exercise for the reader.
+const shutdownPollIntervalMax = 500 * time.Millisecond
+
+// Shutdown gracefully shuts down the server without interrupting any
+// active connections. Shutdown works by first closing all open
+// listeners, then closing all idle connections, and then waiting
+// indefinitely for connections to return to idle and then shut down.
+// If the provided context expires before the shutdown is complete,
+// Shutdown returns the context's error, otherwise it returns any
+// error returned from closing the Server's underlying Listener(s).
+//
+// When Shutdown is called, Serve, ListenAndServe, and
+// ListenAndServeTLS immediately return ErrServerClosed. Make sure the
+// program doesn't exit and waits instead for Shutdown to return.
+//
+// Shutdown does not attempt to close nor wait for hijacked
+// connections such as WebSockets. The caller of Shutdown should
+// separately notify such long-lived connections of shutdown and wait
+// for them to close, if desired. See RegisterOnShutdown for a way to
+// register shutdown notification functions.
+//
+// Once Shutdown has been called on a server, it may not be reused;
+// future calls to methods such as Serve will return ErrServerClosed.
+func (srv *Server) Shutdown(ctx context.Context) error {
+	srv.inShutdown.Store(true)
+
+	srv.mu.Lock()
+	lnerr := srv.closeListenersLocked()
+	for _, f := range srv.onShutdown {
+		go f()
+	}
+	srv.mu.Unlock()
+	srv.listenerGroup.Wait()
+
+	pollIntervalBase := time.Millisecond
+	nextPollInterval := func() time.Duration {
+		// Add 10% jitter.
+		interval := pollIntervalBase + time.Duration(rand.Intn(int(pollIntervalBase/10)))
+		// Double and clamp for next time.
+		pollIntervalBase *= 2
+		if pollIntervalBase > shutdownPollIntervalMax {
+			pollIntervalBase = shutdownPollIntervalMax
+		}
+		return interval
+	}
+
+	timer := time.NewTimer(nextPollInterval())
+	defer timer.Stop()
+	for {
+		if srv.closeIdleConns() {
+			return lnerr
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			timer.Reset(nextPollInterval())
+		}
+	}
 }
 
 // RegisterOnShutdown registers a function to call on Shutdown.
@@ -681,6 +789,80 @@ func (srv *Server) RegisterOnShutdown(f func()) {
 	srv.mu.Unlock()
 }
 
+func (s *Server) closeIdleConns() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	quiescent := true
+	for c := range s.activeConn {
+		st, unixSec := c.getState()
+		// Issue 22682: treat StateNew connections as if
+		// they're idle if we haven't read the first request's
+		// header in over 5 seconds.
+		if st == StateNew && unixSec < time.Now().Unix()-5 {
+			st = StateIdle
+		}
+		if st != StateIdle || unixSec == 0 {
+			// Assume unixSec == 0 means it's a very new
+			// connection, without state set yet.
+			quiescent = false
+			continue
+		}
+		c.rwc.Close()
+		delete(s.activeConn, c)
+	}
+	return quiescent
+}
+
+func (s *Server) closeListenersLocked() error {
+	var err error
+	for ln := range s.listeners {
+		if cerr := (*ln).Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	return err
+}
+
+// A ConnState represents the state of a client connection to a server.
+// It's used by the optional Server.ConnState hook.
+type ConnState int
+
+const (
+	// StateNew represents a new connection that is expected to
+	// send a request immediately. Connections begin at this
+	// state and then transition to either StateActive or
+	// StateClosed.
+	StateNew ConnState = iota
+
+	// StateActive represents a connection that has read 1 or more
+	// bytes of a request. The Server.ConnState hook for
+	// StateActive fires before the request has entered a handler
+	// and doesn't fire again until the request has been
+	// handled. After the request is handled, the state
+	// transitions to StateClosed, StateHijacked, or StateIdle.
+	// For HTTP/2, StateActive fires on the transition from zero
+	// to one active request, and only transitions away once all
+	// active requests are complete. That means that ConnState
+	// cannot be used to do per-request work; ConnState only notes
+	// the overall state of the connection.
+	StateActive
+
+	// StateIdle represents a connection that has finished
+	// handling a request and is in the keep-alive state, waiting
+	// for a new request. Connections transition from StateIdle
+	// to either StateActive or StateClosed.
+	StateIdle
+
+	// StateHijacked represents a hijacked connection.
+	// This is a terminal state. It does not transition to StateClosed.
+	StateHijacked
+
+	// StateClosed represents a closed connection.
+	// This is a terminal state. Hijacked connections do not
+	// transition to StateClosed.
+	StateClosed
+)
+
 // ListenAndServe listens on the TCP network address srv.Addr and then
 // calls Serve to handle requests on incoming connections.
 // Accepted connections are configured to enable TCP keep-alives.
@@ -690,9 +872,9 @@ func (srv *Server) RegisterOnShutdown(f func()) {
 // ListenAndServe always returns a non-nil error. After Shutdown or Close,
 // the returned error is ErrServerClosed.
 func (srv *Server) ListenAndServe() error {
-	// if srv.shuttingDown() {
-	// 	return ErrServerClosed
-	// }
+	if srv.shuttingDown() {
+		return ErrServerClosed
+	}
 	addr := srv.Addr
 	if addr == "" {
 		addr = ":http"
@@ -755,11 +937,21 @@ func (srv *Server) Serve(l net.Listener) error {
 		}
 		// tempDelay = 0
 		c := srv.newConn(rw)
-		// // c.setState(c.rwc, StateNew, runHooks) // before Serve can return
+		c.setState(c.rwc, StateNew, runHooks) // before Serve can return
 		go c.serve(connCtx)
 	}
 }
 
+// trackListener adds or removes a net.Listener to the set of tracked
+// listeners.
+//
+// We store a pointer to interface in the map set, in case the
+// net.Listener is not comparable. This is safe because we only call
+// trackListener via Serve and can track+defer untrack the same
+// pointer to local variable there. We never need to compare a
+// Listener from another caller.
+//
+// It reports whether the server is still up (not Shutdown or Closed).
 func (s *Server) trackListener(ln *net.Listener, add bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -767,13 +959,33 @@ func (s *Server) trackListener(ln *net.Listener, add bool) bool {
 		s.listeners = make(map[*net.Listener]struct{})
 	}
 	if add {
-		// if s.shuttingDown() {
-		// 	return false
-		// }
+		if s.shuttingDown() {
+			return false
+		}
 		s.listeners[ln] = struct{}{}
 		s.listenerGroup.Add(1)
+	} else {
+		delete(s.listeners, ln)
+		s.listenerGroup.Done()
 	}
 	return true
+}
+
+func (s *Server) trackConn(c *conn, add bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeConn == nil {
+		s.activeConn = make(map[*conn]struct{})
+	}
+	if add {
+		s.activeConn[c] = struct{}{}
+	} else {
+		delete(s.activeConn, c)
+	}
+}
+
+func (s *Server) shuttingDown() bool {
+	return s.inShutdown.Load()
 }
 
 // serverHandler delegates to either the server's Handler or
