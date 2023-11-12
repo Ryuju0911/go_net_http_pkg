@@ -541,6 +541,13 @@ func (c *conn) serve(ctx context.Context) {
 	// 	c.remoteAddr = ra.String()
 	// }
 	ctx = context.WithValue(ctx, LocalAddrContextKey, c.rwc.LocalAddr())
+	var inFlightResponse *response
+	defer func() {
+		// TODO: Catch panic
+		if inFlightResponse != nil {
+			inFlightResponse.cancelCtx()
+		}
+	}()
 
 	// HTTP/1.x from here on.
 
@@ -574,7 +581,16 @@ func (c *conn) serve(ctx context.Context) {
 		// 	w.conn.r.startBackgroundRead()
 		// }
 
+		// HTTP cannot have multiple simultaneous active requests.[*]
+		// Until the server replies to this request, it can't read another,
+		// so we might as well run the handler in this goroutine.
+		// [*] Not strictly true: HTTP pipelining. We could let them all process
+		// in parallel even if their responses need to be serialized.
+		// But we're not going to implement HTTP pipelining because it
+		// was never deployed in the wild and the answer is HTTP/2.
+		inFlightResponse = w
 		serverHandler{c.server}.ServeHTTP(w, w.req)
+		inFlightResponse = nil
 		w.cancelCtx()
 		w.finishRequest()
 		c.rwc.SetWriteDeadline(time.Time{})
@@ -699,9 +715,6 @@ type Server struct {
 	ConnContext func(ctx context.Context, c net.Conn) context.Context
 
 	inShutdown atomic.Bool // true when server is in shutdown
-
-	nextProtoOnce sync.Once // guards setupHTTP2_* init
-	nextProtoErr  error     // result of http2.ConfigureServer if used
 
 	mu         sync.Mutex
 	listeners  map[*net.Listener]struct{}
@@ -905,13 +918,10 @@ func (srv *Server) Serve(l net.Listener) error {
 	l = &onceCloseListener{Listener: l}
 	defer l.Close()
 
-	if err := srv.setupHTTP2_Serve(); err != nil {
-		return err
-	}
-
 	if !srv.trackListener(&l, true) {
 		return ErrServerClosed
 	}
+	defer srv.trackListener(&l, false)
 
 	baseCtx := context.Background()
 	if srv.BaseContext != nil {
@@ -921,13 +931,16 @@ func (srv *Server) Serve(l net.Listener) error {
 		}
 	}
 
-	// var tempDelay time.Duration // how long to sleep on accept failuer
-
 	ctx := context.WithValue(baseCtx, ServerContextKey, srv)
 	for {
-		rw, _ := l.Accept()
-		// TODO: handles the case when the err != nil.
-
+		rw, err := l.Accept()
+		if err != nil {
+			if srv.shuttingDown() {
+				return ErrServerClosed
+			}
+			// TODO: handles Accepet error.
+			return err
+		}
 		connCtx := ctx
 		if cc := srv.ConnContext; cc != nil {
 			connCtx = cc(connCtx, rw)
@@ -935,7 +948,6 @@ func (srv *Server) Serve(l net.Listener) error {
 				panic("ConnContext returned nil")
 			}
 		}
-		// tempDelay = 0
 		c := srv.newConn(rw)
 		c.setState(c.rwc, StateNew, runHooks) // before Serve can return
 		go c.serve(connCtx)
@@ -1013,49 +1025,6 @@ func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
 func ListenAndServe(addr string, handler Handler) error {
 	server := &Server{Addr: addr, Handler: handler}
 	return server.ListenAndServe()
-}
-
-// shouldConfigureHTTP2ForServe reports whether Server.Serve should configure
-// automatic HTTP/2. (which sets up the srv.TLSNextProto map)
-// Temporarily, it always returns true.
-func (srv *Server) shouldConfigureHTTP2ForServe() bool {
-	return true
-}
-
-// setupHTTP2_Serve is called from (*Server).Serve and conditionally
-// configures HTTP/2 on srv using a more conservative policy than
-// setupHTTP2_ServeTLS because Serve is called after tls.Listen,
-// and may be called concurrently. See shouldConfigureHTTP2ForServe.
-//
-// The tests named TestTransportAutomaticHTTP2* and
-// TestConcurrentServerServe in server_test.go demonstrate some
-// of the supported use cases and motivations.
-func (srv *Server) setupHTTP2_Serve() error {
-	srv.nextProtoOnce.Do(srv.onceSetNextProtoDefaults_Serve)
-	return srv.nextProtoErr
-}
-
-func (srv *Server) onceSetNextProtoDefaults_Serve() {
-	if srv.shouldConfigureHTTP2ForServe() {
-		srv.onceSetNextProtoDefaults()
-	}
-}
-
-// onceSetNextProtoDefaults configures HTTP/2, if the user hasn't
-// configured otherwise. (by setting srv.TLSNextProto non-nil)
-// It must only be called via srv.nextProtoOnce (use srv.setupHTTP2_*).
-func (srv *Server) onceSetNextProtoDefaults() {
-	// if omitBundledHTTP2 {
-	// 	return
-	// }
-	// if http2server.Value() == "0" {
-	// 	http2server.IncNonDefault()
-	// 	return
-	// }
-	conf := &http2Server{
-		NewWriteScheduler: func() http2WriteScheduler { return http2NewPriorityWriteScheduler(nil) },
-	}
-	srv.nextProtoErr = http2ConfigureServer(srv, conf)
 }
 
 // onceCloseListener wraps a net.Listener, protecting it from
