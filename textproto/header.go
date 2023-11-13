@@ -7,3 +7,8 @@ package textproto
 // A MIMEHeader represents a MIME-style header mapping
 // keys to sets of values.
 type MIMEHeader map[string][]string
+
+// Del deletes the values associated with key.
+func (h MIMEHeader) Del(key string) {
+	delete(h, CanonicalMIMEHeaderKey(key))
+}

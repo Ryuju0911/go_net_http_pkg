@@ -4,6 +4,8 @@
 
 package http
 
+import "net/textproto"
+
 // A Header represents the key-value pairs in an HTTP header.
 //
 // The keys should be in canonical form, as returned by
@@ -16,4 +18,11 @@ func (h Header) get(key string) string {
 		return v[0]
 	}
 	return ""
+}
+
+// Del deletes the values associated with key.
+// The key is case insensitive; it is canonicalized by
+// CanonicalHeaderKey.
+func (h Header) Del(key string) {
+	textproto.MIMEHeader(h).Del(key)
 }

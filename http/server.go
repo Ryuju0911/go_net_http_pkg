@@ -381,11 +381,27 @@ func putBufioWriter(bw *bufio.Writer) {
 	}
 }
 
+// DefaultMaxHeaderBytes is the maximum permitted size of the headers
+// in an HTTP request.
+// This can be overridden by setting Server.MaxHeaderBytes.
+const DefaultMaxHeaderBytes = 1 << 20 // 1 MB
+
+func (srv *Server) maxHeaderBytes() int {
+	if srv.MaxHeaderBytes > 0 {
+		return srv.MaxHeaderBytes
+	}
+	return DefaultMaxHeaderBytes
+}
+
+func (srv *Server) initialReadLimitSize() int64 {
+	return int64(srv.maxHeaderBytes()) + 4096 // bufio slop
+}
+
 var errTooLarge = errors.New("http: request too large")
 
 // Read next request from connection.
 func (c *conn) readRequst(ctx context.Context) (w *response, err error) {
-	c.r.setInfiniteReadLimit() // Instead of setReadLimit(c.server.initialReadLimitSize())
+	c.r.setReadLimit(c.server.initialReadLimitSize())
 	// if c.lastMethod == "POST" {
 	// 	// RFC 7230 section 3 tolerance for old buggy clients.
 	// 	peek, _ := c.bufr.Peek(4) // ReadRequst will get err below
@@ -692,6 +708,13 @@ type Server struct {
 	// The service names are defined in RFC 6335 and assigned by IANA.
 	// See net.Dial for details of the address format.
 	Addr string
+
+	// MaxHeaderBytes controls the maximum number of bytes the
+	// server will read parsing the request header's keys and
+	// values, including the request line. It does not limit the
+	// size of the request body.
+	// If zero, DefaultMaxHeaderBytes is used.
+	MaxHeaderBytes int
 
 	// ConnState specifies an optional callback function that is
 	// called when a client connection changes state. See the

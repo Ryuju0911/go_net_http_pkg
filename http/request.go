@@ -93,6 +93,27 @@ type Request struct {
 	// for input.
 	Body io.ReadCloser
 
+	// ContentLength records the length of the associated content.
+	// The value -1 indicates that the length is unknown.
+	// Values >= 0 indicate that the given number of bytes may
+	// be read from Body.
+	//
+	// For client requests, a value of 0 with a non-nil Body is
+	// also treated as unknown.
+	ContentLength int64
+
+	// Close indicates whether to close the connection after
+	// replying to this request (for servers) or after sending this
+	// request and reading its response (for clients).
+	//
+	// For server requests, the HTTP server handles this automatically
+	// and this field is not needed by Handlers.
+	//
+	// For client requests, setting this field prevents re-use of
+	// TCP connections between requests to the same hosts, as if
+	// Transport.DisableKeepAlives were set.
+	Close bool
+
 	// For server requests, Host specifies the host on which the
 	// URL is sought. For HTTP/1 (per RFC 7230, section 5.4), this
 	// is either the value of the "Host" header or the host name
@@ -239,7 +260,7 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 		return nil, err
 	}
 	req.Header = Header(mimeHeader)
-	if len(req.Header["HOST"]) > 1 {
+	if len(req.Header.get("Host")) > 1 {
 		return nil, fmt.Errorf("too many Host headers")
 	}
 
@@ -259,10 +280,10 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 
 	// req.Close = shouldClose(req.ProtoMajor, req.ProtoMinor, req.Header, false)
 
-	// err = readTransfer(req, b)
-	// if err != nil {
-	// 	return nil, err
-	// }
+	err = readTransfer(req, b)
+	if err != nil {
+		return nil, err
+	}
 
 	// if req.isH2Upgrade() {
 	// 	// Because it's neither chunked, nor declared:
