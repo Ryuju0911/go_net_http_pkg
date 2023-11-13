@@ -14,6 +14,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -362,6 +363,11 @@ func newBufioReader(r io.Reader) *bufio.Reader {
 	return bufio.NewReader(r)
 }
 
+func putBufioReader(br *bufio.Reader) {
+	br.Reset(nil)
+	bufioReaderPool.Put(br)
+}
+
 func newBufioWriterSize(w io.Writer, size int) *bufio.Writer {
 	pool := bufioWriterPool(size)
 	if pool != nil {
@@ -454,6 +460,16 @@ func (w *response) WriteHeader(code int) {
 
 	w.wroteHeader = true
 	w.status = code
+
+	if cl := w.handlerHeader.get("Content-Length"); cl != "" {
+		v, err := strconv.ParseInt(cl, 10, 64)
+		if err == nil && v >= 0 {
+			w.contentLength = v
+		} else {
+			// w.conn.server.logf("http: invalid Content-Length of %q", cl)
+			w.handlerHeader.Del("Content-Length")
+		}
+	}
 }
 
 // writeHeader finalizes the header sent to the client and writes it
@@ -514,10 +530,78 @@ func (w *response) finishRequest() {
 	w.conn.bufw.Flush()
 
 	w.conn.r.abortPendingRead()
+
+	// Close the body (regardless of w.closeAfterReply) so we can
+	// re-use its bufio.Reader later safely.
+	w.reqBody.Close()
 }
 
+func (c *conn) finalFlush() {
+	if c.bufr != nil {
+		putBufioReader(c.bufr)
+		c.bufr = nil
+	}
+
+	if c.bufw != nil {
+		c.bufw.Flush()
+		// Steal the bufio.Writer (~4KB worth of memory) and its associated
+		// writer for a future connection.
+		putBufioWriter(c.bufw)
+		c.bufw = nil
+	}
+}
+
+// rstAvoidanceDelay is the amount of time we sleep after closing the
+// write side of a TCP connection before closing the entire socket.
+// By sleeping, we increase the chances that the client sees our FIN
+// and processes its final data before they process the subsequent RST
+// from closing a connection with known unread data.
+// This RST seems to occur mostly on BSD systems. (And Windows?)
+// This timeout is somewhat arbitrary (~latency around the planet),
+// and may be modified by tests.
+//
+// TODO(bcmills): This should arguably be a server configuration parameter,
+// not a hard-coded value.
+var rstAvoidanceDelay = 500 * time.Millisecond
+
+type closeWriter interface {
+	CloseWrite() error
+}
+
+// closeWriteAndWait flushes any outstanding data and sends a FIN packet (if
+// client is connected via TCP), signaling that we're done. We then
+// pause for a bit, hoping the client processes it before any
+// subsequent RST.
+//
+// See https://golang.org/issue/3595
 func (c *conn) closeWriteAndWait() {
-	time.Sleep(500 * time.Millisecond)
+	c.finalFlush()
+	if tcp, ok := c.rwc.(closeWriter); ok {
+		tcp.CloseWrite()
+	}
+
+	// When we return from closeWriteAndWait, the caller will fully close the
+	// connection. If client is still writing to the connection, this will cause
+	// the write to fail with ECONNRESET or similar. Unfortunately, many TCP
+	// implementations will also drop unread packets from the client's read buffer
+	// when a write fails, causing our final response to be truncated away too.
+	//
+	// As a result, https://www.rfc-editor.org/rfc/rfc7230#section-6.6 recommends
+	// that “[t]he server … continues to read from the connection until it
+	// receives a corresponding close by the client, or until the server is
+	// reasonably certain that its own TCP stack has received the client's
+	// acknowledgement of the packet(s) containing the server's last response.”
+	//
+	// Unfortunately, we have no straightforward way to be “reasonably certain”
+	// that we have received the client's ACK, and at any rate we don't want to
+	// allow a misbehaving client to soak up server connections indefinitely by
+	// withholding an ACK, nor do we want to go through the complexity or overhead
+	// of using low-level APIs to figure out when a TCP round-trip has completed.
+	//
+	// Instead, we declare that we are “reasonably certain” that we received the
+	// ACK if maxRSTAvoidanceDelay has elapsed.
+
+	time.Sleep(rstAvoidanceDelay)
 }
 
 const (
@@ -577,16 +661,26 @@ func (c *conn) serve(ctx context.Context) {
 
 	for {
 		w, err := c.readRequst(ctx)
-		// if c.r.remain != c.server.initialReadLimitSize() {
-		// 	// If we read any bytes off the wire, we're active.
-		// 	c.setState(c.rwc, StateActive, runHooks)
-		// }
+		if c.r.remain != c.server.initialReadLimitSize() {
+			// If we read any bytes off the wire, we're active.
+			c.setState(c.rwc, StateActive, runHooks)
+		}
 		if err != nil {
 			// TODO: Implement error handling based on error type.
 			const errorHeaders = "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
-			const publicErr = "400 Bad Request"
-			fmt.Fprintf(c.rwc, "HTTP/1.1 "+publicErr+errorHeaders+publicErr)
-			return
+
+			switch {
+			case err == errTooLarge:
+				const publicErr = "431 Request Header Fields Too Large"
+				fmt.Fprintf(c.rwc, "HTTP/1.1 "+publicErr+errorHeaders+publicErr)
+				c.closeWriteAndWait()
+				return
+
+			default:
+				const publicErr = "400 Bad Request"
+				fmt.Fprintf(c.rwc, "HTTP/1.1 "+publicErr+errorHeaders+publicErr)
+				return
+			}
 		}
 
 		c.curReq.Store(w)
@@ -610,10 +704,12 @@ func (c *conn) serve(ctx context.Context) {
 		w.cancelCtx()
 		w.finishRequest()
 		c.rwc.SetWriteDeadline(time.Time{})
-		c.closeWriteAndWait()
+
 		c.setState(c.rwc, StateIdle, runHooks)
 		c.curReq.Store(nil)
-		// c.rwc.SetReadDeadline(time.Time{})
+
+		c.rwc.SetReadDeadline(time.Time{})
+
 		c.rwc.Close()
 	}
 }
