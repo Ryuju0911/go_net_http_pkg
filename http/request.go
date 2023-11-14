@@ -148,6 +148,13 @@ type Request struct {
 	ctx context.Context
 }
 
+// ProtoAtLeast reports whether the HTTP protocol used
+// in the request is at least major.minor.
+func (r *Request) ProtoAtLeast(major, minor int) bool {
+	return r.ProtoMajor > major ||
+		r.ProtoMajor == major && r.ProtoMinor >= minor
+}
+
 // ParseHTTPVersion parses an HTTP version string according to RFC 7230, section 2.6.
 // "HTTP/1.0" returns (1, 0, true). Note that strings without
 // a minor version, such as "HTTP/2", are not valid.
@@ -260,7 +267,7 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 		return nil, err
 	}
 	req.Header = Header(mimeHeader)
-	if len(req.Header["HOST"]) > 1 {
+	if len(req.Header["Host"]) > 1 {
 		return nil, fmt.Errorf("too many Host headers")
 	}
 

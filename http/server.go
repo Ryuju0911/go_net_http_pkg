@@ -20,6 +20,15 @@ import (
 	"time"
 )
 
+// Errors used by the HTTP server.
+var (
+	// ErrContentLength is returned by ResponseWriter.Write calls
+	// when a Handler set a Content-Length response header with a
+	// declared size and then attempted to write more bytes than
+	// declared.
+	ErrContentLength = errors.New("http: wrote more than the declared Content-Length")
+)
+
 // A Handler responds to an HTTP request.
 type Handler interface {
 	ServeHTTP(ResponseWriter, *Request)
@@ -125,7 +134,8 @@ type chunkWriter struct {
 }
 
 var (
-	crlf = []byte("\r\n")
+	crlf       = []byte("\r\n")
+	colonSpace = []byte(": ")
 )
 
 func (cw *chunkWriter) Write(p []byte) (n int, err error) {
@@ -180,7 +190,7 @@ type response struct {
 	handlerHeader Header
 	// calledHeader  bool // handler accessed handlerHeader via Header
 
-	// written       int64 // number of bytes written in body
+	written       int64 // number of bytes written in body
 	contentLength int64 // explicitly-declared Content-Length; or -1
 	status        int   // status code passed to WriteHeader
 
@@ -211,10 +221,10 @@ type response struct {
 
 	handlerDone atomic.Bool // set true when the handler exits
 
-	// // Buffers for Date, Content-Length, and status code
-	// dateBuf   [len(TimeFormat)]byte
-	// clenBuf   [10]byte
-	// statusBuf [3]byte
+	// Buffers for Date, Content-Length, and status code
+	dateBuf   [len(TimeFormat)]byte
+	clenBuf   [10]byte
+	statusBuf [3]byte
 
 	// closeNotifyCh is the channel returned by CloseNotify.
 	// TODO(bradfitz): this is currently (for Go 1.8) always
@@ -403,6 +413,36 @@ func (srv *Server) initialReadLimitSize() int64 {
 	return int64(srv.maxHeaderBytes()) + 4096 // bufio slop
 }
 
+// TimeFormat is the time format to use when generating times in HTTP
+// headers. It is like time.RFC1123 but hard-codes GMT as the time
+// zone. The time being formatted must be in UTC for Format to
+// generate the correct format.
+//
+// For parsing this time format, see ParseTime.
+const TimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"
+
+// appendTime is a non-allocating version of []byte(t.UTC().Format(TimeFormat))
+func appendTime(b []byte, t time.Time) []byte {
+	const days = "SunMonTueWedThuFriSat"
+	const months = "JanFebMarAprMayJunJulAugSepOctNovDec"
+
+	t = t.UTC()
+	yy, mm, dd := t.Date()
+	hh, mn, ss := t.Clock()
+	day := days[3*t.Weekday():]
+	mon := months[3*(mm-1):]
+
+	return append(b,
+		day[0], day[1], day[2], ',', ' ',
+		byte('0'+dd/10), byte('0'+dd%10), ' ',
+		mon[0], mon[1], mon[2], ' ',
+		byte('0'+yy/1000), byte('0'+(yy/100)%10), byte('0'+(yy/10)%10), byte('0'+yy%10), ' ',
+		byte('0'+hh/10), byte('0'+hh%10), ':',
+		byte('0'+mn/10), byte('0'+mn%10), ':',
+		byte('0'+ss/10), byte('0'+ss%10), ' ',
+		'G', 'M', 'T')
+}
+
 var errTooLarge = errors.New("http: request too large")
 
 // Read next request from connection.
@@ -472,6 +512,55 @@ func (w *response) WriteHeader(code int) {
 	}
 }
 
+// extraHeader is the set of headers sometimes added by chunkWriter.writeHeader.
+// This type is used to avoid extra allocations from cloning and/or populating
+// the response Header map and all its 1-element slices.
+type extraHeader struct {
+	contentType      string
+	connection       string
+	transferEncoding string
+	date             []byte // written if not nil
+	contentLength    []byte // written if not nil
+}
+
+// Sorted the same as extraHeader.Write's loop.
+var extraHeaderKeys = [][]byte{
+	[]byte("Content-Type"),
+	[]byte("Connection"),
+	[]byte("Transfer-Encoding"),
+}
+
+var (
+	headerContentLength = []byte("Content-Length: ")
+	headerDate          = []byte("Date: ")
+)
+
+// Write writes the headers described in h to w.
+//
+// This method has a value receiver, despite the somewhat large size
+// of h, because it prevents an allocation. The escape analysis isn't
+// smart enough to realize this function doesn't mutate h.
+func (h extraHeader) Write(w *bufio.Writer) {
+	if h.date != nil {
+		w.Write(headerDate)
+		w.Write(h.date)
+		w.Write(crlf)
+	}
+	if h.contentLength != nil {
+		w.Write(headerContentLength)
+		w.Write(h.contentLength)
+		w.Write(crlf)
+	}
+	for i, v := range []string{h.contentType, h.connection, h.transferEncoding} {
+		if v != "" {
+			w.Write(extraHeaderKeys[i])
+			w.Write(colonSpace)
+			w.WriteString(v)
+			w.Write(crlf)
+		}
+	}
+}
+
 // writeHeader finalizes the header sent to the client and writes it
 // to cw.res.conn.bufw.
 //
@@ -487,7 +576,106 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	cw.wroteHeader = true
 
 	w := cw.res
+	// keepAlivesEnabled := w.conn.server.doKeepAlives()
+	isHEAD := w.req.Method == "HEAD"
+
+	// header is written out to w.conn.buf below. Depending on the
+	// state of the handler, we either own the map or not. If we
+	// don't own it, the exclude map is created lazily for
+	// WriteSubset to remove headers. The setHeader struct holds
+	// headers we need to add.
+	header := cw.header
+	owned := header != nil
+	if !owned {
+		header = w.handlerHeader
+	}
+	var excludeHeader map[string]bool
+	delHeader := func(key string) {
+		if owned {
+			header.Del(key)
+			return
+		}
+		if _, ok := header[key]; !ok {
+			return
+		}
+		if excludeHeader == nil {
+			excludeHeader = make(map[string]bool)
+		}
+		excludeHeader[key] = true
+	}
+	var setHeader extraHeader
+
+	trailers := false
+
+	te := header.get("Transfer-Encoding")
+	hasTE := te != ""
+
+	// If the handler is done but never sent a Content-Length
+	// response header and this is our first (and last) write, set
+	// it, even to zero. This helps HTTP/1.0 clients keep their
+	// "keep-alive" connections alive.
+	// Exceptions: 304/204/1xx responses never get Content-Length, and if
+	// it was a HEAD request, we don't know the difference between
+	// 0 actual bytes and 0 bytes because the handler noticed it
+	// was a HEAD request and chose not to write anything. So for
+	// HEAD, the handler should either write the Content-Length or
+	// write non-zero bytes. If it's actually 0 bytes and the
+	// handler never looked at the Request.Method, we just don't
+	// send a Content-Length header.
+	// Further, we don't send an automatic Content-Length if they
+	// set a Transfer-Encoding, because they're generally incompatible.
+	if w.handlerDone.Load() && !trailers && !hasTE && bodyAllowedForStatus(w.status) && !header.has("Content-Length") && (!isHEAD || len(p) > 0) {
+		w.contentLength = int64(len(p))
+		setHeader.contentLength = strconv.AppendInt(cw.res.clenBuf[:0], int64(len(p)), 10)
+	}
+
+	code := w.status
+	if bodyAllowedForStatus(code) {
+		// If no content type, apply sniffing algorithm to body.
+		_, haveType := header["Content-Type"]
+
+		// If the Content-Encoding was set and is non-blank,
+		// we shouldn't sniff the body. See Issue 31753.
+		ce := header.Get("Content-Encoding")
+		hasCE := len(ce) > 0
+		if !hasCE && !haveType && !hasTE && len(p) > 0 {
+			setHeader.contentType = DetectContentType(p)
+		}
+	} else {
+		for _, k := range suppressedHeaders(code) {
+			delHeader(k)
+		}
+	}
+
+	if !header.has("Date") {
+		setHeader.date = appendTime(cw.res.dateBuf[:0], time.Now())
+	}
+
+	writeStatusLine(w.conn.bufw, w.req.ProtoAtLeast(1, 1), code, w.statusBuf[:])
+	cw.header.WriteSubset(w.conn.bufw, excludeHeader)
+	setHeader.Write(w.conn.bufw)
 	w.conn.bufw.Write(crlf)
+}
+
+// writeStatusLine writes an HTTP/1.x Status-Line (RFC 7230 Section 3.1.2)
+// to bw. is11 is whether the HTTP request is HTTP/1.1. false means HTTP/1.0.
+// code is the response status code.
+// scratch is an optional scratch buffer. If it has at least capacity 3, it's used.
+func writeStatusLine(bw *bufio.Writer, is11 bool, code int, scratch []byte) {
+	if is11 {
+		bw.WriteString("HTTP/1.1 ")
+	} else {
+		bw.WriteString("HTTP/1.0 ")
+	}
+	if text := StatusText(code); text != "" {
+		bw.Write(strconv.AppendInt(scratch[:0], int64(code), 10))
+		bw.WriteByte(' ')
+		bw.WriteString(text)
+		bw.WriteString("\r\n")
+	} else {
+		// don't worry about performance
+		fmt.Fprintf(bw, "%03d status code %d\r\n", code, code)
+	}
 }
 
 func (w *response) Write(data []byte) (n int, err error) {
@@ -506,10 +694,10 @@ func (w *response) write(lenData int, dataB []byte, dataS string) (n int, err er
 	// 	return 0, ErrBodyNotAllowed
 	// }
 
-	// w.written += int64(lenData) // ignoring errors, for errorKludge
-	// if w.contentLength != -1 && w.written > w.contentLength {
-	// 	return 0, ErrContentLength
-	// }
+	w.written += int64(lenData) // ignoring errors, for errorKludge
+	if w.contentLength != -1 && w.written > w.contentLength {
+		return 0, ErrContentLength
+	}
 	if dataB != nil {
 		return w.w.Write(dataB)
 	} else {
@@ -709,8 +897,6 @@ func (c *conn) serve(ctx context.Context) {
 		c.curReq.Store(nil)
 
 		c.rwc.SetReadDeadline(time.Time{})
-
-		c.rwc.Close()
 	}
 }
 

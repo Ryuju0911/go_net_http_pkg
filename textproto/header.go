@@ -8,6 +8,22 @@ package textproto
 // keys to sets of values.
 type MIMEHeader map[string][]string
 
+// Get gets the first value associated with the given key.
+// It is case insensitive; CanonicalMIMEHeaderKey is used
+// to canonicalize the provided key.
+// If there are no values associated with the key, Get returns "".
+// To use non-canonical keys, access the map directly.
+func (h MIMEHeader) Get(key string) string {
+	if h == nil {
+		return ""
+	}
+	v := h[CanonicalMIMEHeaderKey(key)]
+	if len(v) == 0 {
+		return ""
+	}
+	return v[0]
+}
+
 // Del deletes the values associated with key.
 func (h MIMEHeader) Del(key string) {
 	delete(h, CanonicalMIMEHeaderKey(key))
