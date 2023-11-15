@@ -34,6 +34,10 @@ type pattern struct {
 	loc      string // source location of registering call, for helpful messages
 }
 
+func (p *pattern) lastSegment() segment {
+	return p.segments[len(p.segments)-1]
+}
+
 // A segment is a pattern piece that matches one or more path segments, or
 // a trailing slash.
 //
