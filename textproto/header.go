@@ -8,6 +8,13 @@ package textproto
 // keys to sets of values.
 type MIMEHeader map[string][]string
 
+// Set sets the header entries associated with key to
+// the single element value. It replaces any existing
+// values associated with key.
+func (h MIMEHeader) Set(key, value string) {
+	h[CanonicalMIMEHeaderKey(key)] = []string{value}
+}
+
 // Get gets the first value associated with the given key.
 // It is case insensitive; CanonicalMIMEHeaderKey is used
 // to canonicalize the provided key.

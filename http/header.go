@@ -18,6 +18,15 @@ import (
 // CanonicalHeaderKey.
 type Header map[string][]string
 
+// Set sets the header entries associated with key to the
+// single element value. It replaces any existing values
+// associated with key. The key is case insensitive; it is
+// canonicalized by textproto.CanonicalMIMEHeaderKey.
+// To use non-canonical keys, assign to the map directly.
+func (h Header) Set(key string, value string) {
+	textproto.MIMEHeader(h).Set(key, value)
+}
+
 // Get gets the first value associated with the given key. If
 // there are no values associated with the key, Get returns "".
 // It is case insensitive; textproto.CanonicalMIMEHeaderKey is
@@ -48,6 +57,33 @@ func (h Header) has(key string) bool {
 // CanonicalHeaderKey.
 func (h Header) Del(key string) {
 	textproto.MIMEHeader(h).Del(key)
+}
+
+// Clone returns a copy of h or nil if h is nil.
+func (h Header) Clone() Header {
+	if h == nil {
+		return nil
+	}
+
+	// Find total number of values.
+	nv := 0
+	for _, vv := range h {
+		nv += len(vv)
+	}
+	sv := make([]string, nv) // shared backing array for headers' values
+	h2 := make(Header, len(h))
+	for k, vv := range h {
+		if vv == nil {
+			// Preserve nil values. ReverseProxy distinguishes
+			// between nil and zero-length header values.
+			h2[k] = nil
+			continue
+		}
+		n := copy(sv, vv)
+		h2[k] = sv[:n:n]
+		sv = sv[n:]
+	}
+	return h2
 }
 
 var headerNewlineToSpace = strings.NewReplacer("\n", " ", "\r", " ")
