@@ -18,6 +18,8 @@
 
 package http
 
+import "strings"
+
 // A routingNode is a node in the decision tree.
 // The same struct is used for leaf and interior nodes.
 type routingNode struct {
@@ -98,4 +100,135 @@ func (n *routingNode) findChild(key string) *routingNode {
 	}
 	r, _ := n.children.find(key)
 	return r
+}
+
+// match returns the leaf node under root that matches the arguments, and a list
+// of values for pattern wildcards in the order that the wildcards appear.
+// For example, if the request path is "/a/b/c" and the pattern is "/{x}/b/{y}",
+// then the second return value will be []string{"a", "c"}.
+func (root *routingNode) match(host, method, path string) (*routingNode, []string) {
+	if host != "" {
+		// There is a host. If there is a pattern that specifies that host and it
+		// matches, we are done. If the pattern doesn't match, fall through to
+		// try patterns with no host.
+		if l, m := root.findChild(host).matchMethodAndPath(method, path); l != nil {
+			return l, m
+		}
+	}
+	return root.emptyChild.matchMethodAndPath(method, path)
+}
+
+// matchMethodAndPath matches the method and path.
+// Its return values are the same as [routingNode.match].
+// The receiver should be a child of the root.
+func (n *routingNode) matchMethodAndPath(method, path string) (*routingNode, []string) {
+	if n == nil {
+		return nil, nil
+	}
+	if l, m := n.findChild(method).matchPath(path, nil); l != nil {
+		// Exact match of method name.
+		return l, m
+	}
+	if method == "HEAD" {
+		// GET matches HEAD too.
+		if l, m := n.findChild("GET").matchPath(path, nil); l != nil {
+			return l, m
+		}
+	}
+	// No exact match; try patterns with no method.
+	return n.emptyChild.matchPath(path, nil)
+}
+
+// matchPath matches a path.
+// Its return values are the same as [routingNode.match].
+// matchPath calls itself recursively. The matches argument holds the wildcard matches
+// found so far.
+func (n *routingNode) matchPath(path string, matches []string) (*routingNode, []string) {
+	if n == nil {
+		return nil, nil
+	}
+	// If path is empty, then we are done.
+	// If n is a leaf node, we found a match; return it.
+	// If n is an interior node (which means it has a nil pattern),
+	// then we failed to match.
+	if path == "" {
+		if n.pattern == nil {
+			return nil, nil
+		}
+		return n, matches
+	}
+	// Get the first segment of path.
+	seg, rest := firstSegment(path)
+	// First try matching against patterns that have a literal for this position.
+	// We know by construction that such patterns are more specific than those
+	// with a wildcard at this position (they are either more specific, equivalent,
+	// or overlap, and we ruled out the first two when the patterns were registered).
+	if n, m := n.findChild(seg).matchPath(rest, matches); n != nil {
+		return n, m
+	}
+	// If matching a literal fails, try again with patterns that have a single
+	// wildcard (represented by an empty string in the child mapping).
+	// Again, by construction, patterns with a single wildcard must be more specific than
+	// those with a multi wildcard.
+	// We skip this step if the segment is a trailing slash, because single wildcards
+	// don't match trailing slashes.
+	if seg != "/" {
+		if n, m := n.emptyChild.matchPath(rest, append(matches, seg)); n != nil {
+			return n, m
+		}
+	}
+	// Lastly, match the pattern (there can be at most one) that has a multi
+	// wildcard in this position to the rest of the path.
+	if c := n.findChild("*"); c != nil {
+		// Don't record a match for a nameless wildcard (which arises from a
+		// trailing slash in the pattern).
+		if c.pattern.lastSegment().s != "" {
+			matches = append(matches, pathUnescape(path[1:])) // remove initial slash
+		}
+		return c, matches
+	}
+	return nil, nil
+}
+
+// firstSegment splits path into its first segment, and the rest.
+// The path must begin with "/".
+// If path consists of only a slash, firstSegment returns ("/", "").
+// The segment is returned unescaped, if possible.
+func firstSegment(path string) (seg, rest string) {
+	if path == "/" {
+		return "/", ""
+	}
+	path = path[1:] // drop initial slash
+	i := strings.IndexByte(path, '/')
+	if i < 0 {
+		i = len(path)
+	}
+	return pathUnescape(path[:i]), path[i:]
+}
+
+// matchingMethods adds to methodSet all the methods that would result in a
+// match if passed to routingNode.match with the given host and path.
+func (root *routingNode) matchingMethods(host, path string, methodSet map[string]bool) {
+	if host != "" {
+		root.findChild(host).matchingMethodsPath(path, methodSet)
+	}
+	root.emptyChild.matchingMethodsPath(path, methodSet)
+	if methodSet["GET"] {
+		methodSet["HEAD"] = true
+	}
+}
+
+func (n *routingNode) matchingMethodsPath(path string, set map[string]bool) {
+	if n == nil {
+		return
+	}
+	n.children.eachPair(func(method string, c *routingNode) bool {
+		if p, _ := c.matchPath(path, nil); p != nil {
+			set[method] = true
+		}
+		return true
+	})
+	// Don't look at the empty child. If there were an empty
+	// child, it would match on any method, but we only
+	// call this when we fail to match on a method.
 }

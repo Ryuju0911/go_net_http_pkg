@@ -34,6 +34,8 @@ type pattern struct {
 	loc      string // source location of registering call, for helpful messages
 }
 
+func (p *pattern) String() string { return p.str }
+
 func (p *pattern) lastSegment() segment {
 	return p.segments[len(p.segments)-1]
 }
