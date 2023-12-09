@@ -5,6 +5,7 @@
 package net
 
 import (
+	"errors"
 	"syscall"
 	"time"
 )
@@ -134,6 +135,11 @@ type Listener interface {
 	Close() error
 }
 
+var (
+	// For connection setup and write operations.
+	errMissingAddress = errors.New("missing address")
+)
+
 type AddrError struct {
 	Err  string
 	Addr string
@@ -149,3 +155,35 @@ func (e *AddrError) Error() string {
 	}
 	return s
 }
+
+// DNSError represents a DNS lookup error.
+type DNSError struct {
+	Err         string // description of the error
+	Name        string // name looked for
+	Server      string // server used
+	IsTimeout   bool   // if true, timed out; not all timeouts set this
+	IsTemporary bool   // if true, error is temporary; not all errors set this
+
+	// IsNotFound is set to true when the requested name does not
+	// contain any records of the requested type (data not found),
+	// or the name itself was not found (NXDOMAIN).
+	IsNotFound bool
+}
+
+func (e *DNSError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	s := "lookup " + e.Name
+	if e.Server != "" {
+		s += " on " + e.Server
+	}
+	s += ": " + e.Err
+	return s
+}
+
+type UnknownNetworkError string
+
+func (e UnknownNetworkError) Error() string   { return "unknown network " + string(e) }
+func (e UnknownNetworkError) Timeout() bool   { return false }
+func (e UnknownNetworkError) Temporary() bool { return false }

@@ -47,3 +47,7 @@ func lookupProtocol(_ context.Context, name string) (int, error) {
 	onceReadProtocols.Do(readProtocols)
 	return lookupProtocolMap(name)
 }
+
+func (r *Resolver) lookupPort(ctx context.Context, network, service string) (int, error) {
+	return goLookupPort(network, service)
+}

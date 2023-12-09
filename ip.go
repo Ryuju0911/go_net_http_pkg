@@ -40,6 +40,31 @@ var (
 	IPv6zero = IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 )
 
+// Is p all zeros?
+func isZeros(p IP) bool {
+	for i := 0; i < len(p); i++ {
+		if p[i] != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// To4 converts the IPv4 address ip to a 4-byte representation.
+// If ip is not an IPv4 address, To4 returns nil.
+func (ip IP) To4() IP {
+	if len(ip) == IPv4len {
+		return ip
+	}
+	if len(ip) == IPv6len &&
+		isZeros(ip[0:10]) &&
+		ip[10] == 0xff &&
+		ip[11] == 0xff {
+		return ip[12:16]
+	}
+	return nil
+}
+
 func (ip IP) To16() IP {
 	if len(ip) == IPv4len {
 		return IPv4(ip[0], ip[1], ip[2], ip[3])
