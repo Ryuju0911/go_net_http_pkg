@@ -34,6 +34,28 @@ func socket(
 		return nil, err
 	}
 
+	// This function makes a network file descriptor for the
+	// following applications:
+	//
+	// - An endpoint holder that opens a passive stream
+	//   connection, known as a stream listener
+	//
+	// - An endpoint holder that opens a destination-unspecific
+	//   datagram connection, known as a datagram listener
+	//
+	// - An endpoint holder that opens an active stream or a
+	//   destination-specific datagram connection, known as a
+	//   dialer
+	//
+	// - An endpoint holder that opens the other connection, such
+	//   as talking to the protocol stack inside the kernel
+	//
+	// For stream and datagram listeners, they will only require
+	// named sockets, so we can assume that it's just a request
+	// from stream or datagram listeners when laddr is not nil but
+	// raddr is nil. Otherwise we assume it's just for dialers or
+	// the other connection holders.
+
 	if laddr != nil && raddr == nil {
 		switch sotype {
 		case syscall.SOCK_STREAM:
@@ -48,6 +70,21 @@ func socket(
 
 	// TODO: Implement fd.dial and call it here.
 	return fd, nil
+}
+
+func (fd *netFD) ctrlNetwork() string {
+	switch fd.net {
+	case "unix", "unixgram", "unixpacket":
+		return fd.net
+	}
+	switch fd.net[len(fd.net)-1] {
+	case '4', '6':
+		return fd.net
+	}
+	if fd.family == syscall.AF_INET {
+		return fd.net + "4"
+	}
+	return fd.net + "6"
 }
 
 func (fd *netFD) listenStream(
@@ -65,15 +102,12 @@ func (fd *netFD) listenStream(
 		return err
 	}
 
-	// if ctrlCtxFn != nil {
-	// 	c, err := newRawConn(fd)
-	// 	if err != nil {
-	// 		return err
-	// 	}
-	// 	if err := ctrlCtxFn(ctx, fd.ctrlNetwork(), laddr.String(), c); err != nil {
-	// 		return err
-	// 	}
-	// }
+	if ctrlCtxFn != nil {
+		c := newRawConn(fd)
+		if err := ctrlCtxFn(ctx, fd.ctrlNetwork(), laddr.String(), c); err != nil {
+			return err
+		}
+	}
 
 	if err = syscall.Bind(fd.pfd.Sysfd, lsa); err != nil {
 		return os.NewSyscallError("bind", err)

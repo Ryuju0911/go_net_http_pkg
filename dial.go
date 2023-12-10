@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"internal/bytealg"
+	"syscall"
 	"time"
 )
 
@@ -67,6 +68,14 @@ func (r *Resolver) resolveAddrList(ctx context.Context, op, network, addr string
 
 // ListenConfig contains options for listening to an address.
 type ListenConfig struct {
+	// If Control is not nil, it is called after creating the network
+	// connection but before binding it to the operating system.
+	//
+	// Network and address parameters passed to Control method are not
+	// necessarily the ones passed to Listen. For example, passing "tcp" to
+	// Listen will cause the Control function to be called with "tcp4" or "tcp6".
+	Control func(network, address string, c syscall.RawConn) error
+
 	// KeepAlive specifies the keep-alive period for network
 	// connections accepted by this listener.
 	// If zero, keep-alives are enabled if supported by the protocol

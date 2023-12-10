@@ -18,14 +18,17 @@ func internetSocket(
 	mode string,
 	ctrlCtxFn func(context.Context, string, string, syscall.RawConn) error,
 ) (fd *netFD, err error) {
-	// if (runtime.GOOS == "aix" || runtime.GOOS == "windows" || runtime.GOOS == "openbsd") && mode == "dial" && raddr.isWildcard() {
-	// 	raddr = raddr.toLocal(net)
+	// switch runtime.GOOS {
+	// case "aix", "windows", "openbsd", "js", "wasip1":
+	// 	if mode == "dial" && raddr.isWildcard() {
+	// 		raddr = raddr.toLocal(net)
+	// 	}
 	// }
 	// family, ipv6only := favoriteAddrFamily(net, laddr, raddr, mode)
 
 	// Temporarily hard coded.
 	family, ipv6only := syscall.AF_INET6, false
-	return socket(ctx, net, family, sotype, proto, ipv6only, laddr, raddr, nil)
+	return socket(ctx, net, family, sotype, proto, ipv6only, laddr, raddr, ctrlCtxFn)
 }
 
 func ipToSockaddrInet6(ip IP, port int, zone string) (syscall.SockaddrInet6, error) {
