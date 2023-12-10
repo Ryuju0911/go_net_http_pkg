@@ -100,6 +100,15 @@ func SplitHostPort(hostport string) (host, port string, err error) {
 	return host, port, nil
 }
 
+func JoinHostPort(host, port string) string {
+	// We assume that host is a literal IPv6 address if host has
+	// colons.
+	if bytealg.IndexByteString(host, ':') >= 0 {
+		return "[" + host + "]:" + port
+	}
+	return host + ":" + port
+}
+
 // internetAddrList resolves addr, which may be a literal IP
 // address or a DNS name, and returns a list of internet protocol
 // family addresses. The result contains at least one address when

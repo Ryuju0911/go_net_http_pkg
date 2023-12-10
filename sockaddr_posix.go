@@ -9,6 +9,7 @@ import "syscall"
 // A sockaddr represents a TCP, UDP, IP or Unix network endpoint
 // address that can be converted into a syscall.Sockaddr.
 type sockaddr interface {
+	Addr
 
 	// sockaddr returns the address converted into a syscall
 	// sockaddr type that implements syscall.Sockaddr

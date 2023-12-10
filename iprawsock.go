@@ -27,3 +27,14 @@ type IPAddr struct {
 	IP   IP
 	Zone string // IPv6 scoped addressing zone
 }
+
+func (a *IPAddr) String() string {
+	if a == nil {
+		return "<nil>"
+	}
+	ip := ipEmptyString(a.IP)
+	if a.Zone != "" {
+		return ip + "%" + a.Zone
+	}
+	return ip
+}

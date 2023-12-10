@@ -4,6 +4,8 @@
 
 package net
 
+import "internal/itoa"
+
 // BUG(mikio): On Plan 9, the ReadMsgUDP and
 // WriteMsgUDP methods of UDPConn are not implemented.
 
@@ -18,4 +20,15 @@ type UDPAddr struct {
 	IP   IP
 	Port int
 	Zone string // IPv6 scoped addressing zone
+}
+
+func (a *UDPAddr) String() string {
+	if a == nil {
+		return "<nil>"
+	}
+	ip := ipEmptyString(a.IP)
+	if a.Zone != "" {
+		return JoinHostPort(ip+"%"+a.Zone, itoa.Itoa(a.Port))
+	}
+	return JoinHostPort(ip, itoa.Itoa(a.Port))
 }
