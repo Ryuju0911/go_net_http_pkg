@@ -4,6 +4,8 @@
 
 package net
 
+import "net/netip"
+
 // IP address lengths (bytes)
 const (
 	IPv4len = 4
@@ -73,4 +75,42 @@ func (ip IP) To16() IP {
 		return ip
 	}
 	return nil
+}
+
+// String returns the string form of the IP address ip.
+// It returns one of 4 forms:
+//   - "<nil>", if ip has length 0
+//   - dotted decimal ("192.0.2.1"), if ip is an IPv4 or IP4-mapped IPv6 address
+//   - IPv6 conforming to RFC 5952 ("2001:db8::1"), if ip is a valid IPv6 address
+//   - the hexadecimal form of ip, without punctuation, if no other cases apply
+func (ip IP) String() string {
+	if len(ip) == 0 {
+		return "<nil>"
+	}
+
+	if len(ip) != IPv4len && len(ip) != IPv6len {
+		return "?" + hexString(ip)
+	}
+	// If IPv4, use dotted notation.
+	if p4 := ip.To4(); len(p4) == IPv4len {
+		return netip.AddrFrom4([4]byte(p4)).String()
+	}
+	return netip.AddrFrom16([16]byte(ip)).String()
+}
+
+func hexString(b []byte) string {
+	s := make([]byte, len(b)*2)
+	for i, tn := range b {
+		s[i*2], s[i*2+1] = hexDigit[tn>>4], hexDigit[tn&0xf]
+	}
+	return string(s)
+}
+
+// ipEmptyString is like ip.String except that it returns
+// an empty string when ip is unset.
+func ipEmptyString(ip IP) string {
+	if len(ip) == 0 {
+		return ""
+	}
+	return ip.String()
 }

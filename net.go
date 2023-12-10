@@ -12,6 +12,7 @@ import (
 
 // Addr represents a network end point address.
 type Addr interface {
+	String() string // string form of address (for example, "192.0.2.1:25", "[2001:db8::1]:80")
 }
 
 // Conn is a generic stream-oriented network connection.
