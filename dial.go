@@ -6,7 +6,6 @@ package net
 
 import (
 	"context"
-	"errors"
 	"internal/bytealg"
 	"syscall"
 	"time"
@@ -92,7 +91,7 @@ type ListenConfig struct {
 func (lc *ListenConfig) Listen(ctx context.Context, network, address string) (Listener, error) {
 	addrs, err := DefaultResolver.resolveAddrList(ctx, "listen", network, address, nil)
 	if err != nil {
-		return nil, err
+		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: nil, Err: err}
 	}
 	sl := &sysListener{
 		ListenConfig: *lc,
@@ -103,12 +102,13 @@ func (lc *ListenConfig) Listen(ctx context.Context, network, address string) (Li
 	la := addrs.first(isIPv4)
 	switch la := la.(type) {
 	case *TCPAddr:
+		// TODO: Support multipath TCP.
 		l, err = sl.listenTCP(ctx, la)
 	default:
-		return nil, errors.New("unexpected address type")
+		return nil, &OpError{Op: "listen", Net: sl.network, Source: nil, Addr: la, Err: &AddrError{Err: "unexpected address type", Addr: address}}
 	}
 	if err != nil {
-		return nil, err
+		return nil, &OpError{Op: "listen", Net: sl.network, Source: nil, Addr: la, Err: err} // l is non-nil interface containing nil pointer
 	}
 	return l, nil
 }

@@ -40,7 +40,7 @@ func ipToSockaddrInet6(ip IP, port int, zone string) (syscall.SockaddrInet6, err
 	ip6 := ip.To16()
 	if ip6 == nil {
 		// TODO: Implement ip.String and call it here.
-		return syscall.SockaddrInet6{}, &AddrError{Err: "non-IPv6 address", Addr: ""}
+		return syscall.SockaddrInet6{}, &AddrError{Err: "non-IPv6 address", Addr: ip.String()}
 	}
 	sa := syscall.SockaddrInet6{Port: port}
 	copy(sa.Addr[:], ip6)
