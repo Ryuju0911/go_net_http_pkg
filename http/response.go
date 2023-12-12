@@ -6,6 +6,8 @@
 
 package http
 
+type Response struct{}
+
 // RFC 7234, section 5.4: Should treat
 //
 //	Pragma: no-cache

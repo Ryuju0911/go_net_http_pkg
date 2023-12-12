@@ -202,6 +202,39 @@ func ParseHTTPVersion(vers string) (major, minor int, ok bool) {
 // 	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
 // }
 
+// NewRequest wraps NewRequestWithContext using context.Background.
+func NewRequest(method, url string, body io.Reader) (*Request, error) {
+	return NewRequestWithContext(context.Background(), method, url, body)
+}
+
+// NewRequestWithContext returns a new Request given a method, URL, and
+// optional body.
+//
+// If the provided body is also an io.Closer, the returned
+// Request.Body is set to body and will be closed (possibly
+// asynchronously) by the Client methods Do, Post, and PostForm,
+// and Transport.RoundTrip.
+//
+// NewRequestWithContext returns a Request suitable for use with
+// Client.Do or Transport.RoundTrip. To create a request for use with
+// testing a Server Handler, either use the NewRequest function in the
+// net/http/httptest package, use ReadRequest, or manually update the
+// Request fields. For an outgoing client request, the context
+// controls the entire lifetime of a request and its response:
+// obtaining a connection, sending the request, and reading the
+// response headers and body. See the Request type's documentation for
+// the difference between inbound and outbound request fields.
+//
+// If body is of type *bytes.Buffer, *bytes.Reader, or
+// *strings.Reader, the returned request's ContentLength is set to its
+// exact value (instead of -1), GetBody is populated (so 307 and 308
+// redirects can replay the body), and Body is set to NoBody if the
+// ContentLength is 0.
+func NewRequestWithContext(ctx context.Context, method, url string, body io.Reader) (*Request, error) {
+	// TODO: Implement logic.
+	return nil, nil
+}
+
 func parseRequestLine(line string) (method, requestURI, proto string, ok bool) {
 	method, rest, ok1 := strings.Cut(line, " ")
 	requestURI, proto, ok2 := strings.Cut(rest, " ")
