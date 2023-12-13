@@ -9,10 +9,46 @@
 
 package http
 
-type Client struct{}
+import (
+	"errors"
+	"net/http/internal/ascii"
+	"net/url"
+	"time"
+)
+
+type Client struct {
+	// Timeout specifies a time limit for requests made by this
+	// Client. The timeout includes connection time, any
+	// redirects, and reading the response body. The timer remains
+	// running after Get, Head, Post, or Do return and will
+	// interrupt reading of the Response.Body.
+	//
+	// A Timeout of zero means no timeout.
+	//
+	// The Client cancels requests to the underlying Transport
+	// as if the Request's Context ended.
+	//
+	// For compatibility, the Client will also use the deprecated
+	// CancelRequest method on Transport if found. New
+	// RoundTripper implementations should use the Request's Context
+	// for cancellation instead of implementing CancelRequest.
+	Timeout time.Duration
+}
 
 // DefaultClient is the default Client and is used by Get, Head, and Post.
 var DefaultClient = Client{}
+
+func (c *Client) deadline() time.Time {
+	if c.Timeout > 0 {
+		return time.Now().Add(c.Timeout)
+	}
+	return time.Time{}
+}
+
+// didTimeout is non-nil only if err != nil.
+func (c *Client) send(req *Request, deadline time.Time) (resp *Response, didTimeout func() bool, err error) {
+	return nil, nil, nil
+}
 
 // Get issues a GET to the specified URL. If the response is one of
 // the following redirect codes, Get follows the redirect, up to a
@@ -68,12 +104,22 @@ func Get(url string) (resp *Response, err error) {
 //
 // To make a request with a specified context.Context, use NewRequestWithContext
 // and DefaultClient.Do.
-func (c *Client) Get(url string) (res *Response, err error) {
+func (c *Client) Get(url string) (resp *Response, err error) {
 	req, err := NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
 	return c.Do(req)
+}
+
+func urlErrorOp(method string) string {
+	if method == "" {
+		return "Get"
+	}
+	if lowerMethod, ok := ascii.ToLower(method); ok {
+		return method[:1] + lowerMethod[1:]
+	}
+	return method
 }
 
 // Do sends an HTTP request and returns an HTTP response, following
@@ -114,7 +160,48 @@ func (c *Client) Get(url string) (res *Response, err error) {
 // Any returned error will be of type *url.Error. The url.Error
 // value's Timeout method will report true if the request timed out.
 func (c *Client) Do(req *Request) (*Response, error) {
-	// TODO: Implement c.do and call it here.
-	// return c.do(req)
-	return nil, nil
+	return c.do(req)
+}
+
+func (c *Client) do(req *Request) (retres *Response, reterr error) {
+	if req.URL == nil {
+		req.closeBody()
+		return nil, &url.Error{
+			Op:  urlErrorOp(req.Method),
+			Err: errors.New("http: nil Request.URL"),
+		}
+	}
+
+	var (
+		deadline = c.deadline()
+		reqs     []*Request
+		resp     *Response
+		// copyHeaders   = c.makeHeadersCopier(req)
+		// reqBodyClosed = false // have we closed the current req.Body?
+
+		// // Redirect behavior:
+		// redirectMethod string
+		// includeBody    bool
+	)
+	for {
+		// For all but the first request, create the next
+		// request hop and replace req.
+		if len(reqs) > 0 {
+			loc := resp.Header.Get("Location")
+			if loc == "" {
+				// While most 3xx responses include a Location, it is not
+				// required and 3xx responses without a Location have been
+				// observed in the wild. See issues #17773 and #49281.
+				return resp, nil
+			}
+			// TODO: Handles the case when loc != nil.
+		}
+		reqs = append(reqs, req)
+		var err error
+		// var didTimeout func() bool
+		if resp, _, err = c.send(req, deadline); err != nil {
+			// TOOD: Implement logic
+			return nil, err
+		}
+	}
 }

@@ -376,3 +376,10 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 	// }
 	return req, nil
 }
+
+func (r *Request) closeBody() error {
+	if r.Body == nil {
+		return nil
+	}
+	return r.Body.Close()
+}
