@@ -3,10 +3,12 @@ package http
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/textproto"
 	"net/url"
+	urlpkg "net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -232,7 +234,44 @@ func NewRequest(method, url string, body io.Reader) (*Request, error) {
 // ContentLength is 0.
 func NewRequestWithContext(ctx context.Context, method, url string, body io.Reader) (*Request, error) {
 	// TODO: Implement logic.
-	return nil, nil
+	if method == "" {
+		// We document that "" means "GET" for Request.Method, and people have
+		// relied on that from NewRequest, so keep that working.
+		// We still enforce validMethod for non-empty methods.
+		method = "GET"
+	}
+	// if !validMethod(method) {
+	// 	return nil, fmt.Errorf("net/http: invalid method %q", method)
+	// }
+	if ctx == nil {
+		return nil, errors.New("net/http: nil Context")
+	}
+	u, err := urlpkg.Parse(url)
+	if err != nil {
+		return nil, err
+	}
+	rc, ok := body.(io.ReadCloser)
+	if !ok && body != nil {
+		rc = io.NopCloser(body)
+	}
+	// The host's colon:port should be normalized. See Issue 14836.
+	u.Host = removeEmptyPort(u.Host)
+	req := &Request{
+		ctx:        ctx,
+		Method:     method,
+		URL:        u,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     make(Header),
+		Body:       rc,
+		Host:       u.Host,
+	}
+	if body != nil {
+		// TODO: Implement logic.
+	}
+
+	return req, nil
 }
 
 func parseRequestLine(line string) (method, requestURI, proto string, ok bool) {

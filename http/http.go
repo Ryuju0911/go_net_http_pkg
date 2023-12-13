@@ -7,6 +7,7 @@ package http
 import (
 	"io"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -23,6 +24,19 @@ var aLongTimeAgo = time.Unix(1, 0)
 // a pointer so it fits in an interface{} without allocation.
 type contextKey struct {
 	name string
+}
+
+// Given a string of the form "host", "host:port", or "[ipv6::address]:port",
+// return true if the string includes a port.
+func hasPort(s string) bool { return strings.LastIndex(s, ":") > strings.LastIndex(s, "]") }
+
+// removeEmptyPort strips the empty port in ":port" to ""
+// as mandated by RFC 3986 Section 6.2.3.
+func removeEmptyPort(host string) string {
+	if hasPort(host) {
+		return strings.TrimSuffix(host, ":")
+	}
+	return host
 }
 
 // func isNotToken(r rune) bool {
