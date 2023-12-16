@@ -4,13 +4,26 @@
 
 package ascii
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+)
 
 // IsPrint returns whether s is ASCII and printable according to
 // https://tools.ietf.org/html/rfc20#section-4.2.
 func IsPrint(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] < ' ' || s[i] > '~' {
+			return false
+		}
+	}
+	return true
+}
+
+// Is returns whether s is ASCII.
+func Is(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > unicode.MaxASCII {
 			return false
 		}
 	}
