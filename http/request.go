@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http/internal/ascii"
 	"net/textproto"
 	"net/url"
 	urlpkg "net/url"
 	"strconv"
 	"strings"
 	"sync"
+
+	"golang.org/x/net/idna"
 )
 
 func badStringError(what, val string) error { return fmt.Errorf("%s %q", what, val) }
@@ -150,6 +153,24 @@ type Request struct {
 	ctx context.Context
 }
 
+// Context returns the request's context. To change the context, use
+// Clone or WithContext.
+//
+// The returned context is always non-nil; it defaults to the
+// background context.
+//
+// For outgoing client requests, the context controls cancellation.
+//
+// For incoming server requests, the context is canceled when the
+// client's connection closes, the request is canceled (with HTTP/2),
+// or when the ServeHTTP method returns.
+func (r *Request) Context() context.Context {
+	if r.ctx != nil {
+		return r.ctx
+	}
+	return context.Background()
+}
+
 // ProtoAtLeast reports whether the HTTP protocol used
 // in the request is at least major.minor.
 func (r *Request) ProtoAtLeast(major, minor int) bool {
@@ -170,6 +191,22 @@ func (r *Request) AddCookie(c *Cookie) {
 	} else {
 		r.Header.Set("Cookie", s)
 	}
+}
+
+func idnaASCII(v string) (string, error) {
+	// TODO: Consider removing this check after verifying performance is okay.
+	// Right now punycode verification, length checks, context checks, and the
+	// permissible character tests are all omitted. It also prevents the ToASCII
+	// call from salvaging an invalid IDN, when possible. As a result it may be
+	// possible to have two IDNs that appear identical to the user where the
+	// ASCII-only version causes an error downstream whereas the non-ASCII
+	// version does not.
+	// Note that for correct ASCII IDNs ToASCII will only do considerably more
+	// work, but it will not cause an allocation.
+	if ascii.Is(v) {
+		return v, nil
+	}
+	return idna.Lookup.ToASCII(v)
 }
 
 // ParseHTTPVersion parses an HTTP version string according to RFC 7230, section 2.6.
@@ -202,22 +239,22 @@ func ParseHTTPVersion(vers string) (major, minor int, ok bool) {
 	return int(maj), int(min), true
 }
 
-// func validMethod(method string) bool {
-// 	/*
-// 	     Method         = "OPTIONS"                ; Section 9.2
-// 	                    | "GET"                    ; Section 9.3
-// 	                    | "HEAD"                   ; Section 9.4
-// 	                    | "POST"                   ; Section 9.5
-// 	                    | "PUT"                    ; Section 9.6
-// 	                    | "DELETE"                 ; Section 9.7
-// 	                    | "TRACE"                  ; Section 9.8
-// 	                    | "CONNECT"                ; Section 9.9
-// 	                    | extension-method
-// 	   extension-method = token
-// 	     token          = 1*<any CHAR except CTLs or separators>
-// 	*/
-// 	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
-// }
+func validMethod(method string) bool {
+	/*
+	     Method         = "OPTIONS"                ; Section 9.2
+	                    | "GET"                    ; Section 9.3
+	                    | "HEAD"                   ; Section 9.4
+	                    | "POST"                   ; Section 9.5
+	                    | "PUT"                    ; Section 9.6
+	                    | "DELETE"                 ; Section 9.7
+	                    | "TRACE"                  ; Section 9.8
+	                    | "CONNECT"                ; Section 9.9
+	                    | extension-method
+	   extension-method = token
+	     token          = 1*<any CHAR except CTLs or separators>
+	*/
+	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
+}
 
 // NewRequest wraps NewRequestWithContext using context.Background.
 func NewRequest(method, url string, body io.Reader) (*Request, error) {
