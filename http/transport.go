@@ -10,13 +10,16 @@
 package http
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"sync"
+	"time"
 )
 
 // DefaultTransport is the default implementation of Transport and is
@@ -37,12 +40,51 @@ var DefaultTransport RoundTripper = &Transport{
 	// ExpectContinueTimeout: 1 * time.Second,
 }
 
+// DefaultMaxIdleConnsPerHost is the default value of Transport's
+// MaxIdleConnsPerHost.
+const DefaultMaxIdleConnsPerHost = 2
+
+// Transport is an implementation of RoundTripper that supports HTTP,
+// HTTPS, and HTTP proxies (for either HTTP or HTTPS with CONNECT).
+//
+// By default, Transport caches connections for future re-use.
+// This may leave many open connections when accessing many hosts.
+// This behavior can be managed using Transport's CloseIdleConnections method
+// and the MaxIdleConnsPerHost and DisableKeepAlives fields.
+//
+// Transports should be reused instead of created as needed.
+// Transports are safe for concurrent use by multiple goroutines.
+//
+// A Transport is a low-level primitive for making HTTP and HTTPS requests.
+// For high-level functionality, such as cookies and redirects, see Client.
+//
+// Transport uses HTTP/1.1 for HTTP URLs and either HTTP/1.1 or HTTP/2
+// for HTTPS URLs, depending on whether the server supports HTTP/2,
+// and how the Transport is configured. The DefaultTransport supports HTTP/2.
+// To explicitly enable HTTP/2 on a transport, use golang.org/x/net/http2
+// and call ConfigureTransport. See the package docs for more about HTTP/2.
+//
+// Responses with status codes in the 1xx range are either handled
+// automatically (100 expect-continue) or ignored. The one
+// exception is HTTP status code 101 (Switching Protocols), which is
+// considered a terminal status and returned by RoundTrip. To see the
+// ignored 1xx responses, use the httptrace trace package's
+// ClientTrace.Got1xxResponse.
+//
+// Transport only retries a request upon encountering a network error
+// if the connection has been already been used successfully and if the
+// request is idempotent and either has no body or has its Request.GetBody
+// defined. HTTP requests are considered idempotent if they have HTTP methods
+// GET, HEAD, OPTIONS, or TRACE; or if their Header map contains an
+// "Idempotency-Key" or "X-Idempotency-Key" entry. If the idempotency key
+// value is a zero-length slice, the request is treated as idempotent but the
+// header is not sent on the wire.
 type Transport struct {
-	// idleMu       sync.Mutex
-	// closeIdle    bool                                // user has requested to close all idle conns
-	// idleConn     map[connectMethodKey][]*persistConn // most recently used at end
-	// idleConnWait map[connectMethodKey]wantConnQueue  // waiting getConns
-	// idleLRU      connLRU
+	idleMu       sync.Mutex
+	closeIdle    bool                                // user has requested to close all idle conns
+	idleConn     map[connectMethodKey][]*persistConn // most recently used at end
+	idleConnWait map[connectMethodKey]wantConnQueue  // waiting getConns
+	idleLRU      connLRU
 
 	// reqMu       sync.Mutex
 	// reqCanceler map[cancelKey]func(error)
@@ -126,12 +168,12 @@ type Transport struct {
 	// // wait for a TLS handshake. Zero means no timeout.
 	// TLSHandshakeTimeout time.Duration
 
-	// // DisableKeepAlives, if true, disables HTTP keep-alives and
-	// // will only use the connection to the server for a single
-	// // HTTP request.
-	// //
-	// // This is unrelated to the similarly named TCP keep-alives.
-	// DisableKeepAlives bool
+	// DisableKeepAlives, if true, disables HTTP keep-alives and
+	// will only use the connection to the server for a single
+	// HTTP request.
+	//
+	// This is unrelated to the similarly named TCP keep-alives.
+	DisableKeepAlives bool
 
 	// // DisableCompression, if true, prevents the Transport from
 	// // requesting compression with an "Accept-Encoding: gzip"
@@ -143,14 +185,14 @@ type Transport struct {
 	// // uncompressed.
 	// DisableCompression bool
 
-	// // MaxIdleConns controls the maximum number of idle (keep-alive)
-	// // connections across all hosts. Zero means no limit.
-	// MaxIdleConns int
+	// MaxIdleConns controls the maximum number of idle (keep-alive)
+	// connections across all hosts. Zero means no limit.
+	MaxIdleConns int
 
-	// // MaxIdleConnsPerHost, if non-zero, controls the maximum idle
-	// // (keep-alive) connections to keep per-host. If zero,
-	// // DefaultMaxIdleConnsPerHost is used.
-	// MaxIdleConnsPerHost int
+	// MaxIdleConnsPerHost, if non-zero, controls the maximum idle
+	// (keep-alive) connections to keep per-host. If zero,
+	// DefaultMaxIdleConnsPerHost is used.
+	MaxIdleConnsPerHost int
 
 	// // MaxConnsPerHost optionally limits the total number of
 	// // connections per host, including connections in the dialing,
@@ -159,11 +201,11 @@ type Transport struct {
 	// // Zero means no limit.
 	// MaxConnsPerHost int
 
-	// // IdleConnTimeout is the maximum amount of time an idle
-	// // (keep-alive) connection will remain idle before closing
-	// // itself.
-	// // Zero means no limit.
-	// IdleConnTimeout time.Duration
+	// IdleConnTimeout is the maximum amount of time an idle
+	// (keep-alive) connection will remain idle before closing
+	// itself.
+	// Zero means no limit.
+	IdleConnTimeout time.Duration
 
 	// // ResponseHeaderTimeout, if non-zero, specifies the amount of
 	// // time to wait for a server's response headers after fully
@@ -389,14 +431,123 @@ func (t *Transport) connectMethodForRequst(treq *transportRequest) (cm connectMe
 	return cm, err
 }
 
+// error values for debugging and testing, not seen by users.
+var (
+	errKeepAlivesDisabled = errors.New("http: putIdleConn: keep alives disabled")
+	errConnBroken         = errors.New("http: putIdleConn: connection is in bad state")
+	errCloseIdle          = errors.New("http: putIdleConn: CloseIdleConnections was called")
+	errTooManyIdle        = errors.New("http: putIdleConn: too many idle connections")
+	errTooManyIdleHost    = errors.New("http: putIdleConn: too many idle connections for host")
+	// errCloseIdleConns     = errors.New("http: CloseIdleConnections called")
+	// errReadLoopExiting    = errors.New("http: persistConn.readLoop exiting")
+	errIdleConnTimeout = errors.New("http: idle connection timeout")
+
+	// // errServerClosedIdle is not seen by users for idempotent requests, but may be
+	// // seen by a user if the server shuts down an idle connection and sends its FIN
+	// // in flight with already-written POST body bytes from the client.
+	// // See https://github.com/golang/go/issues/19943#issuecomment-355607646
+	// errServerClosedIdle = errors.New("http: server closed idle connection")
+)
+
 func (t *Transport) putOrCloseIdleConn(pconn *persistConn) {
 	if err := t.tryPutIdleConn(pconn); err != nil {
 		pconn.close(err)
 	}
 }
 
+func (t *Transport) maxIdleConnsPerHost() int {
+	if v := t.MaxIdleConnsPerHost; v != 0 {
+		return v
+	}
+	return DefaultMaxIdleConnsPerHost
+}
+
+// tryPutIdleConn adds pconn to the list of idle persistent connections awaiting
+// a new request.
+// If pconn is no longer needed or not in a good state, tryPutIdleConn returns
+// an error explaining why it wasn't registered.
+// tryPutIdleConn does not close pconn. Use putOrCloseIdleConn instead for that.
 func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
-	// TODO: Implement logic.
+	if t.DisableKeepAlives || t.MaxIdleConnsPerHost < 0 {
+		return errKeepAlivesDisabled
+	}
+	if pconn.isBroken() {
+		return errConnBroken
+	}
+	pconn.markReused()
+
+	t.idleMu.Lock()
+	defer t.idleMu.Unlock()
+
+	// HTTP/2 (pconn.alt != nil) connections do not come out of the idle list,
+	// because multiple goroutines can use them simultaneously.
+	// If this is an HTTP/2 connection being “returned,” we're done.
+	if pconn.alt != nil && t.idleLRU.m[pconn] != nil {
+		return nil
+	}
+
+	// Deliver pconn to goroutine waiting for idle connection, if any.
+	// (They may be actively dialing, but this conn is ready first.
+	// Chrome calls this socket late binding.
+	// See https://www.chromium.org/developers/design-documents/network-stack#TOC-Connection-Management.)
+	key := pconn.cacheKey
+	if q, ok := t.idleConnWait[key]; ok {
+		done := false
+		// HTTP/1.
+		// Loop over the waiting list until we find a w that isn't done already, and hand it pconn.
+		for q.len() > 0 {
+			w := q.popFront()
+			if w.tryDeliver(pconn, nil) {
+				done = true
+				break
+			}
+		}
+		// TODO: Handle HTTP/2
+
+		if q.len() == 0 {
+			delete(t.idleConnWait, key)
+		} else {
+			t.idleConnWait[key] = q
+		}
+		if done {
+			return nil
+		}
+	}
+
+	if t.closeIdle {
+		return errCloseIdle
+	}
+	if t.idleConn == nil {
+		t.idleConn = make(map[connectMethodKey][]*persistConn)
+	}
+	idles := t.idleConn[key]
+	if len(idles) >= t.maxIdleConnsPerHost() {
+		return errTooManyIdleHost
+	}
+	for _, exist := range idles {
+		if exist == pconn {
+			log.Fatalf("dup idle pconn %p in freelist", pconn)
+		}
+	}
+	t.idleConn[key] = append(idles, pconn)
+	t.idleLRU.add(pconn)
+	if t.MaxIdleConns != 0 && t.idleLRU.len() > t.MaxIdleConns {
+		oldest := t.idleLRU.removeOldest()
+		oldest.close(errTooManyIdle)
+		t.removeIdleConnLocked(oldest)
+	}
+
+	// Set idle timer, but only for HTTP/1 (pconn.alt == nil).
+	// The HTTP/2 implementation manages the idle timer itself
+	// (see idleConnTimeout in h2_bundle.go).
+	if t.IdleConnTimeout > 0 && pconn.alt == nil {
+		if pconn.idleTimer != nil {
+			pconn.idleTimer.Reset(t.IdleConnTimeout)
+		} else {
+			pconn.idleTimer = time.AfterFunc(t.IdleConnTimeout, pconn.closeConnIfStillIdle)
+		}
+	}
+	pconn.idleAt = time.Now()
 	return nil
 }
 
@@ -406,6 +557,39 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 func (t *Transport) queueForIdleConn(w *wantConn) (delivered bool) {
 	// TODO: Implement logic.
 	return true
+}
+
+// t.idleMu must be held.
+func (t *Transport) removeIdleConnLocked(pconn *persistConn) bool {
+	if pconn.idleTimer != nil {
+		pconn.idleTimer.Stop()
+	}
+	t.idleLRU.remove(pconn)
+	key := pconn.cacheKey
+	pconns := t.idleConn[key]
+	var removed bool
+	switch len(pconns) {
+	case 0:
+		// Nothing
+	case 1:
+		if pconns[0] == pconn {
+			delete(t.idleConn, key)
+			removed = true
+		}
+	default:
+		for i, v := range pconns {
+			if v != pconn {
+				continue
+			}
+			// Slide down, keeping most recently-used
+			// conns at the end.
+			copy(pconns[i:], pconns[i+1:])
+			t.idleConn[key] = pconns[:len(pconns)-1]
+			removed = true
+			break
+		}
+	}
+	return removed
 }
 
 // A wantConn records state about a wanted connection
@@ -431,6 +615,25 @@ type wantConn struct {
 	err error
 }
 
+// tryDeliver attempts to deliver pc, err to w and reports whether it succeeded.
+func (w *wantConn) tryDeliver(pc *persistConn, err error) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.pc != nil || w.err != nil {
+		return false
+	}
+
+	w.ctx = nil
+	w.pc = pc
+	w.err = err
+	if w.pc == nil && w.err == nil {
+		panic("net/http: internal error: misuse of tryDeliver")
+	}
+	close(w.ready)
+	return true
+}
+
 // cancel marks w as no longer wanting a result (for example, due to cancellation).
 // If a connection has been delivered already, cancel returns it with t.putOrCloseIdleConn.
 func (w *wantConn) cancel(t *Transport, err error) {
@@ -447,6 +650,43 @@ func (w *wantConn) cancel(t *Transport, err error) {
 	if pc != nil {
 		t.putOrCloseIdleConn(pc)
 	}
+}
+
+// A wantConnQueue is a queue of wantConns.
+type wantConnQueue struct {
+	// This is a queue, not a deque.
+	// It is split into two stages - head[headPos:] and tail.
+	// popFront is trivial (headPos++) on the first stage, and
+	// pushBack is trivial (append) on the second stage.
+	// If the first stage is empty, popFront can swap the
+	// first and second stages to remedy the situation.
+	//
+	// This two-stage split is analogous to the use of two lists
+	// in Okasaki's purely functional queue but without the
+	// overhead of reversing the list when swapping stages.
+	head    []*wantConn
+	headPos int
+	tail    []*wantConn
+}
+
+// len returns the number of items in the queue.
+func (q *wantConnQueue) len() int {
+	return len(q.head) - q.headPos + len(q.tail)
+}
+
+// popFront removes and returns the wantConn at the front of the queue.
+func (q *wantConnQueue) popFront() *wantConn {
+	if q.headPos >= len(q.head) {
+		if len(q.tail) == 0 {
+			return nil
+		}
+		// Pick up tail as new head, clear tail.
+		q.head, q.headPos, q.tail = q.tail, 0, q.head[:0]
+	}
+	w := q.head[q.headPos]
+	q.head[q.headPos] = nil
+	q.headPos++
+	return w
 }
 
 // getConn dials and creates a new persistConn to the target as
@@ -543,10 +783,10 @@ type connectMethodKey struct {
 // persistConn wraps a connection, usually a persistent one
 // (but may be used for non-keep-alive requests as well)
 type persistConn struct {
-	// // alt optionally specifies the TLS NextProto RoundTripper.
-	// // This is used for HTTP/2 today and future protocols later.
-	// // If it's non-nil, the rest of the fields are unused.
-	// alt RoundTripper
+	// alt optionally specifies the TLS NextProto RoundTripper.
+	// This is used for HTTP/2 today and future protocols later.
+	// If it's non-nil, the rest of the fields are unused.
+	alt RoundTripper
 
 	t        *Transport
 	cacheKey connectMethodKey
@@ -569,22 +809,53 @@ type persistConn struct {
 
 	// writeLoopDone chan struct{} // closed when write loop ends
 
-	// // Both guarded by Transport.idleMu:
-	// idleAt    time.Time   // time it last become idle
-	// idleTimer *time.Timer // holding an AfterFunc to close it
+	// Both guarded by Transport.idleMu:
+	idleAt    time.Time   // time it last become idle
+	idleTimer *time.Timer // holding an AfterFunc to close it
 
 	mu sync.Mutex // guards following fields
 	// numExpectedResponses int
 	closed error // set non-nil when conn is closed, before closech is closed
 	// canceledErr          error // set non-nil if conn is canceled
 	broken bool // an error has happened on this connection; marked broken so it's not reused.
-	// reused               bool  // whether conn has had successful request/response and is being reused.
+	reused bool // whether conn has had successful request/response and is being reused.
 	// mutateHeaderFunc is an optional func to modify extra
 	// headers on each outbound request before it's written. (the
 	// original Request given to RoundTrip is not modified)
 	mutateHeaderFunc func(Header)
 }
 
+// isBroken reports whether this connection is in a known broken state.
+func (pc *persistConn) isBroken() bool {
+	pc.mu.Lock()
+	b := pc.closed != nil
+	pc.mu.Unlock()
+	return b
+}
+
+func (pc *persistConn) closeConnIfStillIdle() {
+	t := pc.t
+	t.idleMu.Lock()
+	defer t.idleMu.Unlock()
+	if _, ok := t.idleLRU.m[pc]; !ok {
+		// Not idle.
+		return
+	}
+	t.removeIdleConnLocked(pc)
+	pc.close(errIdleConnTimeout)
+}
+
+func (pc *persistConn) markReused() {
+	pc.mu.Lock()
+	pc.reused = true
+	pc.mu.Unlock()
+}
+
+// close closes the underlying TCP connection and closes
+// the pc.closech channel.
+//
+// The provided err is only for testing and debugging; in normal
+// circumstances it should never be seen by users.
 func (pc *persistConn) close(err error) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
@@ -637,4 +908,43 @@ func canonicalAddr(url *url.URL) string {
 func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
 	// TODO: Implement logic.
 	return nil, nil
+}
+
+type connLRU struct {
+	ll *list.List // list.Element.Value type is of *persistConn.
+	m  map[*persistConn]*list.Element
+}
+
+// add adds pc to the head of the linked list.
+func (cl *connLRU) add(pc *persistConn) {
+	if cl.ll == nil {
+		cl.ll = list.New()
+		cl.m = make(map[*persistConn]*list.Element)
+	}
+	ele := cl.ll.PushFront(pc)
+	if _, ok := cl.m[pc]; ok {
+		panic("persistConn was already in LRU")
+	}
+	cl.m[pc] = ele
+}
+
+func (cl *connLRU) removeOldest() *persistConn {
+	ele := cl.ll.Back()
+	pc := ele.Value.(*persistConn)
+	cl.ll.Remove(ele)
+	delete(cl.m, pc)
+	return pc
+}
+
+// remove removes pc from cl.
+func (cl *connLRU) remove(pc *persistConn) {
+	if ele, ok := cl.m[pc]; ok {
+		cl.ll.Remove(ele)
+		delete(cl.m, pc)
+	}
+}
+
+// len returns the number of items in the cache.
+func (cl *connLRU) len() int {
+	return len(cl.m)
 }
