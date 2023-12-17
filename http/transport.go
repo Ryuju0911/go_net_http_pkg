@@ -10,11 +10,13 @@
 package http
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
+	"sync"
 )
 
 // DefaultTransport is the default implementation of Transport and is
@@ -387,13 +389,103 @@ func (t *Transport) connectMethodForRequst(treq *transportRequest) (cm connectMe
 	return cm, err
 }
 
+func (t *Transport) putOrCloseIdleConn(pconn *persistConn) {
+	if err := t.tryPutIdleConn(pconn); err != nil {
+		pconn.close(err)
+	}
+}
+
+func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
+	// TODO: Implement logic.
+	return nil
+}
+
+// queueForIdleConn queues w to receive the next idle connection for w.cm.
+// As an optimization hint to the caller, queueForIdleConn reports whether
+// it successfully delivered an already-idle connection.
+func (t *Transport) queueForIdleConn(w *wantConn) (delivered bool) {
+	// TODO: Implement logic.
+	return true
+}
+
+// A wantConn records state about a wanted connection
+// (that is, an active call to getConn).
+// The conn may be gotten by dialing or by finding an idle connection,
+// or a cancellation may make the conn no longer wanted.
+// These three options are racing against each other and use
+// wantConn to coordinate and agree about the winning outcome.
+type wantConn struct {
+	cm    connectMethod
+	key   connectMethodKey // cm.key()
+	ready chan struct{}    // closed when pc, err pair is delivered
+
+	// // hooks for testing to know when dials are done
+	// // beforeDial is called in the getConn goroutine when the dial is queued.
+	// // afterDial is called when the dial is completed or canceled.
+	// beforeDial func()
+	// afterDial  func()
+
+	mu  sync.Mutex      // protects ctx, pc, err, close(ready)
+	ctx context.Context // context for dial, cleared after delivered or canceled
+	pc  *persistConn
+	err error
+}
+
+// cancel marks w as no longer wanting a result (for example, due to cancellation).
+// If a connection has been delivered already, cancel returns it with t.putOrCloseIdleConn.
+func (w *wantConn) cancel(t *Transport, err error) {
+	w.mu.Lock()
+	if w.pc == nil && w.err == nil {
+		close(w.ready) // catch misbehavior in future delivery
+	}
+	pc := w.pc
+	w.ctx = nil
+	w.pc = nil
+	w.err = err
+	w.mu.Unlock()
+
+	if pc != nil {
+		t.putOrCloseIdleConn(pc)
+	}
+}
+
 // getConn dials and creates a new persistConn to the target as
 // specified in the connectMethod. This includes doing a proxy CONNECT
 // and/or setting up TLS.  If this doesn't return an error, the persistConn
 // is ready to write requests to.
 func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (pc *persistConn, err error) {
-	// TODO: Implement logic.
+	req := treq.Request
+	// trace := treq.trace
+	ctx := req.Context()
+	// if trace != nil && trace.GetConn != nil {
+	// 	trace.GetConn(cm.addr())
+	// }
+
+	w := &wantConn{
+		cm:    cm,
+		key:   cm.key(),
+		ctx:   ctx,
+		ready: make(chan struct{}, 1),
+		// beforeDial: testHookPrePendingDial,
+		// afterDial:  testHookPostPendingDial,
+	}
+	defer func() {
+		if err != nil {
+			w.cancel(t, err)
+		}
+	}()
+
+	// Queue for idle connection.
+	if delivered := t.queueForIdleConn(w); delivered {
+		// TODO: Implement logic.
+	}
 	return nil, nil
+}
+
+// decConnsPerHost decrements the per-host connection count for key,
+// which may in turn give a different waiting goroutine permission to dial.
+func (t *Transport) decConnsPerHost(key connectMethodKey) {
+	// TODO: Implement logic.
 }
 
 // connectMethod is the map key (in its String form) for keeping persistent
@@ -423,6 +515,31 @@ type connectMethod struct {
 	onlyH1     bool // whether to disable HTTP/2 and force HTTP/1
 }
 
+func (cm *connectMethod) key() connectMethodKey {
+	proxyStr := ""
+	targetAddr := cm.targetAddr
+	if cm.proxyURL != nil {
+		proxyStr = cm.proxyURL.String()
+		if (cm.proxyURL.Scheme == "http" || cm.proxyURL.Scheme == "https") && cm.targetScheme == "http" {
+			targetAddr = ""
+		}
+	}
+	return connectMethodKey{
+		proxy:  proxyStr,
+		scheme: cm.targetScheme,
+		addr:   targetAddr,
+		onlyH1: cm.onlyH1,
+	}
+}
+
+// connectMethodKey is the map key version of connectMethod, with a
+// stringified proxy URL (or the empty string) instead of a pointer to
+// a URL.
+type connectMethodKey struct {
+	proxy, scheme, addr string
+	onlyH1              bool
+}
+
 // persistConn wraps a connection, usually a persistent one
 // (but may be used for non-keep-alive requests as well)
 type persistConn struct {
@@ -431,8 +548,8 @@ type persistConn struct {
 	// // If it's non-nil, the rest of the fields are unused.
 	// alt RoundTripper
 
-	// t         *Transport
-	// cacheKey  connectMethodKey
+	t        *Transport
+	cacheKey connectMethodKey
 	// conn      net.Conn
 	// tlsState  *tls.ConnectionState
 	// br        *bufio.Reader       // from conn
@@ -456,16 +573,42 @@ type persistConn struct {
 	// idleAt    time.Time   // time it last become idle
 	// idleTimer *time.Timer // holding an AfterFunc to close it
 
-	// mu                   sync.Mutex // guards following fields
+	mu sync.Mutex // guards following fields
 	// numExpectedResponses int
-	// closed               error // set non-nil when conn is closed, before closech is closed
+	closed error // set non-nil when conn is closed, before closech is closed
 	// canceledErr          error // set non-nil if conn is canceled
-	// broken               bool  // an error has happened on this connection; marked broken so it's not reused.
+	broken bool // an error has happened on this connection; marked broken so it's not reused.
 	// reused               bool  // whether conn has had successful request/response and is being reused.
-	// // mutateHeaderFunc is an optional func to modify extra
-	// // headers on each outbound request before it's written. (the
-	// // original Request given to RoundTrip is not modified)
-	// mutateHeaderFunc func(Header)
+	// mutateHeaderFunc is an optional func to modify extra
+	// headers on each outbound request before it's written. (the
+	// original Request given to RoundTrip is not modified)
+	mutateHeaderFunc func(Header)
+}
+
+func (pc *persistConn) close(err error) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	pc.closeLocked(err)
+}
+
+func (pc *persistConn) closeLocked(err error) {
+	if err == nil {
+		panic("nil error")
+	}
+	pc.broken = true
+	if pc.closed == nil {
+		pc.closed = err
+		pc.t.decConnsPerHost(pc.cacheKey)
+		// // Close HTTP/1 (pc.alt == nil) connection.
+		// // HTTP/2 closes its connection itself.
+		// if pc.alt == nil {
+		// 	if err != errCallerOwnsConn {
+		// 		pc.conn.Close()
+		// 	}
+		// 	close(pc.closech)
+		// }
+	}
+	pc.mutateHeaderFunc = nil
 }
 
 var portMap = map[string]string{
