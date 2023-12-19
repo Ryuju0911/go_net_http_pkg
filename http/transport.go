@@ -34,8 +34,8 @@ var DefaultTransport RoundTripper = &Transport{
 	// 	KeepAlive: 30 * time.Second,
 	// }),
 	// ForceAttemptHTTP2:     true,
-	// MaxIdleConns:          100,
-	// IdleConnTimeout:       90 * time.Second,
+	MaxIdleConns:    100,
+	IdleConnTimeout: 90 * time.Second,
 	// TLSHandshakeTimeout:   10 * time.Second,
 	// ExpectContinueTimeout: 1 * time.Second,
 }
@@ -555,8 +555,89 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 // As an optimization hint to the caller, queueForIdleConn reports whether
 // it successfully delivered an already-idle connection.
 func (t *Transport) queueForIdleConn(w *wantConn) (delivered bool) {
-	// TODO: Implement logic.
-	return true
+	if t.DisableKeepAlives {
+		return false
+	}
+
+	t.idleMu.Lock()
+	defer t.idleMu.Unlock()
+
+	// Stop closing connections that become idle - we might want one.
+	// (That is, undo the effect of t.CloseIdleConnections.)
+	t.closeIdle = false
+
+	if w == nil {
+		// Happens in test hook.
+		return false
+	}
+
+	// If IdleConnTimeout is set, calculate the oldest
+	// persistConn.idleAt time we're willing to use a cached idle
+	// conn.
+	var oldTime time.Time
+	if t.IdleConnTimeout > 0 {
+		oldTime = time.Now().Add(-t.IdleConnTimeout)
+	}
+
+	// Look for most recently-used idle connection.
+	if list, ok := t.idleConn[w.key]; ok {
+		stop := false
+		delivered := false
+		for len(list) > 0 && !stop {
+			pconn := list[len(list)-1]
+
+			// See whether this connection has been idle too long, considering
+			// only the wall time (the Round(0)), in case this is a laptop or VM
+			// coming out of suspend with previously cached idle connections.
+			tooOld := !oldTime.IsZero() && pconn.idleAt.Round(0).Before(oldTime)
+			if tooOld {
+				// Async cleanup. Launch in its own goroutine (as if a
+				// time.AfterFunc called it); it acquires idleMu, which we're
+				// holding, and does a synchronous net.Conn.Close.
+				go pconn.closeConnIfStillIdle()
+			}
+			if pconn.isBroken() || tooOld {
+				// If either persistConn.readLoop has marked the connection
+				// broken, but Transport.removeIdleConn has not yet removed it
+				// from the idle list, or if this persistConn is too old (it was
+				// idle too long), then ignore it and look for another. In both
+				// cases it's already in the process of being closed.
+				list = list[:len(list)-1]
+				continue
+			}
+			delivered = w.tryDeliver(pconn, nil)
+			if delivered {
+				if pconn.alt != nil {
+					// HTTP/2: multiple clients can share pconn.
+					// Leave it in the list.
+				} else {
+					// HTTP/1: only one client can use pconn.
+					// Remove it from the list.
+					t.idleLRU.remove(pconn)
+					list = list[:len(list)-1]
+				}
+			}
+			stop = true
+		}
+		if len(list) > 0 {
+			t.idleConn[w.key] = list
+		} else {
+			delete(t.idleConn, w.key)
+		}
+		if stop {
+			return delivered
+		}
+	}
+
+	// Register to receive next connection that becomes idle.
+	if t.idleConnWait == nil {
+		t.idleConnWait = make(map[connectMethodKey]wantConnQueue)
+	}
+	q := t.idleConnWait[w.key]
+	q.cleanFront()
+	q.pushBack(w)
+	t.idleConnWait[w.key] = q
+	return false
 }
 
 // t.idleMu must be held.
@@ -613,6 +694,16 @@ type wantConn struct {
 	ctx context.Context // context for dial, cleared after delivered or canceled
 	pc  *persistConn
 	err error
+}
+
+// waiting reports whether w is still waiting for an answer (connection or error).
+func (w *wantConn) waiting() bool {
+	select {
+	case <-w.ready:
+		return false
+	default:
+		return true
+	}
 }
 
 // tryDeliver attempts to deliver pc, err to w and reports whether it succeeded.
@@ -674,6 +765,11 @@ func (q *wantConnQueue) len() int {
 	return len(q.head) - q.headPos + len(q.tail)
 }
 
+// pushBack adds w to the back of the queue.
+func (q *wantConnQueue) pushBack(w *wantConn) {
+	q.tail = append(q.tail, w)
+}
+
 // popFront removes and returns the wantConn at the front of the queue.
 func (q *wantConnQueue) popFront() *wantConn {
 	if q.headPos >= len(q.head) {
@@ -687,6 +783,30 @@ func (q *wantConnQueue) popFront() *wantConn {
 	q.head[q.headPos] = nil
 	q.headPos++
 	return w
+}
+
+// peekFront returns the wantConn at the front of the queue without removing it.
+func (q *wantConnQueue) peekFront() *wantConn {
+	if q.headPos < len(q.head) {
+		return q.head[q.headPos]
+	}
+	if len(q.tail) > 0 {
+		return q.tail[0]
+	}
+	return nil
+}
+
+// cleanFront pops any wantConns that are no longer waiting from the head of the
+// queue, reporting whether any were popped.
+func (q *wantConnQueue) cleanFront() (cleaned bool) {
+	for {
+		w := q.peekFront()
+		if w == nil || w.waiting() {
+			return cleaned
+		}
+		q.popFront()
+		cleaned = true
+	}
 }
 
 // getConn dials and creates a new persistConn to the target as
@@ -833,6 +953,9 @@ func (pc *persistConn) isBroken() bool {
 	return b
 }
 
+// closeConnIfStillIdle closes the connection if it's still sitting idle.
+// This is what's called by the persistConn's idleTimer, and is run in its
+// own goroutine.
 func (pc *persistConn) closeConnIfStillIdle() {
 	t := pc.t
 	t.idleMu.Lock()
