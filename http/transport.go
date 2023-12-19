@@ -86,15 +86,15 @@ type Transport struct {
 	idleConnWait map[connectMethodKey]wantConnQueue  // waiting getConns
 	idleLRU      connLRU
 
-	// reqMu       sync.Mutex
-	// reqCanceler map[cancelKey]func(error)
+	reqMu       sync.Mutex
+	reqCanceler map[cancelKey]func(error)
 
 	// altMu    sync.Mutex   // guards changing altProto only
 	// altProto atomic.Value // of nil or map[string]RoundTripper, key is URI scheme
 
-	// connsPerHostMu   sync.Mutex
-	// connsPerHost     map[connectMethodKey]int
-	// connsPerHostWait map[connectMethodKey]wantConnQueue // waiting getConns
+	connsPerHostMu   sync.Mutex
+	connsPerHost     map[connectMethodKey]int
+	connsPerHostWait map[connectMethodKey]wantConnQueue // waiting getConns
 
 	// // Proxy specifies a function to return a proxy for a given
 	// // Request. If the function returns a non-nil error, the
@@ -194,12 +194,12 @@ type Transport struct {
 	// DefaultMaxIdleConnsPerHost is used.
 	MaxIdleConnsPerHost int
 
-	// // MaxConnsPerHost optionally limits the total number of
-	// // connections per host, including connections in the dialing,
-	// // active, and idle states. On limit violation, dials will block.
-	// //
-	// // Zero means no limit.
-	// MaxConnsPerHost int
+	// MaxConnsPerHost optionally limits the total number of
+	// connections per host, including connections in the dialing,
+	// active, and idle states. On limit violation, dials will block.
+	//
+	// Zero means no limit.
+	MaxConnsPerHost int
 
 	// IdleConnTimeout is the maximum amount of time an idle
 	// (keep-alive) connection will remain idle before closing
@@ -376,7 +376,7 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 
 		pconn, err := t.getConn(treq, cm)
 		if err != nil {
-			// t.setReqCanceler(cancelKey, nil)
+			t.setReqCanceler(cancelKey, nil)
 			req.closeBody()
 			return nil, err
 		}
@@ -388,6 +388,8 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 			resp.Request = origReq
 			return resp, nil
 		}
+
+		// Failed. Clean up and determine whether to retry.
 	}
 }
 
@@ -673,6 +675,19 @@ func (t *Transport) removeIdleConnLocked(pconn *persistConn) bool {
 	return removed
 }
 
+func (t *Transport) setReqCanceler(key cancelKey, fn func(error)) {
+	t.reqMu.Lock()
+	defer t.reqMu.Unlock()
+	if t.reqCanceler == nil {
+		t.reqCanceler = make(map[cancelKey]func(error))
+	}
+	if fn != nil {
+		t.reqCanceler[key] = fn
+	} else {
+		delete(t.reqCanceler, key)
+	}
+}
+
 // A wantConn records state about a wanted connection
 // (that is, an active call to getConn).
 // The conn may be gotten by dialing or by finding an idle connection,
@@ -704,6 +719,13 @@ func (w *wantConn) waiting() bool {
 	default:
 		return true
 	}
+}
+
+// getCtxForDial returns context for dial or nil if connection wans delivered or canceled.
+func (w *wantConn) getCtxForDial() context.Context {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.ctx
 }
 
 // tryDeliver attempts to deliver pc, err to w and reports whether it succeeded.
@@ -837,15 +859,89 @@ func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (pc *persi
 
 	// Queue for idle connection.
 	if delivered := t.queueForIdleConn(w); delivered {
-		// TODO: Implement logic.
+		pc := w.pc
+		// // Trace only for HTTP/1.
+		// // HTTP/2 calls trace.GotConn itself.
+		// if pc.alt == nil && trace != nil && trace.GotConn != nil {
+		// 	trace.GotConn(pc.gotIdleConnTrace(pc.idleAt))
+		// }
+		// set request canceler to some non-nil function so we
+		// can detect whether it was cleared between now and when
+		// we enter roundTrip
+		t.setReqCanceler(treq.cancelKey, func(error) {})
+		return pc, nil
 	}
+
+	cancelc := make(chan error, 1)
+	t.setReqCanceler(treq.cancelKey, func(err error) { cancelc <- err })
+
+	// Queue for permission to dial.
+	t.queueForDial(w)
 	return nil, nil
+}
+
+// queueForDial queues w to wait for permission to begin dialing.
+// Once w receives permission to dial, it will do so in a separate goroutine.
+func (t *Transport) queueForDial(w *wantConn) {
+	// w.beforeDial()
+	if t.MaxConnsPerHost <= 0 {
+		go t.dialConnFor(w)
+		return
+	}
+
+	t.connsPerHostMu.Lock()
+	defer t.connsPerHostMu.Unlock()
+
+	if n := t.connsPerHost[w.key]; n < t.MaxConnsPerHost {
+		if t.connsPerHost == nil {
+			t.connsPerHost = make(map[connectMethodKey]int)
+		}
+		t.connsPerHost[w.key] = n + 1
+		go t.dialConnFor(w)
+		return
+	}
+
+	if t.connsPerHostWait == nil {
+		t.connsPerHostWait = make(map[connectMethodKey]wantConnQueue)
+	}
+	q := t.connsPerHostWait[w.key]
+	q.cleanFront()
+	q.pushBack(w)
+	t.connsPerHostWait[w.key] = q
+}
+
+// dialConnFor dials on behalf of w and delivers the result to w.
+// dialConnFor has received permission to dial w.cm and is counted in t.connCount[w.cm.key()].
+// If the dial is canceled or unsuccessful, dialConnFor decrements t.connCount[w.cm.key()].
+func (t *Transport) dialConnFor(w *wantConn) {
+	// defer w.afterDial()
+	ctx := w.getCtxForDial()
+	if ctx == nil {
+		return
+	}
+
+	pc, err := t.dialConn(ctx, w.cm)
+	delivered := w.tryDeliver(pc, err)
+	if err == nil && (!delivered || pc.alt != nil) {
+		// pconn was not passed to w,
+		// or it is HTTP/2 and can be shared.
+		// Add to the idle connection pool.
+		t.putOrCloseIdleConn(pc)
+	}
+	if err != nil {
+		t.decConnsPerHost(w.key)
+	}
 }
 
 // decConnsPerHost decrements the per-host connection count for key,
 // which may in turn give a different waiting goroutine permission to dial.
 func (t *Transport) decConnsPerHost(key connectMethodKey) {
 	// TODO: Implement logic.
+}
+
+func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *persistConn, err error) {
+	// TODO: Implement logic.
+	return nil, nil
 }
 
 // connectMethod is the map key (in its String form) for keeping persistent
