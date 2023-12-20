@@ -936,7 +936,51 @@ func (t *Transport) dialConnFor(w *wantConn) {
 // decConnsPerHost decrements the per-host connection count for key,
 // which may in turn give a different waiting goroutine permission to dial.
 func (t *Transport) decConnsPerHost(key connectMethodKey) {
-	// TODO: Implement logic.
+	if t.MaxConnsPerHost <= 0 {
+		return
+	}
+
+	t.connsPerHostMu.Lock()
+	defer t.connsPerHostMu.Unlock()
+	n := t.connsPerHost[key]
+	if n == 0 {
+		// Shouldn't happen, but if it does, the counting is buggy and could
+		// easily lead to a silent deadlock, so report the problem loudly.
+		panic("net/http: internal error: connCount underflow")
+	}
+
+	// Can we hand this count to a goroutine still waiting to dial?
+	// (Some goroutines on the wait list may have timed out or
+	// gotten a connection another way. If they're all gone,
+	// we don't want to kick off any spurious dial operations.)
+	if q := t.connsPerHostWait[key]; q.len() > 0 {
+		done := false
+		for q.len() > 0 {
+			w := q.popFront()
+			if w.waiting() {
+				go t.dialConnFor(w)
+				done = true
+				break
+			}
+		}
+		if q.len() == 0 {
+			delete(t.connsPerHostWait, key)
+		} else {
+			// q is a value (like a slice), so we have to store
+			// the updated q back into the map.
+			t.connsPerHostWait[key] = q
+		}
+		if done {
+			return
+		}
+	}
+
+	// Otherwise, decrement the recorded count.
+	if n--; n == 0 {
+		delete(t.connsPerHost, key)
+	} else {
+		t.connsPerHost[key] = n
+	}
 }
 
 func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *persistConn, err error) {
