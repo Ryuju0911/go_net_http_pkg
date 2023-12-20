@@ -10,6 +10,7 @@
 package http
 
 import (
+	"bufio"
 	"container/list"
 	"context"
 	"errors"
@@ -116,27 +117,27 @@ type Transport struct {
 	// // If it returns an error, the request fails with that error.
 	// OnProxyConnectResponse func(ctx context.Context, proxyURL *url.URL, connectReq *Request, connectRes *Response) error
 
-	// // DialContext specifies the dial function for creating unencrypted TCP connections.
-	// // If DialContext is nil (and the deprecated Dial below is also nil),
-	// // then the transport dials using package net.
-	// //
-	// // DialContext runs concurrently with calls to RoundTrip.
-	// // A RoundTrip call that initiates a dial may end up using
-	// // a connection dialed previously when the earlier connection
-	// // becomes idle before the later DialContext completes.
-	// DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	// DialContext specifies the dial function for creating unencrypted TCP connections.
+	// If DialContext is nil (and the deprecated Dial below is also nil),
+	// then the transport dials using package net.
+	//
+	// DialContext runs concurrently with calls to RoundTrip.
+	// A RoundTrip call that initiates a dial may end up using
+	// a connection dialed previously when the earlier connection
+	// becomes idle before the later DialContext completes.
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
-	// // Dial specifies the dial function for creating unencrypted TCP connections.
-	// //
-	// // Dial runs concurrently with calls to RoundTrip.
-	// // A RoundTrip call that initiates a dial may end up using
-	// // a connection dialed previously when the earlier connection
-	// // becomes idle before the later Dial completes.
-	// //
-	// // Deprecated: Use DialContext instead, which allows the transport
-	// // to cancel dials as soon as they are no longer needed.
-	// // If both are set, DialContext takes priority.
-	// Dial func(network, addr string) (net.Conn, error)
+	// Dial specifies the dial function for creating unencrypted TCP connections.
+	//
+	// Dial runs concurrently with calls to RoundTrip.
+	// A RoundTrip call that initiates a dial may end up using
+	// a connection dialed previously when the earlier connection
+	// becomes idle before the later Dial completes.
+	//
+	// Deprecated: Use DialContext instead, which allows the transport
+	// to cancel dials as soon as they are no longer needed.
+	// If both are set, DialContext takes priority.
+	Dial func(network, addr string) (net.Conn, error)
 
 	// // DialTLSContext specifies an optional dial function for creating
 	// // TLS connections for non-proxied HTTPS requests.
@@ -248,22 +249,22 @@ type Transport struct {
 	// // ignored.
 	// GetProxyConnectHeader func(ctx context.Context, proxyURL *url.URL, target string) (Header, error)
 
-	// // MaxResponseHeaderBytes specifies a limit on how many
-	// // response bytes are allowed in the server's response
-	// // header.
-	// //
-	// // Zero means to use a default limit.
-	// MaxResponseHeaderBytes int64
+	// MaxResponseHeaderBytes specifies a limit on how many
+	// response bytes are allowed in the server's response
+	// header.
+	//
+	// Zero means to use a default limit.
+	MaxResponseHeaderBytes int64
 
-	// // WriteBufferSize specifies the size of the write buffer used
-	// // when writing to the transport.
-	// // If zero, a default (currently 4KB) is used.
-	// WriteBufferSize int
+	// WriteBufferSize specifies the size of the write buffer used
+	// when writing to the transport.
+	// If zero, a default (currently 4KB) is used.
+	WriteBufferSize int
 
-	// // ReadBufferSize specifies the size of the read buffer used
-	// // when reading from the transport.
-	// // If zero, a default (currently 4KB) is used.
-	// ReadBufferSize int
+	// ReadBufferSize specifies the size of the read buffer used
+	// when reading from the transport.
+	// If zero, a default (currently 4KB) is used.
+	ReadBufferSize int
 
 	// // nextProtoOnce guards initialization of TLSNextProto and
 	// // h2transport (via onceSetNextProtoDefaults)
@@ -284,6 +285,20 @@ type Transport struct {
 // not any transient one created by roundTrip.
 type cancelKey struct {
 	req *Request
+}
+
+func (t *Transport) writeBufferSize() int {
+	if t.WriteBufferSize > 0 {
+		return t.WriteBufferSize
+	}
+	return 4 << 10
+}
+
+func (t *Transport) readBufferSize() int {
+	if t.ReadBufferSize > 0 {
+		return t.ReadBufferSize
+	}
+	return 4 << 10
 }
 
 // transportRequest is a wrapper around a *Request that adds
@@ -688,6 +703,26 @@ func (t *Transport) setReqCanceler(key cancelKey, fn func(error)) {
 	}
 }
 
+var zeroDialer net.Dialer
+
+func (t *Transport) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	if t.DialContext != nil {
+		c, err := t.DialContext(ctx, network, addr)
+		if c == nil && err == nil {
+			err = errors.New("net/http: Transport.DialContext hook returned (nil, nil)")
+		}
+		return c, err
+	}
+	if t.Dial != nil {
+		c, err := t.Dial(network, addr)
+		if c == nil && err == nil {
+			err = errors.New("net/http: Transport.Dial hook returned (nil, nil)")
+		}
+		return c, err
+	}
+	return zeroDialer.DialContext(ctx, network, addr)
+}
+
 // A wantConn records state about a wanted connection
 // (that is, an active call to getConn).
 // The conn may be gotten by dialing or by finding an idle connection,
@@ -984,8 +1019,78 @@ func (t *Transport) decConnsPerHost(key connectMethodKey) {
 }
 
 func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *persistConn, err error) {
-	// TODO: Implement logic.
-	return nil, nil
+	pconn = &persistConn{
+		t:        t,
+		cacheKey: cm.key(),
+		// reqch:         make(chan requestAndChan, 1),
+		// writech:       make(chan writeRequest, 1),
+		// closech:       make(chan struct{}),
+		// writeErrCh:    make(chan error, 1),
+		// writeLoopDone: make(chan struct{}),
+	}
+	wrapErr := func(err error) error {
+		if cm.proxyURL != nil {
+			// Return a typed error, per Issue 16997
+			return &net.OpError{Op: "proxyconnect", Net: "tcp", Err: err}
+		}
+		return err
+	}
+
+	// TODO: Handle HTTPS.
+
+	conn, err := t.dial(ctx, "tcp", cm.addr())
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	pconn.conn = conn
+	// TODO: Handle HTTPS
+
+	// Proxy setup.
+	switch {
+	case cm.proxyURL == nil:
+		// Do nothing. Not using a proxy.
+		// TODO: Use a proxy.
+	}
+
+	// if cm.proxyURL != nil && cm.targetScheme == "https" {
+	// 	if err := pconn.addTLS(ctx, cm.tlsHost(), trace); err != nil {
+	// 		return nil, err
+	// 	}
+	// }
+
+	// if s := pconn.tlsState; s != nil && s.NegotiatedProtocolIsMutual && s.NegotiatedProtocol != "" {
+	// 	if next, ok := t.TLSNextProto[s.NegotiatedProtocol]; ok {
+	// 		alt := next(cm.targetAddr, pconn.conn.(*tls.Conn))
+	// 		if e, ok := alt.(erringRoundTripper); ok {
+	// 			// pconn.conn was closed by next (http2configureTransports.upgradeFn).
+	// 			return nil, e.RoundTripErr()
+	// 		}
+	// 		return &persistConn{t: t, cacheKey: pconn.cacheKey, alt: alt}, nil
+	// 	}
+	// }
+
+	pconn.br = bufio.NewReaderSize(pconn, t.readBufferSize())
+	pconn.bw = bufio.NewWriterSize(persistConnWriter{pconn}, t.writeBufferSize())
+
+	go pconn.readLoop()
+	go pconn.writeLoop()
+	return pconn, nil
+}
+
+// persistConnWriter is the io.Writer written to by pc.bw.
+// It accumulates the number of bytes written to the underlying conn,
+// so the retry logic can determine whether any bytes made it across
+// the wire.
+// This is exactly 1 pointer field wide so it can go into an interface
+// without allocation.
+type persistConnWriter struct {
+	pc *persistConn
+}
+
+func (w persistConnWriter) Write(p []byte) (n int, err error) {
+	n, err = w.pc.conn.Write(p)
+	w.pc.nwrite += int64(n)
+	return
 }
 
 // connectMethod is the map key (in its String form) for keeping persistent
@@ -1032,6 +1137,14 @@ func (cm *connectMethod) key() connectMethodKey {
 	}
 }
 
+// addr returns the first hop "host:port" to which we need to TCP connect.
+func (cm *connectMethod) addr() string {
+	if cm.proxyURL != nil {
+		return canonicalAddr(cm.proxyURL)
+	}
+	return cm.targetAddr
+}
+
 // connectMethodKey is the map key version of connectMethod, with a
 // stringified proxy URL (or the empty string) instead of a pointer to
 // a URL.
@@ -1050,17 +1163,17 @@ type persistConn struct {
 
 	t        *Transport
 	cacheKey connectMethodKey
-	// conn      net.Conn
+	conn     net.Conn
 	// tlsState  *tls.ConnectionState
-	// br        *bufio.Reader       // from conn
-	// bw        *bufio.Writer       // to conn
-	// nwrite    int64               // bytes written
+	br     *bufio.Reader // from conn
+	bw     *bufio.Writer // to conn
+	nwrite int64         // bytes written
 	// reqch     chan requestAndChan // written by roundTrip; read by readLoop
 	// writech   chan writeRequest   // written by roundTrip; read by writeLoop
 	// closech   chan struct{}       // closed when conn closed
 	// isProxy   bool
-	// sawEOF    bool  // whether we've seen EOF from conn; owned by readLoop
-	// readLimit int64 // bytes allowed to be read; owned by readLoop
+	sawEOF    bool  // whether we've seen EOF from conn; owned by readLoop
+	readLimit int64 // bytes allowed to be read; owned by readLoop
 	// // writeErrCh passes the request write error (usually nil)
 	// // from the writeLoop goroutine to the readLoop which passes
 	// // it off to the res.Body reader, which then uses it to decide
@@ -1085,6 +1198,28 @@ type persistConn struct {
 	mutateHeaderFunc func(Header)
 }
 
+func (pc *persistConn) maxHeaderResponseSize() int64 {
+	if v := pc.t.MaxResponseHeaderBytes; v != 0 {
+		return v
+	}
+	return 10 << 20 // conservative default; same as http2
+}
+
+func (pc *persistConn) Read(p []byte) (n int, err error) {
+	if pc.readLimit <= 0 {
+		return 0, fmt.Errorf("read limit of %d bytes exhausted", pc.maxHeaderResponseSize())
+	}
+	if int64(len(p)) > pc.readLimit {
+		p = p[:pc.readLimit]
+	}
+	n, err = pc.conn.Read(p)
+	if err == io.EOF {
+		pc.sawEOF = true
+	}
+	pc.readLimit -= int64(n)
+	return
+}
+
 // isBroken reports whether this connection is in a known broken state.
 func (pc *persistConn) isBroken() bool {
 	pc.mu.Lock()
@@ -1106,6 +1241,14 @@ func (pc *persistConn) closeConnIfStillIdle() {
 	}
 	t.removeIdleConnLocked(pc)
 	pc.close(errIdleConnTimeout)
+}
+
+func (pc *persistConn) readLoop() {
+	// TODO: Implement logic.
+}
+
+func (pc *persistConn) writeLoop() {
+	// TODO: Implement logic.
 }
 
 func (pc *persistConn) markReused() {
