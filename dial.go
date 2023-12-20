@@ -11,6 +11,139 @@ import (
 	"time"
 )
 
+// A Dialer contains options for connecting to an address.
+//
+// The zero value for each field is equivalent to dialing
+// without that option. Dialing with the zero value of Dialer
+// is therefore equivalent to just calling the Dial function.
+//
+// It is safe to call Dialer's methods concurrently.
+type Dialer struct {
+	// Timeout is the maximum amount of time a dial will wait for
+	// a connect to complete. If Deadline is also set, it may fail
+	// earlier.
+	//
+	// The default is no timeout.
+	//
+	// When using TCP and dialing a host name with multiple IP
+	// addresses, the timeout may be divided between them.
+	//
+	// With or without a timeout, the operating system may impose
+	// its own earlier timeout. For instance, TCP timeouts are
+	// often around 3 minutes.
+	Timeout time.Duration
+
+	// Deadline is the absolute point in time after which dials
+	// will fail. If Timeout is set, it may fail earlier.
+	// Zero means no deadline, or dependent on the operating system
+	// as with the Timeout option.
+	Deadline time.Time
+
+	// LocalAddr is the local address to use when dialing an
+	// address. The address must be of a compatible type for the
+	// network being dialed.
+	// If nil, a local address is automatically chosen.
+	LocalAddr Addr
+
+	// // DualStack previously enabled RFC 6555 Fast Fallback
+	// // support, also known as "Happy Eyeballs", in which IPv4 is
+	// // tried soon if IPv6 appears to be misconfigured and
+	// // hanging.
+	// //
+	// // Deprecated: Fast Fallback is enabled by default. To
+	// // disable, set FallbackDelay to a negative value.
+	// DualStack bool
+
+	// FallbackDelay specifies the length of time to wait before
+	// spawning a RFC 6555 Fast Fallback connection. That is, this
+	// is the amount of time to wait for IPv6 to succeed before
+	// assuming that IPv6 is misconfigured and falling back to
+	// IPv4.
+	//
+	// If zero, a default delay of 300ms is used.
+	// A negative value disables Fast Fallback support.
+	FallbackDelay time.Duration
+
+	// // KeepAlive specifies the interval between keep-alive
+	// // probes for an active network connection.
+	// // If zero, keep-alive probes are sent with a default value
+	// // (currently 15 seconds), if supported by the protocol and operating
+	// // system. Network protocols or operating systems that do
+	// // not support keep-alives ignore this field.
+	// // If negative, keep-alive probes are disabled.
+	// KeepAlive time.Duration
+
+	// Resolver optionally specifies an alternate resolver to use.
+	Resolver *Resolver
+
+	// Cancel is an optional channel whose closure indicates that
+	// the dial should be canceled. Not all types of dials support
+	// cancellation.
+	//
+	// Deprecated: Use DialContext instead.
+	Cancel <-chan struct{}
+
+	// // If Control is not nil, it is called after creating the network
+	// // connection but before actually dialing.
+	// //
+	// // Network and address parameters passed to Control function are not
+	// // necessarily the ones passed to Dial. For example, passing "tcp" to Dial
+	// // will cause the Control function to be called with "tcp4" or "tcp6".
+	// //
+	// // Control is ignored if ControlContext is not nil.
+	// Control func(network, address string, c syscall.RawConn) error
+
+	// // If ControlContext is not nil, it is called after creating the network
+	// // connection but before actually dialing.
+	// //
+	// // Network and address parameters passed to ControlContext function are not
+	// // necessarily the ones passed to Dial. For example, passing "tcp" to Dial
+	// // will cause the ControlContext function to be called with "tcp4" or "tcp6".
+	// //
+	// // If ControlContext is not nil, Control is ignored.
+	// ControlContext func(ctx context.Context, network, address string, c syscall.RawConn) error
+
+	// // If mptcpStatus is set to a value allowing Multipath TCP (MPTCP) to be
+	// // used, any call to Dial with "tcp(4|6)" as network will use MPTCP if
+	// // supported by the operating system.
+	// mptcpStatus mptcpStatus
+}
+
+func (d *Dialer) dualStack() bool { return d.FallbackDelay >= 0 }
+
+func minNonzeroTime(a, b time.Time) time.Time {
+	if a.IsZero() {
+		return b
+	}
+	if b.IsZero() || a.Before(b) {
+		return a
+	}
+	return b
+}
+
+// deadline returns the earliest of:
+//   - now+Timeout
+//   - d.Deadline
+//   - the context's deadline
+//
+// Or zero, if none of Timeout, Deadline, or context's deadline is set.
+func (d *Dialer) deadline(ctx context.Context, now time.Time) (earliest time.Time) {
+	if d.Timeout != 0 { // including negative, for historical reasons
+		earliest = now.Add(d.Timeout)
+	}
+	if d, ok := ctx.Deadline(); ok {
+		earliest = minNonzeroTime(earliest, d)
+	}
+	return minNonzeroTime(earliest, d.Deadline)
+}
+
+func (d *Dialer) resolver() *Resolver {
+	if d.Resolver != nil {
+		return d.Resolver
+	}
+	return DefaultResolver
+}
+
 func parseNetwork(ctx context.Context, network string, needsProto bool) (afnet string, proto int, err error) {
 	i := bytealg.LastIndexByteString(network, ':')
 	if i < 0 { // no colon
@@ -63,6 +196,92 @@ func (r *Resolver) resolveAddrList(ctx context.Context, op, network, addr string
 	}
 
 	return addrs, err
+}
+
+// sysDialer contains a Dial's parameters and configuration.
+type sysDialer struct {
+	Dialer
+	network, address string
+	// testHookDialTCP  func(ctx context.Context, net string, laddr, raddr *TCPAddr) (*TCPConn, error)
+}
+
+// DialContext connects to the address on the named network using
+// the provided context.
+//
+// The provided Context must be non-nil. If the context expires before
+// the connection is complete, an error is returned. Once successfully
+// connected, any expiration of the context will not affect the
+// connection.
+//
+// When using TCP, and the host in the address parameter resolves to multiple
+// network addresses, any dial timeout (from d.Timeout or ctx) is spread
+// over each consecutive dial, such that each is given an appropriate
+// fraction of the time to connect.
+// For example, if a host has 4 IP addresses and the timeout is 1 minute,
+// the connect to each single address will be given 15 seconds to complete
+// before trying the next one.
+//
+// See func Dial for a description of the network and address
+// parameters.
+func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn, error) {
+	if ctx == nil {
+		panic("nil context")
+	}
+	deadline := d.deadline(ctx, time.Now())
+	if !deadline.IsZero() {
+		// testHoolStepTime()
+		if d, ok := ctx.Deadline(); !ok || deadline.Before(d) {
+			subCtx, cancel := context.WithDeadline(ctx, deadline)
+			defer cancel()
+			ctx = subCtx
+		}
+	}
+	if oldCancel := d.Cancel; oldCancel != nil {
+		subCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		go func() {
+			select {
+			case <-oldCancel:
+				cancel()
+			case <-subCtx.Done():
+			}
+		}()
+		ctx = subCtx
+	}
+
+	// // Shadow the nettrace (if any) during resolve so Connect events don't fire for DNS lookups.
+	resolveCtx := ctx
+	// if trace, _ := ctx.Value(nettrace.TraceKey{}).(*nettrace.Trace); trace != nil {
+	// 	shadow := *trace
+	// 	shadow.ConnectStart = nil
+	// 	shadow.ConnectDone = nil
+	// 	resolveCtx = context.WithValue(resolveCtx, nettrace.TraceKey{}, &shadow)
+	// }
+
+	addrs, err := d.resolver().resolveAddrList(resolveCtx, "dial", network, address, d.LocalAddr)
+	if err != nil {
+		return nil, &OpError{Op: "dial", Net: network, Source: nil, Addr: nil, Err: err}
+	}
+
+	sd := &sysDialer{
+		Dialer:  *d,
+		network: network,
+		address: address,
+	}
+
+	var primaries, fallbacks addrList
+	if d.dualStack() && network == "tcp" {
+		primaries, fallbacks = addrs.partition(isIPv4)
+	} else {
+		primaries = addrs
+	}
+
+	return sd.dialParallel(ctx, primaries, fallbacks)
+}
+
+func (sd *sysDialer) dialParallel(ctx context.Context, primaries, fallbacks addrList) (Conn, error) {
+	// TODO: Implement logic.
+	return nil, nil
 }
 
 // ListenConfig contains options for listening to an address.

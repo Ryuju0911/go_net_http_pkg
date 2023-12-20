@@ -36,6 +36,26 @@ func (addrs addrList) first(strategy func(Addr) bool) Addr {
 	return addrs[0]
 }
 
+// partition divides an address list into two categories, using a
+// strategy function to assign a boolean label to each address.
+// The first address, and any with a matching label, are returned as
+// primaries, while addresses with the opposite label are returned
+// as fallbacks. For non-empty inputs, primaries is guaranteed to be
+// non-empty.
+func (addrs addrList) partition(strategy func(Addr) bool) (primaries, fallbacks addrList) {
+	var primaryLabel bool
+	for i, addr := range addrs {
+		label := strategy(addr)
+		if i == 0 || label == primaryLabel {
+			primaryLabel = label
+			primaries = append(primaries, addr)
+		} else {
+			fallbacks = append(fallbacks, addr)
+		}
+	}
+	return
+}
+
 // SplitHostPort splits a network address of the form "host:port",
 // "host%zone:port", "[host]:port" or "[host%zone]:port" into host or
 // host%zone and port.
