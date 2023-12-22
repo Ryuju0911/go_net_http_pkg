@@ -5,6 +5,7 @@
 package net
 
 import (
+	"context"
 	"errors"
 	"syscall"
 	"time"
@@ -139,7 +140,31 @@ type Listener interface {
 var (
 	// For connection setup and write operations.
 	errMissingAddress = errors.New("missing address")
+
+	// For both read and write operations.
+	errCanceled = canceledError{}
 )
+
+// canceledError lets us return the same error string we have always
+// returned, while still being Is context.Canceled.
+type canceledError struct{}
+
+func (canceledError) Error() string { return "operation was canceled" }
+
+func (canceledError) Is(err error) bool { return err == context.Canceled }
+
+// mapErr maps from the context errors to the historical internal net
+// error values.
+func mapErr(err error) error {
+	switch err {
+	case context.Canceled:
+		return errCanceled
+	case context.DeadlineExceeded:
+		return errTimeout
+	default:
+		return err
+	}
+}
 
 // OpError is the error type usually returned by functions in the net
 // package. It describes the operation, network type, and address of
@@ -208,6 +233,29 @@ func (e *AddrError) Error() string {
 		s = "address " + e.Addr + ": " + s
 	}
 	return s
+}
+
+// errTimeout exists to return the historical "i/o timeout" string
+// for context.DeadlineExceeded. See mapErr.
+// It is also used when Dialer.Deadline is exceeded.
+// error.Is(errTimeout, context.DeadlineExceeded) returns true.
+//
+// TODO(iant): We could consider changing this to os.ErrDeadlineExceeded
+// in the future, if we make
+//
+//	errors.Is(os.ErrDeadlineExceeded, context.DeadlineExceeded)
+//
+// return true.
+var errTimeout error = &timeoutError{}
+
+type timeoutError struct{}
+
+func (e *timeoutError) Error() string   { return "i/o timeout" }
+func (e *timeoutError) Timeout() bool   { return true }
+func (e *timeoutError) Temporary() bool { return true }
+
+func (e *timeoutError) Is(err error) bool {
+	return err == context.DeadlineExceeded
 }
 
 // DNSError represents a DNS lookup error.
