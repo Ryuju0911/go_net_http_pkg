@@ -64,14 +64,14 @@ type Dialer struct {
 	// A negative value disables Fast Fallback support.
 	FallbackDelay time.Duration
 
-	// // KeepAlive specifies the interval between keep-alive
-	// // probes for an active network connection.
-	// // If zero, keep-alive probes are sent with a default value
-	// // (currently 15 seconds), if supported by the protocol and operating
-	// // system. Network protocols or operating systems that do
-	// // not support keep-alives ignore this field.
-	// // If negative, keep-alive probes are disabled.
-	// KeepAlive time.Duration
+	// KeepAlive specifies the interval between keep-alive
+	// probes for an active network connection.
+	// If zero, keep-alive probes are sent with a default value
+	// (currently 15 seconds), if supported by the protocol and operating
+	// system. Network protocols or operating systems that do
+	// not support keep-alives ignore this field.
+	// If negative, keep-alive probes are disabled.
+	KeepAlive time.Duration
 
 	// Resolver optionally specifies an alternate resolver to use.
 	Resolver *Resolver
@@ -142,6 +142,38 @@ func (d *Dialer) resolver() *Resolver {
 		return d.Resolver
 	}
 	return DefaultResolver
+}
+
+// partialDeadline returns the deadline to use for a single address,
+// when multiple addresses are pending.
+func partialDeadline(now, deadline time.Time, addrsRemaining int) (time.Time, error) {
+	if deadline.IsZero() {
+		return deadline, nil
+	}
+	timeRemaining := deadline.Sub(now)
+	if timeRemaining <= 0 {
+		return time.Time{}, errTimeout
+	}
+	// Tentatively allocate equal time to each remaining address.
+	timeout := timeRemaining / time.Duration(addrsRemaining)
+	// If the time per address is too short, steal from the end of the list.
+	const saneMinimum = 2 * time.Second
+	if timeout < saneMinimum {
+		if timeRemaining < saneMinimum {
+			timeout = timeRemaining
+		} else {
+			timeout = saneMinimum
+		}
+	}
+	return now.Add(timeout), nil
+}
+
+func (d *Dialer) fallbackDelay() time.Duration {
+	if d.FallbackDelay > 0 {
+		return d.FallbackDelay
+	} else {
+		return 300 * time.Millisecond
+	}
 }
 
 func parseNetwork(ctx context.Context, network string, needsProto bool) (afnet string, proto int, err error) {
@@ -279,8 +311,129 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn
 	return sd.dialParallel(ctx, primaries, fallbacks)
 }
 
+// dialParallel races two copies of dialSerial, giving the first a
+// head start. It returns the first established connection and
+// closes the others. Otherwise it returns an error from the first
+// primary address.
 func (sd *sysDialer) dialParallel(ctx context.Context, primaries, fallbacks addrList) (Conn, error) {
-	// TODO: Implement logic.
+	if len(fallbacks) == 0 {
+		return sd.dialSerial(ctx, primaries)
+	}
+
+	returned := make(chan struct{})
+	defer close(returned)
+
+	type dialResult struct {
+		Conn
+		error
+		primary bool
+		done    bool
+	}
+	results := make(chan dialResult) // unbuffered
+
+	startRacer := func(ctx context.Context, primary bool) {
+		ras := primaries
+		if !primary {
+			ras = fallbacks
+		}
+		c, err := sd.dialSerial(ctx, ras)
+		select {
+		case results <- dialResult{Conn: c, error: err, primary: primary, done: true}:
+		case <-returned:
+			if c != nil {
+				c.Close()
+			}
+		}
+	}
+
+	var primary, fallback dialResult
+
+	// Start the main racer.
+	primaryCtx, primaryCancel := context.WithCancel(ctx)
+	defer primaryCancel()
+	go startRacer(primaryCtx, true)
+
+	// Start the timer for the fallback racer.
+	fallbackTimer := time.NewTimer(sd.fallbackDelay())
+	defer fallbackTimer.Stop()
+
+	for {
+		select {
+		case <-fallbackTimer.C:
+			fallbackCtx, fallbackCancel := context.WithCancel(ctx)
+			defer fallbackCancel()
+			go startRacer(fallbackCtx, false)
+
+		case res := <-results:
+			if res.error == nil {
+				return res.Conn, nil
+			}
+			if res.primary {
+				primary = res
+			} else {
+				fallback = res
+			}
+			if primary.done && fallback.done {
+				return nil, primary.error
+			}
+			if res.primary && fallbackTimer.Stop() {
+				// If we were able to stop the timer, that means it
+				// was running (hadn't yet started the fallback), but
+				// we just got an error on the primary path, so start
+				// the fallback immediately (in 0 nanoseconds).
+				fallbackTimer.Reset(0)
+			}
+		}
+	}
+}
+
+// dialSerial connects to a list of addresses in sequence, returning
+// either the first successful connection, or the first error.
+func (sd *sysDialer) dialSerial(ctx context.Context, ras addrList) (Conn, error) {
+	var firstErr error // The error from the first address is most relevant.
+
+	for i, ra := range ras {
+		select {
+		case <-ctx.Done():
+			return nil, &OpError{Op: "dial", Net: sd.network, Source: sd.LocalAddr, Addr: ra, Err: mapErr(ctx.Err())}
+		default:
+		}
+
+		dialCtx := ctx
+		if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+			partialDeadline, err := partialDeadline(time.Now(), deadline, len(ras)-i)
+			if err != nil {
+				// Ran out of time.
+				if firstErr == nil {
+					firstErr = &OpError{Op: "dial", Net: sd.network, Source: sd.LocalAddr, Addr: ra, Err: err}
+				}
+				break
+			}
+			if partialDeadline.Before(deadline) {
+				var cancel context.CancelFunc
+				dialCtx, cancel = context.WithDeadline(ctx, partialDeadline)
+				defer cancel()
+			}
+		}
+
+		c, err := sd.dialSingle(dialCtx, ra)
+		if err == nil {
+			return c, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	if firstErr == nil {
+		firstErr = &OpError{Op: "dial", Net: sd.network, Source: nil, Addr: nil, Err: errMissingAddress}
+	}
+	return nil, firstErr
+}
+
+// dialSingle attempts to establish and returns a single connection to
+// the destination address.
+func (sd *sysDialer) dialSingle(ctx context.Context, ra Addr) (c Conn, err error) {
 	return nil, nil
 }
 
