@@ -83,25 +83,25 @@ type Dialer struct {
 	// Deprecated: Use DialContext instead.
 	Cancel <-chan struct{}
 
-	// // If Control is not nil, it is called after creating the network
-	// // connection but before actually dialing.
-	// //
-	// // Network and address parameters passed to Control function are not
-	// // necessarily the ones passed to Dial. For example, passing "tcp" to Dial
-	// // will cause the Control function to be called with "tcp4" or "tcp6".
-	// //
-	// // Control is ignored if ControlContext is not nil.
-	// Control func(network, address string, c syscall.RawConn) error
+	// If Control is not nil, it is called after creating the network
+	// connection but before actually dialing.
+	//
+	// Network and address parameters passed to Control function are not
+	// necessarily the ones passed to Dial. For example, passing "tcp" to Dial
+	// will cause the Control function to be called with "tcp4" or "tcp6".
+	//
+	// Control is ignored if ControlContext is not nil.
+	Control func(network, address string, c syscall.RawConn) error
 
-	// // If ControlContext is not nil, it is called after creating the network
-	// // connection but before actually dialing.
-	// //
-	// // Network and address parameters passed to ControlContext function are not
-	// // necessarily the ones passed to Dial. For example, passing "tcp" to Dial
-	// // will cause the ControlContext function to be called with "tcp4" or "tcp6".
-	// //
-	// // If ControlContext is not nil, Control is ignored.
-	// ControlContext func(ctx context.Context, network, address string, c syscall.RawConn) error
+	// If ControlContext is not nil, it is called after creating the network
+	// connection but before actually dialing.
+	//
+	// Network and address parameters passed to ControlContext function are not
+	// necessarily the ones passed to Dial. For example, passing "tcp" to Dial
+	// will cause the ControlContext function to be called with "tcp4" or "tcp6".
+	//
+	// If ControlContext is not nil, Control is ignored.
+	ControlContext func(ctx context.Context, network, address string, c syscall.RawConn) error
 
 	// // If mptcpStatus is set to a value allowing Multipath TCP (MPTCP) to be
 	// // used, any call to Dial with "tcp(4|6)" as network will use MPTCP if
@@ -434,7 +434,30 @@ func (sd *sysDialer) dialSerial(ctx context.Context, ras addrList) (Conn, error)
 // dialSingle attempts to establish and returns a single connection to
 // the destination address.
 func (sd *sysDialer) dialSingle(ctx context.Context, ra Addr) (c Conn, err error) {
-	return nil, nil
+	// trace, _ := ctx.Value(nettrace.TraceKey{}).(*nettrace.Trace)
+	// if trace != nil {
+	// 	raStr := ra.String()
+	// 	if trace.ConnectStart != nil {
+	// 		trace.ConnectStart(sd.network, raStr)
+	// 	}
+	// 	if trace.ConnectDone != nil {
+	// 		defer func() { trace.ConnectDone(sd.network, raStr, err) }()
+	// 	}
+	// }
+	la := sd.LocalAddr
+	switch ra := ra.(type) {
+	case *TCPAddr:
+		la, _ := la.(*TCPAddr)
+		// TODO: Handle multipath.
+		c, err = sd.dialTCP(ctx, la, ra)
+		// TODO: Handle other protocols.
+	default:
+		return nil, &OpError{Op: "dial", Net: sd.network, Source: la, Addr: ra, Err: &AddrError{Err: "unexpected address type", Addr: sd.address}}
+	}
+	if err != nil {
+		return nil, &OpError{Op: "dial", Net: sd.network, Source: la, Addr: ra, Err: err} // c is non-nil interface containing nil pointer
+	}
+	return c, nil
 }
 
 // ListenConfig contains options for listening to an address.
