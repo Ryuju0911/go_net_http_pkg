@@ -310,6 +310,13 @@ func (srv *Server) newConn(rwc net.Conn) *conn {
 	return c
 }
 
+type readResult struct {
+	_   incomparable
+	n   int
+	err error
+	b   byte // byte read, if n == 1
+}
+
 // connReader is the io.Reader wrapper used by *conn. It combines a
 // selectively-activated io.LimitedReader (to bound request header
 // read sizes) with support for selectively keeping an io.Reader.Read
