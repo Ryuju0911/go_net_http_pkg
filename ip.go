@@ -4,7 +4,10 @@
 
 package net
 
-import "net/netip"
+import (
+	"internal/bytealg"
+	"net/netip"
+)
 
 // IP address lengths (bytes)
 const (
@@ -113,4 +116,20 @@ func ipEmptyString(ip IP) string {
 		return ""
 	}
 	return ip.String()
+}
+
+// Equal reports whether ip and x are the same IP address.
+// An IPv4 address and that same address in IPv6 form are
+// considered to be equal.
+func (ip IP) Equal(x IP) bool {
+	if len(ip) == len(x) {
+		return bytealg.Equal(ip, x)
+	}
+	if len(ip) == IPv4len && len(x) == IPv6len {
+		return bytealg.Equal(x[0:12], v4InV6Prefix) && bytealg.Equal(ip, x[12:])
+	}
+	if len(ip) == IPv6len && len(x) == IPv4len {
+		return bytealg.Equal(ip[0:12], v4InV6Prefix) && bytealg.Equal(ip[12:], x)
+	}
+	return false
 }
