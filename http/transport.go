@@ -30,10 +30,10 @@ import (
 // and NO_PROXY (or the lowercase versions thereof).
 var DefaultTransport RoundTripper = &Transport{
 	// Proxy: ProxyFromEnvironment,
-	// DialContext: defaultTransportDialContext(&net.Dialer{
-	// 	Timeout:   30 * time.Second,
-	// 	KeepAlive: 30 * time.Second,
-	// }),
+	DialContext: defaultTransportDialContext(&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}),
 	// ForceAttemptHTTP2:     true,
 	MaxIdleConns:    100,
 	IdleConnTimeout: 90 * time.Second,
@@ -214,14 +214,14 @@ type Transport struct {
 	// // time does not include the time to read the response body.
 	// ResponseHeaderTimeout time.Duration
 
-	// // ExpectContinueTimeout, if non-zero, specifies the amount of
-	// // time to wait for a server's first response headers after fully
-	// // writing the request headers if the request has an
-	// // "Expect: 100-continue" header. Zero means no timeout and
-	// // causes the body to be sent immediately, without
-	// // waiting for the server to approve.
-	// // This time does not include the time to send the request header.
-	// ExpectContinueTimeout time.Duration
+	// ExpectContinueTimeout, if non-zero, specifies the amount of
+	// time to wait for a server's first response headers after fully
+	// writing the request headers if the request has an
+	// "Expect: 100-continue" header. Zero means no timeout and
+	// causes the body to be sent immediately, without
+	// waiting for the server to approve.
+	// This time does not include the time to send the request header.
+	ExpectContinueTimeout time.Duration
 
 	// // TLSNextProto specifies how the Transport switches to an
 	// // alternate protocol (such as HTTP/2) after a TLS ALPN
@@ -305,13 +305,21 @@ func (t *Transport) readBufferSize() int {
 // optional extra headers to write and stores any error to return
 // from roundTrip.
 type transportRequest struct {
-	*Request // original request, not to be mutated
-	// 	extra     Header                 // extra headers to write, or nil
+	*Request        // original request, not to be mutated
+	extra    Header // extra headers to write, or nil
 	// 	trace     *httptrace.ClientTrace // optional
 	cancelKey cancelKey
 
-	// mu  sync.Mutex // guards err
-	// err error      // first setError value for mapRoundTripError to consider
+	mu  sync.Mutex // guards err
+	err error      // first setError value for mapRoundTripError to consider
+}
+
+func (tr *transportRequest) setError(err error) {
+	tr.mu.Lock()
+	if tr.err == nil {
+		tr.err = err
+	}
+	tr.mu.Unlock()
 }
 
 // roundTrip implements a RoundTripper over HTTP.
@@ -456,14 +464,14 @@ var (
 	errTooManyIdle        = errors.New("http: putIdleConn: too many idle connections")
 	errTooManyIdleHost    = errors.New("http: putIdleConn: too many idle connections for host")
 	// errCloseIdleConns     = errors.New("http: CloseIdleConnections called")
-	// errReadLoopExiting    = errors.New("http: persistConn.readLoop exiting")
+	errReadLoopExiting = errors.New("http: persistConn.readLoop exiting")
 	errIdleConnTimeout = errors.New("http: idle connection timeout")
 
-	// // errServerClosedIdle is not seen by users for idempotent requests, but may be
-	// // seen by a user if the server shuts down an idle connection and sends its FIN
-	// // in flight with already-written POST body bytes from the client.
-	// // See https://github.com/golang/go/issues/19943#issuecomment-355607646
-	// errServerClosedIdle = errors.New("http: server closed idle connection")
+	// errServerClosedIdle is not seen by users for idempotent requests, but may be
+	// seen by a user if the server shuts down an idle connection and sends its FIN
+	// in flight with already-written POST body bytes from the client.
+	// See https://github.com/golang/go/issues/19943#issuecomment-355607646
+	errServerClosedIdle = errors.New("http: server closed idle connection")
 )
 
 func (t *Transport) putOrCloseIdleConn(pconn *persistConn) {
@@ -655,6 +663,13 @@ func (t *Transport) queueForIdleConn(w *wantConn) (delivered bool) {
 	q.pushBack(w)
 	t.idleConnWait[w.key] = q
 	return false
+}
+
+// removeIdleConn marks pconn as dead.
+func (t *Transport) removeIdleConn(pconn *persistConn) bool {
+	t.idleMu.Lock()
+	defer t.idleMu.Unlock()
+	return t.removeIdleConnLocked(pconn)
 }
 
 // t.idleMu must be held.
@@ -912,7 +927,44 @@ func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (pc *persi
 
 	// Queue for permission to dial.
 	t.queueForDial(w)
-	return nil, nil
+
+	// Wait for completion or cancellation.
+	select {
+	case <-w.ready:
+		// // Trace success but only for HTTP/1.
+		// // HTTP/2 calls trace.GotConn itself.
+		// if w.pc != nil && w.pc.alt == nil && trace != nil && trace.GotConn != nil {
+		// 	trace.GotConn(httptrace.GotConnInfo{Conn: w.pc.conn, Reused: w.pc.isReused()})
+		// }
+		if w.err != nil {
+			// If the request has been canceled, that's probably
+			// what caused w.err; if so, prefer to return the
+			// cancellation error (see golang.org/issue/16049).
+			select {
+			case <-req.Cancel:
+				return nil, errRequestCanceledConn
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case err := <-cancelc:
+				if err == errRequestCanceled {
+					err = errRequestCanceledConn
+				}
+				return nil, err
+			default:
+				// return below
+			}
+		}
+		return w.pc, w.err
+	case <-req.Cancel:
+		return nil, errRequestCanceledConn
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	case err := <-cancelc:
+		if err == errRequestCanceled {
+			err = errRequestCanceledConn
+		}
+		return nil, err
+	}
 }
 
 // queueForDial queues w to wait for permission to begin dialing.
@@ -1022,11 +1074,11 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 	pconn = &persistConn{
 		t:        t,
 		cacheKey: cm.key(),
-		// reqch:         make(chan requestAndChan, 1),
-		// writech:       make(chan writeRequest, 1),
-		// closech:       make(chan struct{}),
+		reqch:    make(chan requestAndChan, 1),
+		writech:  make(chan writeRequest, 1),
+		closech:  make(chan struct{}),
 		// writeErrCh:    make(chan error, 1),
-		// writeLoopDone: make(chan struct{}),
+		writeLoopDone: make(chan struct{}),
 	}
 	wrapErr := func(err error) error {
 		if cm.proxyURL != nil {
@@ -1165,30 +1217,30 @@ type persistConn struct {
 	cacheKey connectMethodKey
 	conn     net.Conn
 	// tlsState  *tls.ConnectionState
-	br     *bufio.Reader // from conn
-	bw     *bufio.Writer // to conn
-	nwrite int64         // bytes written
-	// reqch     chan requestAndChan // written by roundTrip; read by readLoop
-	// writech   chan writeRequest   // written by roundTrip; read by writeLoop
-	// closech   chan struct{}       // closed when conn closed
-	// isProxy   bool
+	br        *bufio.Reader       // from conn
+	bw        *bufio.Writer       // to conn
+	nwrite    int64               // bytes written
+	reqch     chan requestAndChan // written by roundTrip; read by readLoop
+	writech   chan writeRequest   // written by roundTrip; read by writeLoop
+	closech   chan struct{}       // closed when conn closed
+	isProxy   bool
 	sawEOF    bool  // whether we've seen EOF from conn; owned by readLoop
 	readLimit int64 // bytes allowed to be read; owned by readLoop
-	// // writeErrCh passes the request write error (usually nil)
-	// // from the writeLoop goroutine to the readLoop which passes
-	// // it off to the res.Body reader, which then uses it to decide
-	// // whether or not a connection can be reused. Issue 7569.
-	// writeErrCh chan error
+	// writeErrCh passes the request write error (usually nil)
+	// from the writeLoop goroutine to the readLoop which passes
+	// it off to the res.Body reader, which then uses it to decide
+	// whether or not a connection can be reused. Issue 7569.
+	writeErrCh chan error
 
-	// writeLoopDone chan struct{} // closed when write loop ends
+	writeLoopDone chan struct{} // closed when write loop ends
 
 	// Both guarded by Transport.idleMu:
 	idleAt    time.Time   // time it last become idle
 	idleTimer *time.Timer // holding an AfterFunc to close it
 
-	mu sync.Mutex // guards following fields
-	// numExpectedResponses int
-	closed error // set non-nil when conn is closed, before closech is closed
+	mu                   sync.Mutex // guards following fields
+	numExpectedResponses int
+	closed               error // set non-nil when conn is closed, before closech is closed
 	// canceledErr          error // set non-nil if conn is canceled
 	broken bool // an error has happened on this connection; marked broken so it's not reused.
 	reused bool // whether conn has had successful request/response and is being reused.
@@ -1243,12 +1295,76 @@ func (pc *persistConn) closeConnIfStillIdle() {
 	pc.close(errIdleConnTimeout)
 }
 
-func (pc *persistConn) readLoop() {
-	// TODO: Implement logic.
+// errCallerOwnsConn is an internal sentinel error used when we hand
+// off a writable response.Body to the caller. We use this to prevent
+// closing a net.Conn that is now owned by the caller.
+var errCallerOwnsConn = errors.New("read loop ending; caller owns writable underlying conn")
+
+func (pc *persistConn) readLoop() {}
+
+// waitForContinue returns the function to block until
+// any response, timeout or connection close. After any of them,
+// the function returns a bool which indicates if the body should be sent.
+func (pc *persistConn) waitForContinue(continueCh <-chan struct{}) func() bool {
+	if continueCh == nil {
+		return nil
+	}
+	return func() bool {
+		timer := time.NewTimer(pc.t.ExpectContinueTimeout)
+		defer timer.Stop()
+
+		select {
+		case _, ok := <-continueCh:
+			return ok
+		case <-timer.C:
+			return true
+		case <-pc.closech:
+			return false
+		}
+	}
+}
+
+// nothingWrittenError wraps a write errors which ended up writing zero bytes.
+type nothingWrittenError struct {
+	error
 }
 
 func (pc *persistConn) writeLoop() {
-	// TODO: Implement logic.
+	defer close(pc.writeLoopDone)
+	for {
+		select {
+		case wr := <-pc.writech:
+			startBytesWritten := pc.nwrite
+			err := wr.req.Request.write(pc.bw, pc.isProxy, wr.req.extra, pc.waitForContinue(wr.continueCh))
+			if bre, ok := err.(requestBodyReadError); ok {
+				err = bre.error
+				// Errors reading from the user's
+				// Request.Body are high priority.
+				// Set it here before sending on the
+				// channels below or calling
+				// pc.close() which tears down
+				// connections and causes other
+				// errors.
+				wr.req.setError(err)
+			}
+			if err == nil {
+				err = pc.bw.Flush()
+			}
+			if err != nil {
+				if pc.nwrite == startBytesWritten {
+					err = nothingWrittenError{err}
+				}
+			}
+			pc.writeErrCh <- err // to the body reader, which might recycle us
+			wr.ch <- err         // to the roundTrip function
+			if err != nil {
+				pc.close(err)
+				return
+			}
+		case <-pc.closech:
+			return
+		}
+	}
 }
 
 func (pc *persistConn) markReused() {
@@ -1276,14 +1392,14 @@ func (pc *persistConn) closeLocked(err error) {
 	if pc.closed == nil {
 		pc.closed = err
 		pc.t.decConnsPerHost(pc.cacheKey)
-		// // Close HTTP/1 (pc.alt == nil) connection.
-		// // HTTP/2 closes its connection itself.
-		// if pc.alt == nil {
-		// 	if err != errCallerOwnsConn {
-		// 		pc.conn.Close()
-		// 	}
-		// 	close(pc.closech)
-		// }
+		// Close HTTP/1 (pc.alt == nil) connection.
+		// HTTP/2 closes its connection itself.
+		if pc.alt == nil {
+			if err != errCallerOwnsConn {
+				pc.conn.Close()
+			}
+			close(pc.closech)
+		}
 	}
 	pc.mutateHeaderFunc = nil
 }
@@ -1310,6 +1426,45 @@ func canonicalAddr(url *url.URL) string {
 	}
 	return net.JoinHostPort(idnaASCIIFromURL(url), port)
 }
+
+type requestAndChan struct {
+	// _ incomparable
+	// // req       *Request
+	// // cancelKey cancelKey
+	// ch chan responseAndError // unbuffered; always send in select on callerGone
+
+	// // // whether the Transport (as opposed to the user client code)
+	// // // added the Accept-Encoding gzip header. If the Transport
+	// // // set it, only then do we transparently decode the gzip.
+	// // addedGzip bool
+
+	// // // Optional blocking chan for Expect: 100-continue (for send).
+	// // // If the request has an "Expect: 100-continue" header and
+	// // // the server responds 100 Continue, readLoop send a value
+	// // // to writeLoop via this chan.
+	// // continueCh chan<- struct{}
+
+	// callerGone <-chan struct{} // closed when roundTrip caller has returned
+}
+
+// A writeRequest is sent by the caller's goroutine to the
+// writeLoop's goroutine to write a request while the read loop
+// concurrently waits on both the write response and the server's
+// reply.
+type writeRequest struct {
+	req *transportRequest
+	ch  chan<- error
+
+	// Optional blocking chan for Expect: 100-continue (for receive).
+	// If not nil, writeLoop blocks sending request body until
+	// it receives from this chan.
+	continueCh <-chan struct{}
+}
+
+// errRequestCanceled is set to be identical to the one from h2 to facilitate
+// testing.
+var errRequestCanceled = errors.New("net/http: request canceled")
+var errRequestCanceledConn = errors.New("net/http: request canceled while waiting for connection") // TODO: unify?
 
 func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
 	// TODO: Implement logic.
