@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http/httptrace"
 	"net/textproto"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -164,6 +166,89 @@ func (t *transferWriter) shouldSendChunkedRequestBody() bool {
 	// can deal with a chunked request body. Maybe we'll adjust this
 	// later.
 	return true
+}
+
+func (t *transferWriter) shouldSendContentLength() bool {
+	if chunked(t.TransferEncoding) {
+		return false
+	}
+	if t.ContentLength > 0 {
+		return true
+	}
+	if t.ContentLength < 0 {
+		return false
+	}
+	// Many servers expect a Content-Length for these methods
+	if t.Method == "POST" || t.Method == "PUT" || t.Method == "PATCH" {
+		return true
+	}
+	if t.ContentLength == 0 && isIdentity(t.TransferEncoding) {
+		if t.Method == "GET" || t.Method == "HEAD" {
+			return false
+		}
+		return true
+	}
+
+	return false
+}
+
+func (t *transferWriter) writeHeader(w io.Writer, trace *httptrace.ClientTrace) error {
+	if t.Close && !hasToken(t.Header.get("Connection"), "close") {
+		if _, err := io.WriteString(w, "Connection: close\r\n"); err != nil {
+			return err
+		}
+		if trace != nil && trace.WroteHeaderField != nil {
+			trace.WroteHeaderField("Connection", []string{"close"})
+		}
+	}
+
+	// Write Content-Length and/or Transfer-Encoding whose values are a
+	// function of the sanitized field triple (Body, ContentLength,
+	// TransferEncoding)
+	if t.shouldSendContentLength() {
+		if _, err := io.WriteString(w, "Content-Length: "); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(w, strconv.FormatInt(t.ContentLength, 10)+"\r\n"); err != nil {
+			return err
+		}
+		if trace != nil && trace.WroteHeaderField != nil {
+			trace.WroteHeaderField("Content-Length", []string{strconv.FormatInt(t.ContentLength, 10)})
+		}
+	} else if chunked(t.TransferEncoding) {
+		if _, err := io.WriteString(w, "Transfer-Encoding: chunked\r\n"); err != nil {
+			return err
+		}
+		if trace != nil && trace.WroteHeaderField != nil {
+			trace.WroteHeaderField("Transfer-Encoding", []string{"chunked"})
+		}
+	}
+
+	// Write Trailer header
+	if t.Trailer != nil {
+		keys := make([]string, 0, len(t.Trailer))
+		for k := range t.Trailer {
+			k = CanonicalHeaderKey(k)
+			switch k {
+			case "Transfer-Encoding", "Trailer", "Content-Length":
+				return badStringError("invalid Trailer key", k)
+			}
+			keys = append(keys, k)
+		}
+		if len(keys) > 0 {
+			sort.Strings(keys)
+			// TODO: could do better allocation-wise here, but trailers are rare.
+			// so being lazy for now.
+			if _, err := io.WriteString(w, "Trailer: "+strings.Join(keys, ",")+"\r\n"); err != nil {
+				return err
+			}
+			if trace != nil && trace.WroteHeaderField != nil {
+				trace.WroteHeaderField("Trailer", keys)
+			}
+		}
+	}
+
+	return nil
 }
 
 // probeRequestBody reads a byte from t.Body to see whether it's empty
@@ -328,6 +413,9 @@ func readTransfer(msg any, r *bufio.Reader) (err error) {
 
 // Checks whether chunked is part of the encodings stack.
 func chunked(te []string) bool { return len(te) > 0 && te[0] == "chunked" }
+
+// Checks whether the encoding is explicitly "identity".
+func isIdentity(te []string) bool { return len(te) == 1 && te[0] == "identity" }
 
 func fixLength(isResponse bool, status int, requestMethod string, header Header, chunked bool) (int64, error) {
 	isRequest := !isResponse
