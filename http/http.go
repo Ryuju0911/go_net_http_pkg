@@ -50,6 +50,17 @@ func isNotToken(r rune) bool {
 	return !httpguts.IsTokenRune(r)
 }
 
+// stringContainsCTLByte reports whether s contains any ASCII control character.
+func stringContainsCTLByte(s string) bool {
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < ' ' || b == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
 func hexEscapeNonASCII(s string) string {
 	newLen := 0
 	for i := 0; i < len(s); i++ {

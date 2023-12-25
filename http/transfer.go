@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http/httptrace"
+	"net/http/internal"
 	"net/textproto"
 	"reflect"
 	"sort"
@@ -58,8 +59,8 @@ type transferWriter struct {
 	TransferEncoding []string
 	Header           Header
 	Trailer          Header
-	// IsResponse       bool
-	// bodyReadError    error // any non-EOF error from reading Body
+	IsResponse       bool
+	bodyReadError    error // any non-EOF error from reading Body
 
 	FlushHeaders bool            // flush headers to network before body
 	ByteReadCh   chan readResult // non-nil if probeRequestBody called
@@ -249,6 +250,109 @@ func (t *transferWriter) writeHeader(w io.Writer, trace *httptrace.ClientTrace) 
 	}
 
 	return nil
+}
+
+// always closes t.BodyCloser
+func (t *transferWriter) writeBody(w io.Writer) (err error) {
+	var ncopy int64
+	closed := false
+	defer func() {
+		if closed || t.BodyCloser == nil {
+			return
+		}
+		if closeErr := t.BodyCloser.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
+
+	// Write body. We "unwrap" the body first if it was wrapped in a
+	// nopCloser or readTrackingBody. This is to ensure that we can take advantage of
+	// OS-level optimizations in the event that the body is an
+	// *os.File.
+	if t.Body != nil {
+		var body = t.unwrapBody()
+		if chunked(t.TransferEncoding) {
+			if bw, ok := w.(*bufio.Writer); ok && !t.IsResponse {
+				w = &internal.FlushAfterChunkWriter{Writer: bw}
+			}
+			cw := internal.NewChunkedWriter(w)
+			_, err = t.doBodyCopy(cw, body)
+			if err == nil {
+				err = cw.Close()
+			}
+		} else if t.ContentLength == -1 {
+			dst := w
+			if t.Method == "CONNECT" {
+				dst = bufioFlushWriter{dst}
+			}
+			ncopy, err = t.doBodyCopy(dst, body)
+		} else {
+			ncopy, err = t.doBodyCopy(w, io.LimitReader(body, t.ContentLength))
+			if err != nil {
+				return err
+			}
+			var nextra int64
+			nextra, err = t.doBodyCopy(io.Discard, body)
+			ncopy += nextra
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if t.BodyCloser != nil {
+		closed = true
+		if err := t.BodyCloser.Close(); err != nil {
+			return err
+		}
+	}
+
+	if !t.ResponseToHEAD && t.ContentLength != -1 && t.ContentLength != ncopy {
+		return fmt.Errorf("http: ContentLength=%d with Body length %d",
+			t.ContentLength, ncopy)
+	}
+
+	if chunked(t.TransferEncoding) {
+		// Write Trailer header
+		if t.Trailer != nil {
+			if err := t.Trailer.Write(w); err != nil {
+				return err
+			}
+		}
+		// Last chunk, empty trailer
+		_, err = io.WriteString(w, "\r\n")
+	}
+	return err
+}
+
+// doBodyCopy wraps a copy operation, with any resulting error also
+// being saved in bodyReadError.
+//
+// This function is only intended for use in writeBody.
+func (t *transferWriter) doBodyCopy(dst io.Writer, src io.Reader) (n int64, err error) {
+	buf := getCopyBuf()
+	defer putCopyBuf(buf)
+
+	n, err = io.CopyBuffer(dst, src, buf)
+	if err != nil && err != io.EOF {
+		t.bodyReadError = err
+	}
+	return
+}
+
+// unwrapBody unwraps the body's inner reader if it's a
+// nopCloser. This is to ensure that body writes sourced from local
+// files (*os.File types) are properly optimized.
+//
+// This function is only intended for use in writeBody.
+func (t *transferWriter) unwrapBody() io.Reader {
+	if r, ok := unwrapNopCloser(t.Body); ok {
+		return r
+	}
+	if r, ok := t.Body.(*readTrackingBody); ok {
+		r.didRead = true
+		return r.ReadCloser
+	}
+	return t.Body
 }
 
 // probeRequestBody reads a byte from t.Body to see whether it's empty
@@ -588,4 +692,19 @@ func isKnownInMemoryReader(r io.Reader) bool {
 		return isKnownInMemoryReader(r.ReadCloser)
 	}
 	return false
+}
+
+// bufioFlushWriter is an io.Writer wrapper that flushes all writes
+// on its wrapped writer if it's a *bufio.Writer.
+type bufioFlushWriter struct{ w io.Writer }
+
+func (fw bufioFlushWriter) Write(p []byte) (n int, err error) {
+	n, err = fw.w.Write(p)
+	if bw, ok := fw.w.(*bufio.Writer); n > 0 && ok {
+		ferr := bw.Flush()
+		if ferr != nil && err == nil {
+			err = ferr
+		}
+	}
+	return
 }
