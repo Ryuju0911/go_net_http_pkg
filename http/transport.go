@@ -18,9 +18,12 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http/httptrace"
 	"net/url"
 	"sync"
 	"time"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 // DefaultTransport is the default implementation of Transport and is
@@ -338,21 +341,21 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 	}
 	scheme := req.URL.Scheme
 	isHTTP := scheme == "http" || scheme == "https"
-	// if isHTTP {
-	// 	for k, vv := range req.Header {
-	// 		if !httpguts.ValidHeaderFieldName(k) {
-	// 			req.closeBody()
-	// 			return nil, fmt.Errorf("net/http: invalid header field name %q", k)
-	// 		}
-	// 		for _, v := range vv {
-	// 			if !httpguts.ValidHeaderFieldValue(v) {
-	// 				req.closeBody()
-	// 				// Don't include the value in the error, because it may be sensitive.
-	// 				return nil, fmt.Errorf("net/http: invalid header field value for %q", k)
-	// 			}
-	// 		}
-	// 	}
-	// }
+	if isHTTP {
+		for k, vv := range req.Header {
+			if !httpguts.ValidHeaderFieldName(k) {
+				req.closeBody()
+				return nil, fmt.Errorf("net/http: invalid header field name %q", k)
+			}
+			for _, v := range vv {
+				if !httpguts.ValidHeaderFieldValue(v) {
+					req.closeBody()
+					// Don't include the value in the error, because it may be sensitive.
+					return nil, fmt.Errorf("net/http: invalid header field value for %q", k)
+				}
+			}
+		}
+	}
 
 	origReq := req
 	cancelKey := cancelKey{origReq}
@@ -413,6 +416,7 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 		}
 
 		// Failed. Clean up and determine whether to retry.
+		// TODO
 	}
 }
 
@@ -473,6 +477,24 @@ var (
 	// See https://github.com/golang/go/issues/19943#issuecomment-355607646
 	errServerClosedIdle = errors.New("http: server closed idle connection")
 )
+
+// transportReadFromServerError is used by Transport.readLoop when the
+// 1 byte peek read fails and we're actually anticipating a response.
+// Usually this is just due to the inherent keep-alive shut down race,
+// where the server closed the connection at the same time the client
+// wrote. The underlying err field is usually io.EOF or some
+// ECONNRESET sort of thing which varies by platform. But it might be
+// the user's custom net.Conn.Read error too, so we carry it along for
+// them to return from Transport.RoundTrip.
+type transportReadFromServerError struct {
+	err error
+}
+
+func (e transportReadFromServerError) Unwrap() error { return e.err }
+
+func (e transportReadFromServerError) Error() string {
+	return fmt.Sprintf("net/http: Transport failed to read from server: %v", e.err)
+}
 
 func (t *Transport) putOrCloseIdleConn(pconn *persistConn) {
 	if err := t.tryPutIdleConn(pconn); err != nil {
@@ -716,6 +738,25 @@ func (t *Transport) setReqCanceler(key cancelKey, fn func(error)) {
 	} else {
 		delete(t.reqCanceler, key)
 	}
+}
+
+// replaceReqCanceler replaces an existing cancel function. If there is no cancel function
+// for the request, we don't set the function and return false.
+// Since CancelRequest will clear the canceler, we can use the return value to detect if
+// the request was canceled since the last setReqCancel call.
+func (t *Transport) replaceReqCanceler(key cancelKey, fn func(error)) bool {
+	t.reqMu.Lock()
+	defer t.reqMu.Unlock()
+	_, ok := t.reqCanceler[key]
+	if !ok {
+		return false
+	}
+	if fn != nil {
+		t.reqCanceler[key] = fn
+	} else {
+		delete(t.reqCanceler, key)
+	}
+	return true
 }
 
 var zeroDialer net.Dialer
@@ -1300,7 +1341,206 @@ func (pc *persistConn) closeConnIfStillIdle() {
 // closing a net.Conn that is now owned by the caller.
 var errCallerOwnsConn = errors.New("read loop ending; caller owns writable underlying conn")
 
-func (pc *persistConn) readLoop() {}
+func (pc *persistConn) readLoop() {
+	closeErr := errReadLoopExiting // default value, if not changed below
+	defer func() {
+		pc.close(closeErr)
+		pc.t.removeIdleConn(pc)
+	}()
+
+	tryPutIdleConn := func() bool {
+		if err := pc.t.tryPutIdleConn(pc); err != nil {
+			closeErr = err
+			return false
+		}
+		return true
+	}
+
+	// eofc is used to block caller goroutines reading from Response.Body
+	// at EOF until this goroutines has (potentially) added the connection
+	// back to the idle pool.
+	eofc := make(chan struct{})
+	defer close(eofc) // unblock reader on errors
+
+	// // Read this once, before loop starts. (to avoid races in tests)
+	// testHookMu.Lock()
+	// testHookReadLoopBeforeNextRead := testHookReadLoopBeforeNextRead
+	// testHookMu.Unlock()
+
+	alive := true
+	for alive {
+		pc.readLimit = pc.maxHeaderResponseSize()
+		_, err := pc.br.Peek(1)
+
+		pc.mu.Lock()
+		if pc.numExpectedResponses == 0 {
+			pc.readLoopPeekFailLocked(err)
+			pc.mu.Unlock()
+			return
+		}
+		pc.mu.Unlock()
+
+		rc := <-pc.reqch
+		// trace := httptrace.ContextClientTrace(rc.req.Context())
+
+		var resp *Response
+		if err == nil {
+			resp, err = pc.readResponse(rc, nil)
+		} else {
+			err = transportReadFromServerError{err}
+			closeErr = err
+		}
+
+		if err != nil {
+			if pc.readLimit <= 0 {
+				err = fmt.Errorf("net/http: server response headers exceeded %d bytes; aborted", pc.maxHeaderResponseSize())
+			}
+
+			select {
+			case rc.ch <- responseAndError{err: err}:
+			case <-rc.callerGone:
+				return
+			}
+			return
+		}
+		pc.readLimit = maxInt64 // effectively no limit for response bodies
+
+		pc.mu.Lock()
+		pc.numExpectedResponses--
+		pc.mu.Unlock()
+
+		bodyWritable := resp.bodyIsWritable()
+		hasBody := rc.req.Method != "HEAD" && resp.ContentLength != 0
+
+		if resp.Close || rc.req.Close || resp.StatusCode <= 199 || bodyWritable {
+			// Don't do keep-alive on error if either party requested a close
+			// or we get an unexpected informational (1xx) response.
+			// StatusCode 100 is already handled above.
+			alive = false
+		}
+
+		if !hasBody || bodyWritable {
+			replaced := pc.t.replaceReqCanceler(rc.cancelKey, nil)
+
+			// Put the idle conn back into the pool before we send the response
+			// so if they process it quickly and make another request, they'll
+			// get this same conn. But we use the unbuffered channel 'rc'
+			// to guarantee that persistConn.roundTrip got out of its select
+			// potentially waiting for this persistConn to close.
+			alive = alive &&
+				!pc.sawEOF &&
+				pc.wroteRequest() &&
+				replaced && tryPutIdleConn()
+
+			if bodyWritable {
+				closeErr = errCallerOwnsConn
+			}
+
+			select {
+			case rc.ch <- responseAndError{res: resp}:
+			case <-rc.callerGone:
+				return
+			}
+
+			// Now that they've read from the unbuffered channel, they're safely
+			// out of the select that also waits on this goroutine to die, so
+			// we're allowed to exit now if needed (if alive is false)
+			// testHookReadLoopBeforeNextRead()
+			continue
+		}
+	}
+}
+
+func (pc *persistConn) readLoopPeekFailLocked(peekErr error) {
+	if pc.closed != nil {
+		return
+	}
+	if n := pc.br.Buffered(); n > 0 {
+		buf, _ := pc.br.Peek(n)
+		if is408Message(buf) {
+			pc.closeLocked(errServerClosedIdle)
+			return
+		} else {
+			log.Printf("Unsolicited response received on idle HTTP channel starting with %q; err=%v", buf, peekErr)
+		}
+	}
+	if peekErr == io.EOF {
+		// common case.
+		pc.closeLocked(errServerClosedIdle)
+	} else {
+		pc.closeLocked(fmt.Errorf("readLoopPeekFailLocked: %w", peekErr))
+	}
+}
+
+// is408Message reports whether buf has the prefix of an
+// HTTP 408 Request Timeout response.
+// See golang.org/issue/32310.
+func is408Message(buf []byte) bool {
+	if len(buf) < len("HTTP/1.x 408") {
+		return false
+	}
+	if string(buf[:7]) != "HTTP/1." {
+		return false
+	}
+	return string(buf[8:12]) == " 408"
+}
+
+// readResponse reads an HTTP response (or two, in the case of "Expect:
+// 100-continue") from the server. It returns the final non-100 one.
+// trace is optional.
+func (pc *persistConn) readResponse(rc requestAndChan, trace *httptrace.ClientTrace) (resp *Response, err error) {
+	// if trace != nil && trace.GotFirstResponseByte != nil {
+	// 	if peek, err := pc.br.Peek(1); err == nil && len(peek) == 1 {
+	// 		trace.GotFirstResponseByte()
+	// 	}
+	// }
+	num1xx := 0               // number of informational 1xx headers received
+	const max1xxResponses = 5 // arbitrary bound on number of informational responses
+
+	continueCh := rc.continueCh
+	for {
+		resp, err = ReadResponse(pc.br, rc.req)
+		if err != nil {
+			return
+		}
+		resCode := resp.StatusCode
+		if continueCh != nil {
+			if resCode == 100 {
+				// if trace != nil && trace.Got100Continue != nil {
+				// 	trace.Got100Continue()
+				// }
+				continueCh <- struct{}{}
+				continueCh = nil
+			} else if resCode <= 200 {
+				close(continueCh)
+				continueCh = nil
+			}
+		}
+		is1xx := 100 <= resCode && resCode <= 199
+		// treat 101 as a terminal status, see issue 26161
+		is1xxNonTerminal := is1xx && resCode != StatusSwitchingProtocols
+		if is1xxNonTerminal {
+			num1xx++
+			if num1xx > max1xxResponses {
+				return nil, errors.New("net/http: too many 1xx informational responses")
+			}
+			pc.readLimit = pc.maxHeaderResponseSize() // reset the limit
+			// if trace != nil && trace.Got1xxResponse != nil {
+			// 	if err := trace.Got1xxResponse(resCode, textproto.MIMEHeader(resp.Header)); err != nil {
+			// 		return nil, err
+			// 	}
+			// }
+			continue
+		}
+		break
+	}
+	if resp.isProtocolSwitch() {
+		resp.Body = newReadWriteCloserBody(pc.br, pc.conn)
+	}
+
+	// resp.TLS = pc.tlsState
+	return
+}
 
 // waitForContinue returns the function to block until
 // any response, timeout or connection close. After any of them,
@@ -1322,6 +1562,39 @@ func (pc *persistConn) waitForContinue(continueCh <-chan struct{}) func() bool {
 			return false
 		}
 	}
+}
+
+func newReadWriteCloserBody(br *bufio.Reader, rwc io.ReadWriteCloser) io.ReadWriteCloser {
+	body := &readWriteCloserBody{ReadWriteCloser: rwc}
+	if br.Buffered() != 0 {
+		body.br = br
+	}
+	return body
+}
+
+// readWriteCloserBody is the Response.Body type used when we want to
+// give users write access to the Body through the underlying
+// connection (TCP, unless using custom dialers). This is then
+// the concrete type for a Response.Body on the 101 Switching
+// Protocols response, as used by WebSockets, h2c, etc.
+type readWriteCloserBody struct {
+	_  incomparable
+	br *bufio.Reader // used until empty
+	io.ReadWriteCloser
+}
+
+func (b *readWriteCloserBody) Read(p []byte) (n int, err error) {
+	if b.br != nil {
+		if n := b.br.Buffered(); len(p) > n {
+			p = p[:n]
+		}
+		n, err = b.br.Read(p)
+		if b.br.Buffered() == 0 {
+			b.br = nil
+		}
+		return n, err
+	}
+	return b.ReadWriteCloser.Read(p)
 }
 
 // nothingWrittenError wraps a write errors which ended up writing zero bytes.
@@ -1427,24 +1700,58 @@ func canonicalAddr(url *url.URL) string {
 	return net.JoinHostPort(idnaASCIIFromURL(url), port)
 }
 
+// maxWriteWaitBeforeConnReuse is how long the a Transport RoundTrip
+// will wait to see the Request's Body.Write result after getting a
+// response from the server. See comments in (*persistConn).wroteRequest.
+//
+// In tests, we set this to a large value to avoid flakiness from inconsistent
+// recycling of connections.
+var maxWriteWaitBeforeConnReuse = 50 * time.Millisecond
+
+// wroteRequest is a check before recycling a connection that the previous write
+// (from writeLoop above) happened and was successful.
+func (pc *persistConn) wroteRequest() bool {
+	select {
+	case err := <-pc.writeErrCh:
+		return err == nil
+	default:
+		t := time.NewTimer(maxWriteWaitBeforeConnReuse)
+		defer t.Stop()
+		select {
+		case err := <-pc.writeErrCh:
+			return err == nil
+		case <-t.C:
+			return false
+		}
+	}
+}
+
+// responseAndError is how the goroutine reading from an HTTP/1 server
+// communicates with the goroutine doing the RoundTrip.
+type responseAndError struct {
+	_   incomparable
+	res *Response // else use this response (see res method)
+	err error
+}
+
 type requestAndChan struct {
-	// _ incomparable
-	// // req       *Request
-	// // cancelKey cancelKey
-	// ch chan responseAndError // unbuffered; always send in select on callerGone
+	_         incomparable
+	req       *Request
+	cancelKey cancelKey
+	ch        chan responseAndError // unbuffered; always send in select on callerGone
 
-	// // // whether the Transport (as opposed to the user client code)
-	// // // added the Accept-Encoding gzip header. If the Transport
-	// // // set it, only then do we transparently decode the gzip.
-	// // addedGzip bool
+	// // whether the Transport (as opposed to the user client code)
+	// // added the Accept-Encoding gzip header. If the Transport
+	// // set it, only then do we transparently decode the gzip.
+	// addedGzip bool
 
-	// // // Optional blocking chan for Expect: 100-continue (for send).
-	// // // If the request has an "Expect: 100-continue" header and
-	// // // the server responds 100 Continue, readLoop send a value
-	// // // to writeLoop via this chan.
-	// // continueCh chan<- struct{}
+	// Optional blocking chan for Expect: 100-continue (for send).
+	// If the request has an "Expect: 100-continue" header and
+	// the server responds 100 Continue, readLoop send a value
+	// to writeLoop via this chan.
+	continueCh chan<- struct{}
 
-	// callerGone <-chan struct{} // closed when roundTrip caller has returned
+	callerGone <-chan struct{} // closed when roundTrip caller has returned
 }
 
 // A writeRequest is sent by the caller's goroutine to the

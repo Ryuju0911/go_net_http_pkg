@@ -626,9 +626,9 @@ func NewRequestWithContext(ctx context.Context, method, url string, body io.Read
 		// We still enforce validMethod for non-empty methods.
 		method = "GET"
 	}
-	// if !validMethod(method) {
-	// 	return nil, fmt.Errorf("net/http: invalid method %q", method)
-	// }
+	if !validMethod(method) {
+		return nil, fmt.Errorf("net/http: invalid method %q", method)
+	}
 	if ctx == nil {
 		return nil, errors.New("net/http: nil Context")
 	}

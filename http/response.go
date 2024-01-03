@@ -12,6 +12,8 @@ import (
 	"net/textproto"
 	"strconv"
 	"strings"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 // Response represents the response from an HTTP request.
@@ -180,4 +182,35 @@ func fixPragmaCacheControl(header Header) {
 			header["Cache-Control"] = []string{"no-cache"}
 		}
 	}
+}
+
+// bodyIsWritable reports whether the Body supports writing. The
+// Transport returns Writable bodies for 101 Switching Protocols
+// responses.
+// The Transport uses this method to determine whether a persistent
+// connection is done being managed from its perspective. Once we
+// return a writable response body to a user, the net/http package is
+// done managing that connection.
+func (r *Response) bodyIsWritable() bool {
+	_, ok := r.Body.(io.Writer)
+	return ok
+}
+
+// isProtocolSwitch reports whether the response code and header
+// indicate a successful protocol upgrade response.
+func (r *Response) isProtocolSwitch() bool {
+	return isProtocolSwitchResponse(r.StatusCode, r.Header)
+}
+
+// isProtocolSwitchResponse reports whether the response code and
+// response header indicate a successful protocol upgrade response.
+func isProtocolSwitchResponse(code int, h Header) bool {
+	return code == StatusSwitchingProtocols && isProtocolSwitchHeader(h)
+}
+
+// isProtocolSwitchHeader reports whether the request or response header
+// is for a protocol switch.
+func isProtocolSwitchHeader(h Header) bool {
+	return h.Get("Upgrade") != "" &&
+		httpguts.HeaderValuesContainsToken(h["Connection"], "Upgrade")
 }
