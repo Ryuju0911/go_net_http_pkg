@@ -763,6 +763,17 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 	return req, nil
 }
 
+func (r *Request) expectsContinue() bool {
+	return hasToken(r.Header.get("Expect"), "100-continue")
+}
+
+func (r *Request) wantsClose() bool {
+	if r.Close {
+		return true
+	}
+	return hasToken(r.Header.get("Connection"), "close")
+}
+
 func (r *Request) closeBody() error {
 	if r.Body == nil {
 		return nil

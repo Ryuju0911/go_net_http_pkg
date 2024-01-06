@@ -41,7 +41,7 @@ var DefaultTransport RoundTripper = &Transport{
 	MaxIdleConns:    100,
 	IdleConnTimeout: 90 * time.Second,
 	// TLSHandshakeTimeout:   10 * time.Second,
-	// ExpectContinueTimeout: 1 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
 }
 
 // DefaultMaxIdleConnsPerHost is the default value of Transport's
@@ -211,11 +211,11 @@ type Transport struct {
 	// Zero means no limit.
 	IdleConnTimeout time.Duration
 
-	// // ResponseHeaderTimeout, if non-zero, specifies the amount of
-	// // time to wait for a server's response headers after fully
-	// // writing the request (including its body, if any). This
-	// // time does not include the time to read the response body.
-	// ResponseHeaderTimeout time.Duration
+	// ResponseHeaderTimeout, if non-zero, specifies the amount of
+	// time to wait for a server's response headers after fully
+	// writing the request (including its body, if any). This
+	// time does not include the time to read the response body.
+	ResponseHeaderTimeout time.Duration
 
 	// ExpectContinueTimeout, if non-zero, specifies the amount of
 	// time to wait for a server's first response headers after fully
@@ -317,6 +317,13 @@ type transportRequest struct {
 	err error      // first setError value for mapRoundTripError to consider
 }
 
+func (tr *transportRequest) extraHeaders() Header {
+	if tr.extra == nil {
+		tr.extra = make(Header)
+	}
+	return tr.extra
+}
+
 func (tr *transportRequest) setError(err error) {
 	tr.mu.Lock()
 	if tr.err == nil {
@@ -415,8 +422,35 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 			return resp, nil
 		}
 
-		// Failed. Clean up and determine whether to retry.
-		// TODO
+		// 	// Failed. Clean up and determine whether to retry.
+		// 	if http2isNoCachedConnError(err) {
+		// 		if t.removeIdleConn(pconn) {
+		// 			t.decConnsPerHost(pconn.cacheKey)
+		// 		}
+		// 	} else if !pconn.shouldRetryRequest(req, err) {
+		// 		// Issue 16465: return underlying net.Conn.Read error from peek,
+		// 		// as we've historically done.
+		// 		if e, ok := err.(nothingWrittenError); ok {
+		// 			err = e.error
+		// 		}
+		// 		if e, ok := err.(transportReadFromServerError); ok {
+		// 			err = e.err
+		// 		}
+		// 		if b, ok := req.Body.(*readTrackingBody); ok && !b.didClose {
+		// 			// Issue 49621: Close the request body if pconn.roundTrip
+		// 			// didn't do so already. This can happen if the pconn
+		// 			// write loop exits without reading the write request.
+		// 			req.closeBody()
+		// 		}
+		// 		return nil, err
+		// 	}
+		// 	testHookRoundTripRetried()
+
+		// 	// Rewind the body if we're able to.
+		// 	req, err = rewindBody(req)
+		// 	if err != nil {
+		// 		return nil, err
+		// 	}
 	}
 }
 
@@ -447,6 +481,22 @@ func setupRewindBody(req *Request) *Request {
 	newReq := *req
 	newReq.Body = &readTrackingBody{ReadCloser: req.Body}
 	return &newReq
+}
+
+// Cancel an in-flight request, recording the error value.
+// Returns whether the request was canceled.
+func (t *Transport) cancelRequest(key cancelKey, err error) bool {
+	// This function must not return until the cancel func has completed.
+	// See: https://golang.org/issue/34658
+	t.reqMu.Lock()
+	defer t.reqMu.Unlock()
+	cancel := t.reqCanceler[key]
+	delete(t.reqCanceler, key)
+	if cancel != nil {
+		cancel(err)
+	}
+
+	return cancel != nil
 }
 
 func (t *Transport) connectMethodForRequst(treq *transportRequest) (cm connectMethod, err error) {
@@ -1282,9 +1332,9 @@ type persistConn struct {
 	mu                   sync.Mutex // guards following fields
 	numExpectedResponses int
 	closed               error // set non-nil when conn is closed, before closech is closed
-	// canceledErr          error // set non-nil if conn is canceled
-	broken bool // an error has happened on this connection; marked broken so it's not reused.
-	reused bool // whether conn has had successful request/response and is being reused.
+	canceledErr          error // set non-nil if conn is canceled
+	broken               bool  // an error has happened on this connection; marked broken so it's not reused.
+	reused               bool  // whether conn has had successful request/response and is being reused.
 	// mutateHeaderFunc is an optional func to modify extra
 	// headers on each outbound request before it's written. (the
 	// original Request given to RoundTrip is not modified)
@@ -1321,6 +1371,21 @@ func (pc *persistConn) isBroken() bool {
 	return b
 }
 
+// canceled returns non-nil if the connection was closed due to
+// CancelRequest or due to context cancellation.
+func (pc *persistConn) canceled() error {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	return pc.canceledErr
+}
+
+func (pc *persistConn) cancelRequest(err error) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	pc.canceledErr = err
+	pc.closeLocked(errRequestCanceled)
+}
+
 // closeConnIfStillIdle closes the connection if it's still sitting idle.
 // This is what's called by the persistConn's idleTimer, and is run in its
 // own goroutine.
@@ -1334,6 +1399,64 @@ func (pc *persistConn) closeConnIfStillIdle() {
 	}
 	t.removeIdleConnLocked(pc)
 	pc.close(errIdleConnTimeout)
+}
+
+// mapRoundTripError returns the appropriate error value for
+// persistConn.roundTrip.
+//
+// The provided err is the first error that (*persistConn).roundTrip
+// happened to receive from its select statement.
+//
+// The startBytesWritten value should be the value of pc.nwrite before the roundTrip
+// started writing the request.
+func (pc *persistConn) mapRoundTripError(req *transportRequest, startBytesWritten int64, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	// Wait for the writeLoop goroutine to terminate to avoid data
+	// races on callers who mutate the request on failure.
+	//
+	// When resc in pc.roundTrip and hence rc.ch receives a responseAndError
+	// with a non-nil error it implies that the persistConn is either closed
+	// or closing. Waiting on pc.writeLoopDone is hence safe as all callers
+	// close closech which in turn ensures writeLoop returns.
+	<-pc.writeLoopDone
+
+	// If the request was canceled, that's better than network
+	// failures that were likely the result of tearing down the
+	// connection.
+	if cerr := pc.canceled(); cerr != nil {
+		return cerr
+	}
+
+	// See if an error was set explicitly.
+	req.mu.Lock()
+	reqErr := req.err
+	req.mu.Unlock()
+	if reqErr != nil {
+		return reqErr
+	}
+
+	if err == errServerClosedIdle {
+		// Don't decorate
+		return err
+	}
+
+	if _, ok := err.(transportReadFromServerError); ok {
+		if pc.nwrite == startBytesWritten {
+			return nothingWrittenError{err}
+		}
+		// Don't decorate
+		return err
+	}
+	if pc.isBroken() {
+		if pc.nwrite == startBytesWritten {
+			return nothingWrittenError{err}
+		}
+		return fmt.Errorf("net/http: HTTP/1.x transport connection broken: %w", err)
+	}
+	return err
 }
 
 // errCallerOwnsConn is an internal sentinel error used when we hand
@@ -1768,14 +1891,161 @@ type writeRequest struct {
 	continueCh <-chan struct{}
 }
 
+type httpError struct {
+	err     string
+	timeout bool
+}
+
+func (e *httpError) Error() string   { return e.err }
+func (e *httpError) Timeout() bool   { return e.timeout }
+func (e *httpError) Temporary() bool { return true }
+
+var errTimeout error = &httpError{err: "net/http: timeout awaiting response headers", timeout: true}
+
 // errRequestCanceled is set to be identical to the one from h2 to facilitate
 // testing.
 var errRequestCanceled = errors.New("net/http: request canceled")
 var errRequestCanceledConn = errors.New("net/http: request canceled while waiting for connection") // TODO: unify?
 
+func nop() {}
+
 func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
-	// TODO: Implement logic.
-	return nil, nil
+	// testHookEnterRoundTrip()
+	if !pc.t.replaceReqCanceler(req.cancelKey, pc.cancelRequest) {
+		pc.t.putOrCloseIdleConn(pc)
+		return nil, errRequestCanceled
+	}
+	pc.mu.Lock()
+	pc.numExpectedResponses++
+	headerFn := pc.mutateHeaderFunc
+	pc.mu.Unlock()
+
+	if headerFn != nil {
+		headerFn(req.extraHeaders())
+	}
+
+	// // Ask for a compressed version if the caller didn't set their
+	// // own value for Accept-Encoding. We only attempt to
+	// // uncompress the gzip stream if we were the layer that
+	// // requested it.
+	// requestedGzip := false
+	// if !pc.t.DisableCompression &&
+	// 	req.Header.Get("Accept-Encoding") == "" &&
+	// 	req.Header.Get("Range") == "" &&
+	// 	req.Method != "HEAD" {
+	// 	// Request gzip only, not deflate. Deflate is ambiguous and
+	// 	// not as universally supported anyway.
+	// 	// See: https://zlib.net/zlib_faq.html#faq39
+	// 	//
+	// 	// Note that we don't request this for HEAD requests,
+	// 	// due to a bug in nginx:
+	// 	//   https://trac.nginx.org/nginx/ticket/358
+	// 	//   https://golang.org/issue/5522
+	// 	//
+	// 	// We don't request gzip if the request is for a range, since
+	// 	// auto-decoding a portion of a gzipped document will just fail
+	// 	// anyway. See https://golang.org/issue/8923
+	// 	requestedGzip = true
+	// 	req.extraHeaders().Set("Accept-Encoding", "gzip")
+	// }
+
+	var continueCh chan struct{}
+	if req.ProtoAtLeast(1, 1) && req.Body != nil && req.expectsContinue() {
+		continueCh = make(chan struct{}, 1)
+	}
+
+	if pc.t.DisableKeepAlives &&
+		!req.wantsClose() &&
+		!isProtocolSwitchHeader(req.Header) {
+		req.extraHeaders().Set("Connection", "close")
+	}
+
+	gone := make(chan struct{})
+	defer close(gone)
+
+	defer func() {
+		if err != nil {
+			pc.t.setReqCanceler(req.cancelKey, nil)
+		}
+	}()
+
+	// const debugRoundTrip = false
+
+	// Write the request concurrently with waiting for a response,
+	// in case the server decides to reply before reading our full
+	// request body.
+	startBytesWritten := pc.nwrite
+	writeErrCh := make(chan error, 1)
+	pc.writech <- writeRequest{req, writeErrCh, continueCh}
+
+	resc := make(chan responseAndError)
+	pc.reqch <- requestAndChan{
+		req:       req.Request,
+		cancelKey: req.cancelKey,
+		ch:        resc,
+		// addedGzip: requestedGzip,
+		continueCh: continueCh,
+		callerGone: gone,
+	}
+
+	var respHeaderTimer <-chan time.Time
+	cancelChan := req.Request.Cancel
+	ctxDoneChan := req.Context().Done()
+	pcClosed := pc.closech
+	canceled := false
+	for {
+		// testHookWaitResLoop()
+		select {
+		case err := <-writeErrCh:
+			// if debugRoundTrip {
+			// 	req.logf("writeErrCh resv: %T/%#v", err, err)
+			// }
+			if err != nil {
+				pc.close(fmt.Errorf("write error: %w", err))
+				return nil, pc.mapRoundTripError(req, startBytesWritten, err)
+			}
+			if d := pc.t.ResponseHeaderTimeout; d > 0 {
+				// if debugRoundTrip {
+				// 	req.logf("starting timer for %v", d)
+				// }
+				timer := time.NewTimer(d)
+				defer timer.Stop() // prevent leaks
+				respHeaderTimer = timer.C
+			}
+		case <-pcClosed:
+			pcClosed = nil
+			if canceled || pc.t.replaceReqCanceler(req.cancelKey, nil) {
+				// if debugRoundTrip {
+				// 	req.logf("closech recv: %T %#v", pc.closed, pc.closed)
+				// }
+				return nil, pc.mapRoundTripError(req, startBytesWritten, pc.closed)
+			}
+		case <-respHeaderTimer:
+			// if debugRoundTrip {
+			// 	req.logf("timeout waiting for response headers.")
+			// }
+			pc.close(errTimeout)
+			return nil, errTimeout
+		case re := <-resc:
+			if (re.res == nil) == (re.err == nil) {
+				panic(fmt.Sprintf("internal error: exactly one of res or err should be set; nil=%v", re.res == nil))
+			}
+			// if debugRoundTrip {
+			// 	req.logf("resc recv: %p, %T/%#v", re.res, re.err, re.err)
+			// }
+			if re.err != nil {
+				return nil, pc.mapRoundTripError(req, startBytesWritten, re.err)
+			}
+			return re.res, nil
+		case <-cancelChan:
+			canceled = pc.t.cancelRequest(req.cancelKey, errRequestCanceled)
+			cancelChan = nil
+		case <-ctxDoneChan:
+			canceled = pc.t.cancelRequest(req.cancelKey, req.Context().Err())
+			cancelChan = nil
+			ctxDoneChan = nil
+		}
+	}
 }
 
 type connLRU struct {

@@ -10,9 +10,16 @@
 package http
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"io"
+	"log"
 	"net/http/internal/ascii"
 	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -146,10 +153,126 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, d
 	if !deadline.IsZero() {
 		forkReq()
 	}
-	// stopTimer, didTimeout := setRequestCancel(req, rt, deadline)
+	stopTimer, didTimeout := setRequestCancel(req, rt, deadline)
 
 	resp, err = rt.RoundTrip(req)
-	return
+	if err != nil {
+		stopTimer()
+		if resp != nil {
+			log.Printf("RoundTripper returned a response & error; ignoring response")
+		}
+		// if tlsErr, ok := err.(tls.RecordHeaderError); ok {
+		// 	// If we get a bad TLS record header, check to see if the
+		// 	// response looks like HTTP and give a more helpful error.
+		// 	// See golang.org/issue/11111.
+		// 	if string(tlsErr.RecordHeader[:]) == "HTTP/" {
+		// 		err = ErrSchemeMismatch
+		// 	}
+		// }
+		return nil, didTimeout, err
+	}
+	if resp == nil {
+		if resp.ContentLength > 0 && req.Method != "HEAD" {
+			return nil, didTimeout, fmt.Errorf("http: RoundTripper implementation (%T) returned a *Response with content length %d but a nil Body", rt, resp.ContentLength)
+		}
+		resp.Body = io.NopCloser(strings.NewReader(""))
+	}
+	if !deadline.IsZero() {
+		resp.Body = &cancelTimerBody{
+			stop:          stopTimer,
+			rc:            resp.Body,
+			reqDidTimeout: didTimeout,
+		}
+	}
+	return resp, nil, nil
+}
+
+// timeBeforeContextDeadline reports whether the non-zero Time t is
+// before ctx's deadline, if any. If ctx does not have a deadline, it
+// always reports true (the deadline is considered infinite).
+func timeBeforeContextDeadline(t time.Time, ctx context.Context) bool {
+	d, ok := ctx.Deadline()
+	if !ok {
+		return true
+	}
+	return t.Before(d)
+}
+
+// knownRoundTripperImpl reports whether rt is a RoundTripper that's
+// maintained by the Go team and known to implement the latest
+// optional semantics (notably contexts). The Request is used
+// to check whether this particular request is using an alternate protocol,
+// in which case we need to check the RoundTripper for that protocol.
+func knownRoundTripperImpl(rt RoundTripper, req *Request) bool {
+	// TODO: implement logic.
+	return true
+}
+
+func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTimer func(), didTimeout func() bool) {
+	if deadline.IsZero() {
+		return nop, alwaysFalse
+	}
+	knownTransport := knownRoundTripperImpl(rt, req)
+	oldCtx := req.Context()
+
+	if req.Cancel == nil && knownTransport {
+		if !timeBeforeContextDeadline(deadline, oldCtx) {
+			return nop, alwaysFalse
+		}
+
+		var cancelCtx func()
+		req.ctx, cancelCtx = context.WithDeadline(oldCtx, deadline)
+		return cancelCtx, func() bool { return time.Now().After(deadline) }
+	}
+	initialReqCancel := req.Cancel // the user's original Request.Cancel, if any
+
+	var cancelCtx func()
+	if !timeBeforeContextDeadline(deadline, oldCtx) {
+		req.ctx, cancelCtx = context.WithDeadline(oldCtx, deadline)
+	}
+
+	cancel := make(chan struct{})
+	req.Cancel = cancel
+
+	doCancel := func() {
+		// The second way in the func comment above:
+		close(cancel)
+		// The first way, used only for RoundTripper
+		// implementations written before Go 1.5 or Go 1.6.
+		type canceler interface{ CancelRequest(*Request) }
+		if v, ok := rt.(canceler); ok {
+			v.CancelRequest(req)
+		}
+	}
+
+	stopTimerCh := make(chan struct{})
+	var once sync.Once
+	stopTimer = func() {
+		once.Do(func() {
+			close(stopTimerCh)
+			if cancelCtx != nil {
+				cancelCtx()
+			}
+		})
+	}
+
+	timer := time.NewTimer(time.Until(deadline))
+	var timedOut atomic.Bool
+
+	go func() {
+		select {
+		case <-initialReqCancel:
+			doCancel()
+			timer.Stop()
+		case <-timer.C:
+			timedOut.Store(true)
+			doCancel()
+		case <-stopTimerCh:
+			timer.Stop()
+		}
+	}()
+
+	return stopTimer, timedOut.Load
 }
 
 // Get issues a GET to the specified URL. If the response is one of
@@ -308,4 +431,37 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 			return nil, err
 		}
 	}
+}
+
+// cancelTimerBody is an io.ReadCloser that wraps rc with two features:
+//  1. On Read error or close, the stop func is called.
+//  2. On Read failure, if reqDidTimeout is true, the error is wrapped and
+//     marked as net.Error that hit its timeout.
+type cancelTimerBody struct {
+	stop          func() // stops the time.Timer waiting to cancel the request
+	rc            io.ReadCloser
+	reqDidTimeout func() bool
+}
+
+func (b *cancelTimerBody) Read(p []byte) (n int, err error) {
+	n, err = b.rc.Read(p)
+	if err == nil {
+		return n, nil
+	}
+	if err == io.EOF {
+		return n, err
+	}
+	if b.reqDidTimeout() {
+		err = &httpError{
+			err:     err.Error() + " (Client.Timeout or context cancellation while reading body)",
+			timeout: true,
+		}
+	}
+	return n, err
+}
+
+func (b *cancelTimerBody) Close() error {
+	err := b.rc.Close()
+	b.stop()
+	return err
 }
