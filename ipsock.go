@@ -173,5 +173,6 @@ func (r *Resolver) internetAddrList(ctx context.Context, net, addr string) (addr
 	}
 
 	// TODO: Handle the case when host != "".
-	return addrList{inetaddr(IPAddr{})}, nil
+	// Temporarily, returns 127.0.0.1 for localhost.
+	return addrList{inetaddr(IPAddr{IP: []byte{127, 0, 0, 1}, Zone: ""})}, nil
 }

@@ -407,6 +407,10 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 			return nil, err
 		}
 
+		// Get the cached or newly-created connection to either the
+		// host (for http or https), the http proxy, or the http proxy
+		// pre-CONNECTed to https server. In any case, we'll be ready
+		// to send it requests.
 		pconn, err := t.getConn(treq, cm)
 		if err != nil {
 			t.setReqCanceler(cancelKey, nil)
@@ -1571,6 +1575,8 @@ func (pc *persistConn) readLoop() {
 			// testHookReadLoopBeforeNextRead()
 			continue
 		}
+
+		// TODO
 	}
 }
 
