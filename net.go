@@ -37,6 +37,32 @@ type Conn interface {
 	// LocalAddr returns the local network address, if known.
 	LocalAddr() Addr
 
+	// RemoteAddr returns the remote network address, if known.
+	RemoteAddr() Addr
+
+	// // SetDeadline sets the read and write deadlines associated
+	// // with the connection. It is equivalent to calling both
+	// // SetReadDeadline and SetWriteDeadline.
+	// //
+	// // A deadline is an absolute time after which I/O operations
+	// // fail instead of blocking. The deadline applies to all future
+	// // and pending I/O, not just the immediately following call to
+	// // Read or Write. After a deadline has been exceeded, the
+	// // connection can be refreshed by setting a deadline in the future.
+	// //
+	// // If the deadline is exceeded a call to Read or Write or to other
+	// // I/O methods will return an error that wraps os.ErrDeadlineExceeded.
+	// // This can be tested using errors.Is(err, os.ErrDeadlineExceeded).
+	// // The error's Timeout method will return true, but note that there
+	// // are other possible errors for which the Timeout method will
+	// // return true even if the deadline has not been exceeded.
+	// //
+	// // An idle timeout can be implemented by repeatedly extending
+	// // the deadline after successful Read or Write calls.
+	// //
+	// // A zero value for t means I/O operations will not time out.
+	// SetDeadline(t time.Time) error
+
 	// SetReadDeadline sets the deadline for future Read calls
 	// and any currently-blocked Read call.
 	// A zero value for t means Read will not time out.
@@ -84,11 +110,24 @@ func (c *conn) Close() error {
 	return err
 }
 
+// LocalAddr returns the local network address.
+// The Addr returned is shared by all invocations of LocalAddr, so
+// do not modify it.
 func (c *conn) LocalAddr() Addr {
 	if !c.ok() {
 		return nil
 	}
 	return c.fd.laddr
+}
+
+// RemoteAddr returns the remote network address.
+// The Addr returned is shared by all invocations of RemoteAddr, so
+// do not modify it.
+func (c *conn) RemoteAddr() Addr {
+	if !c.ok() {
+		return nil
+	}
+	return c.fd.raddr
 }
 
 // SetReadDeadline implements the Conn SetReadDeadline method.
@@ -135,6 +174,9 @@ type Listener interface {
 	// Close closes the listener.
 	// Any blocked Accept operations will be unblocked and return errors.
 	Close() error
+
+	// Addr returns the listener's network address.
+	Addr() Addr
 }
 
 var (
