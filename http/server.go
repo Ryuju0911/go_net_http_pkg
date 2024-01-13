@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"net/textproto"
@@ -1585,6 +1586,12 @@ type Server struct {
 	// ConnState type and associated constants for details.
 	ConnState func(net.Conn, ConnState)
 
+	// ErrorLog specifies an optional logger for errors accepting
+	// connections, unexpected behavior from handlers, and
+	// underlying FileSystem errors.
+	// If nil, logging is done via the log package's standard logger.
+	ErrorLog *log.Logger
+
 	Handler Handler // handler to invoke, http.DefaultServeMux if nil
 
 	// BaseContext optionally specifies a function that returns
@@ -1602,6 +1609,8 @@ type Server struct {
 	ConnContext func(ctx context.Context, c net.Conn) context.Context
 
 	inShutdown atomic.Bool // true when server is in shutdown
+
+	disableKeepAlives atomic.Bool
 
 	mu         sync.Mutex
 	listeners  map[*net.Listener]struct{}
@@ -1900,6 +1909,19 @@ func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
 	}
 
 	handler.ServeHTTP(rw, req)
+}
+
+func (srv *Server) SetKeepAlivesEnabled(v bool) {
+	if v {
+		srv.disableKeepAlives.Store(false)
+		return
+	}
+	srv.disableKeepAlives.Store(true)
+
+	// Close idle HTTP/1 conns:
+	srv.closeIdleConns()
+
+	// TODO: Issue 26303: close HTTP/2 conns as soon as they become idle.
 }
 
 // ListenAndServe listens on the TCP network address addr and then calls
