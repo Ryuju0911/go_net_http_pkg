@@ -487,6 +487,28 @@ func setupRewindBody(req *Request) *Request {
 	return &newReq
 }
 
+// CloseIdleConnections closes any connections which were previously
+// connected from previous requests but are now sitting idle in
+// a "keep-alive" state. It does not interrupt any connections currently
+// in use.
+func (t *Transport) CloseIdleConnections() {
+	// t.nextProtoOnce.Do(t.onceSetNextProtoDefaults)
+	t.idleMu.Lock()
+	m := t.idleConn
+	t.idleConn = nil
+	t.closeIdle = true // close newly idle connections
+	t.idleLRU = connLRU{}
+	t.idleMu.Unlock()
+	for _, conns := range m {
+		for _, pconn := range conns {
+			pconn.close(errCloseIdleConns)
+		}
+	}
+	// if t2 := t.h2transport; t2 != nil {
+	// 	t2.CloseIdleConnections()
+	// }
+}
+
 // Cancel an in-flight request, recording the error value.
 // Returns whether the request was canceled.
 func (t *Transport) cancelRequest(key cancelKey, err error) bool {
@@ -521,9 +543,9 @@ var (
 	errCloseIdle          = errors.New("http: putIdleConn: CloseIdleConnections was called")
 	errTooManyIdle        = errors.New("http: putIdleConn: too many idle connections")
 	errTooManyIdleHost    = errors.New("http: putIdleConn: too many idle connections for host")
-	// errCloseIdleConns     = errors.New("http: CloseIdleConnections called")
-	errReadLoopExiting = errors.New("http: persistConn.readLoop exiting")
-	errIdleConnTimeout = errors.New("http: idle connection timeout")
+	errCloseIdleConns     = errors.New("http: CloseIdleConnections called")
+	errReadLoopExiting    = errors.New("http: persistConn.readLoop exiting")
+	errIdleConnTimeout    = errors.New("http: idle connection timeout")
 
 	// errServerClosedIdle is not seen by users for idempotent requests, but may be
 	// seen by a user if the server shuts down an idle connection and sends its FIN
