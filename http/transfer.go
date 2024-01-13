@@ -741,17 +741,17 @@ func fixTrailer(header Header, chunked bool) (Header, error) {
 }
 
 type body struct {
-	src          io.Reader
-	hdr          any           // non-nil (Response or Request) value means read trailer
-	r            *bufio.Reader // underlying wire-format reader for the trailer
-	closing      bool          // is the connection to be closed after reading body?
-	doEarlyClose bool          // whether Close should stop early
+	src     io.Reader
+	hdr     any           // non-nil (Response or Request) value means read trailer
+	r       *bufio.Reader // underlying wire-format reader for the trailer
+	closing bool          // is the connection to be closed after reading body?
+	// doEarlyClose bool          // whether Close should stop early
 
-	mu         sync.Mutex // guards following, and calls to Read and Close
-	sawEOF     bool
-	closed     bool
-	earlyClose bool   // Close called and we didn't read to the end of src
-	onHitEOF   func() // if non-nil, func to call when EOF is Read
+	mu     sync.Mutex // guards following, and calls to Read and Close
+	sawEOF bool
+	closed bool
+	// earlyClose bool   // Close called and we didn't read to the end of src
+	onHitEOF func() // if non-nil, func to call when EOF is Read
 }
 
 // ErrBodyReadAfterClose is returned when reading a Request or Response

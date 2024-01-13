@@ -653,9 +653,9 @@ func NewRequestWithContext(ctx context.Context, method, url string, body io.Read
 		Body:       rc,
 		Host:       u.Host,
 	}
-	if body != nil {
-		// TODO: Implement logic.
-	}
+	// if body != nil {
+	// 	// TODO: Implement logic.
+	// }
 
 	return req, nil
 }
