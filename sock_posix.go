@@ -68,7 +68,10 @@ func socket(
 		// TODO: Implement the cases when syscall.SOCK_SEQPACKET or syscall.SOCK_DGRAM.
 	}
 
-	// TODO: Implement fd.dial and call it here.
+	if err := fd.dial(ctx, laddr, raddr, ctrlCtxFn); err != nil {
+		fd.Close()
+		return nil, err
+	}
 	return fd, nil
 }
 
@@ -85,6 +88,64 @@ func (fd *netFD) ctrlNetwork() string {
 		return fd.net + "4"
 	}
 	return fd.net + "6"
+}
+
+func (fd *netFD) dial(ctx context.Context, laddr, raddr sockaddr, ctrlCtxFn func(context.Context, string, string, syscall.RawConn) error) error {
+	var c *rawConn
+	if ctrlCtxFn != nil {
+		c = newRawConn(fd)
+		var ctrlAddr string
+		if raddr != nil {
+			ctrlAddr = raddr.String()
+		} else if laddr != nil {
+			ctrlAddr = laddr.String()
+		}
+		if err := ctrlCtxFn(ctx, fd.ctrlNetwork(), ctrlAddr, c); err != nil {
+			return err
+		}
+	}
+
+	var lsa syscall.Sockaddr
+	var err error
+	if laddr != nil {
+		if lsa, err = laddr.sockaddr(fd.family); err != nil {
+			return err
+		} else if lsa != nil {
+			if err = syscall.Bind(fd.pfd.Sysfd, lsa); err != nil {
+				return os.NewSyscallError("bind", err)
+			}
+		}
+	}
+	var rsa syscall.Sockaddr  // remote address from the user
+	var crsa syscall.Sockaddr // remote address we actually connected to
+	if raddr != nil {
+		if rsa, err = raddr.sockaddr(fd.family); err != nil {
+			return err
+		}
+		if crsa, err = fd.connect(ctx, lsa, rsa); err != nil {
+			return err
+		}
+		fd.isConnected = true
+	} else {
+		if err := fd.init(); err != nil {
+			return err
+		}
+	}
+	// Record the local and remote addresses from the actual socket.
+	// Get the local address by calling Getsockname.
+	// For the remote address, use
+	// 1) the one returned by the connect method, if any; or
+	// 2) the one from Getpeername, if it succeeds; or
+	// 3) the one passed to us as the raddr parameter.
+	lsa, _ = syscall.Getsockname(fd.pfd.Sysfd)
+	if crsa != nil {
+		fd.setAddr(fd.addrFunc()(lsa), fd.addrFunc()(crsa))
+	} else if rsa, _ = syscall.Getpeername(fd.pfd.Sysfd); rsa != nil {
+		fd.setAddr(fd.addrFunc()(lsa), fd.addrFunc()(rsa))
+	} else {
+		fd.setAddr(fd.addrFunc()(lsa), raddr)
+	}
+	return nil
 }
 
 func (fd *netFD) listenStream(

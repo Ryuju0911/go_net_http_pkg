@@ -261,6 +261,17 @@ func (e *OpError) Error() string {
 	return s
 }
 
+var (
+	// aLongTimeAgo is a non-zero time, far in the past, used for
+	// immediate cancellation of dials.
+	aLongTimeAgo = time.Unix(1, 0)
+
+	// noDeadline and noCancel are just zero values for
+	// readability with functions taking too many parameters.
+	noDeadline = time.Time{}
+	// noCancel   = (chan struct{})(nil)
+)
+
 type AddrError struct {
 	Err  string
 	Addr string
