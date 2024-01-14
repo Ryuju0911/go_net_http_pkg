@@ -139,11 +139,11 @@ type conn struct {
 	// *tls.Conn.
 	rwc net.Conn
 
-	// // remoteAddr is rwc.RemoteAddr().String(). It is not populated synchronously
-	// // inside the Listener's Accept goroutine, as some implementations block.
-	// // It is populated immediately inside the (*conn).serve goroutine.
-	// // This is the value of a Handler's (*Request).RemoteAddr.
-	// remoteAddr string
+	// remoteAddr is rwc.RemoteAddr().String(). It is not populated synchronously
+	// inside the Listener's Accept goroutine, as some implementations block.
+	// It is populated immediately inside the (*conn).serve goroutine.
+	// This is the value of a Handler's (*Request).RemoteAddr.
+	remoteAddr string
 
 	// werr is set to the first write error to rwc.
 	// It is set via checkConnErrorWriter{w}, where bufw writes.
@@ -559,7 +559,7 @@ func (c *conn) readRequst(ctx context.Context) (w *response, err error) {
 
 	ctx, cancelCtx := context.WithCancel(ctx)
 	req.ctx = ctx
-	// req.RemoteAddr = c.remoteAddr
+	req.RemoteAddr = c.remoteAddr
 	// req.TLS = c.tlsState
 	// if body, ok := req.Body.(*body); ok {
 	// 	body.doEarlyClose = true
@@ -865,6 +865,12 @@ func (c *conn) finalFlush() {
 	}
 }
 
+// Close the connection.
+func (c *conn) close() {
+	c.finalFlush()
+	c.rwc.Close()
+}
+
 // rstAvoidanceDelay is the amount of time we sleep after closing the
 // write side of a TCP connection before closing the entire socket.
 // By sleeping, we increase the chances that the client sees our FIN
@@ -951,9 +957,9 @@ func (c *conn) getState() (state ConnState, unixSec int64) {
 
 // Serve a new connection.
 func (c *conn) serve(ctx context.Context) {
-	// if ra := c.rwc.RemoteAddr(); ra != nil {
-	// 	c.remoteAddr = ra.String()
-	// }
+	if ra := c.rwc.RemoteAddr(); ra != nil {
+		c.remoteAddr = ra.String()
+	}
 	ctx = context.WithValue(ctx, LocalAddrContextKey, c.rwc.LocalAddr())
 	var inFlightResponse *response
 	defer func() {
@@ -961,6 +967,13 @@ func (c *conn) serve(ctx context.Context) {
 		if inFlightResponse != nil {
 			inFlightResponse.cancelCtx()
 		}
+		// if !c.hijacked
+		if inFlightResponse != nil {
+			inFlightResponse.conn.r.abortPendingRead()
+			inFlightResponse.reqBody.Close()
+		}
+		c.close()
+		c.setState(c.rwc, StateClosed, runHooks)
 	}()
 
 	// HTTP/1.x from here on.
@@ -997,6 +1010,19 @@ func (c *conn) serve(ctx context.Context) {
 			}
 		}
 
+		// // Expect 100 Continue support
+		// req := w.req
+		// if req.expectsContinue() {
+		// 	if req.ProtoAtLeast(1, 1) && req.ContentLength != 0 {
+		// 		// Wrap the Body reader with one that replies on the connection
+		// 		req.Body = &expectContinueReader{readCloser: req.Body, resp: w}
+		// 		w.canWriteContinue.Store(true)
+		// 	}
+		// } else if req.Header.get("Expect") != "" {
+		// 	w.sendExpectationFailed()
+		// 	return
+		// }
+
 		c.curReq.Store(w)
 
 		// if requestBodyRemains(req.Body) {
@@ -1018,9 +1044,36 @@ func (c *conn) serve(ctx context.Context) {
 		w.cancelCtx()
 		w.finishRequest()
 		c.rwc.SetWriteDeadline(time.Time{})
-
+		// if !w.shouldReuseConnection() {
+		// 	if w.requestBodyLimitHit || w.closedRequestBodyEarly() {
+		// 		c.closeWriteAndWait()
+		// 	}
+		// 	return
+		// }
 		c.setState(c.rwc, StateIdle, runHooks)
 		c.curReq.Store(nil)
+
+		// if !w.conn.server.doKeepAlives() {
+		// 	// We're in shutdown mode. We might've replied
+		// 	// to the user without "Connection: close" and
+		// 	// they might think they can send another
+		// 	// request, but such is life with HTTP/1.1.
+		// 	return
+		// }
+
+		// if d := c.server.idleTimeout(); d != 0 {
+		// 	c.rwc.SetReadDeadline(time.Now().Add(d))
+		// } else {
+		// 	c.rwc.SetReadDeadline(time.Time{})
+		// }
+
+		// Wait for the connection to become readable again before trying to
+		// read the next request. This prevents a ReadHeaderTimeout or
+		// ReadTimeout from starting until the first bytes of the next request
+		// have been received.
+		if _, err := c.bufr.Peek(4); err != nil {
+			return
+		}
 
 		c.rwc.SetReadDeadline(time.Time{})
 	}
@@ -1810,9 +1863,17 @@ var ErrServerClosed = errors.New("http: Server closed")
 // Serve always returns a non-nil error and closes l.
 // After Shutdown or Close, the returned error is ErrServerClosed.
 func (srv *Server) Serve(l net.Listener) error {
+	// if fn := testHookServerServe; fn != nil {
+	// 	fn(srv, l) // call hook with unwrapped listener
+	// }
+
 	origListener := l
 	l = &onceCloseListener{Listener: l}
 	defer l.Close()
+
+	// if err := srv.setupHTTP2_Serve(); err != nil {
+	// 	return err
+	// }
 
 	if !srv.trackListener(&l, true) {
 		return ErrServerClosed
@@ -1827,6 +1888,8 @@ func (srv *Server) Serve(l net.Listener) error {
 		}
 	}
 
+	var tempDelay time.Duration // how long to sleep on accept failure
+
 	ctx := context.WithValue(baseCtx, ServerContextKey, srv)
 	for {
 		rw, err := l.Accept()
@@ -1834,7 +1897,19 @@ func (srv *Server) Serve(l net.Listener) error {
 			if srv.shuttingDown() {
 				return ErrServerClosed
 			}
-			// TODO: handles Accepet error.
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if max := 1 * time.Second; tempDelay > max {
+					tempDelay = max
+				}
+				srv.logf("http: Accept error: %v; retrying in %v", err, tempDelay)
+				time.Sleep(tempDelay)
+				continue
+			}
 			return err
 		}
 		connCtx := ctx
@@ -1844,6 +1919,7 @@ func (srv *Server) Serve(l net.Listener) error {
 				panic("ConnContext returned nil")
 			}
 		}
+		tempDelay = 0
 		c := srv.newConn(rw)
 		c.setState(c.rwc, StateNew, runHooks) // before Serve can return
 		go c.serve(connCtx)
@@ -1922,6 +1998,14 @@ func (srv *Server) SetKeepAlivesEnabled(v bool) {
 	srv.closeIdleConns()
 
 	// TODO: Issue 26303: close HTTP/2 conns as soon as they become idle.
+}
+
+func (s *Server) logf(format string, args ...any) {
+	if s.ErrorLog != nil {
+		s.ErrorLog.Printf(format, args...)
+	} else {
+		log.Printf(format, args...)
+	}
 }
 
 // ListenAndServe listens on the TCP network address addr and then calls

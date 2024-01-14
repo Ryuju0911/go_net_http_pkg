@@ -203,14 +203,14 @@ type Request struct {
 	// Few HTTP clients, servers, or proxies support HTTP trailers.
 	Trailer Header
 
-	// // RemoteAddr allows HTTP servers and other software to record
-	// // the network address that sent the request, usually for
-	// // logging. This field is not filled in by ReadRequest and
-	// // has no defined format. The HTTP server in this package
-	// // sets RemoteAddr to an "IP:port" address before invoking a
-	// // handler.
-	// // This field is ignored by the HTTP client.
-	// RemoteAddr string
+	// RemoteAddr allows HTTP servers and other software to record
+	// the network address that sent the request, usually for
+	// logging. This field is not filled in by ReadRequest and
+	// has no defined format. The HTTP server in this package
+	// sets RemoteAddr to an "IP:port" address before invoking a
+	// handler.
+	// This field is ignored by the HTTP client.
+	RemoteAddr string
 
 	// RequestURI is the unmodified request-target of the
 	// Request-Line (RFC 7230, Section 3.1.1) as sent by the client
@@ -707,9 +707,9 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 	if !ok {
 		return nil, badStringError("malformed HTTP request", s)
 	}
-	// if !validMethod(req.Method) {
-	// 	return nil, badStringError("invalid method", req.Method)
-	// }
+	if !validMethod(req.Method) {
+		return nil, badStringError("invalid method", req.Method)
+	}
 	rawurl := req.RequestURI
 	if req.ProtoMajor, req.ProtoMinor, ok = ParseHTTPVersion(req.Proto); !ok {
 		return nil, badStringError("malformed HTTP version", req.Proto)

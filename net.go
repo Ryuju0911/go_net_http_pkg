@@ -7,6 +7,7 @@ package net
 import (
 	"context"
 	"errors"
+	"os"
 	"syscall"
 	"time"
 )
@@ -179,6 +180,17 @@ type Listener interface {
 	Addr() Addr
 }
 
+// An Error represents a network error.
+type Error interface {
+	error
+	Timeout() bool // Is the error a timeout?
+
+	// Deprecated: Temporary errors are not well-defined.
+	// Most "temporary" errors are timeouts, and the few exceptions are surprising.
+	// Do not use this method.
+	Temporary() bool
+}
+
 var (
 	// For connection setup and write operations.
 	errMissingAddress = errors.New("missing address")
@@ -272,6 +284,38 @@ var (
 	// noCancel   = (chan struct{})(nil)
 )
 
+type timeout interface {
+	Timeout() bool
+}
+
+func (e *OpError) Timeout() bool {
+	if ne, ok := e.Err.(*os.SyscallError); ok {
+		t, ok := ne.Err.(timeout)
+		return ok && t.Timeout()
+	}
+	t, ok := e.Err.(timeout)
+	return ok && t.Timeout()
+}
+
+type temporary interface {
+	Temporary() bool
+}
+
+func (e *OpError) Temporary() bool {
+	// Treat ECONNRESET and ECONNABORTED as temporary errors when
+	// they come from calling accept. See issue 6163.
+	if e.Op == "accept" && isConnError(e.Err) {
+		return true
+	}
+
+	if ne, ok := e.Err.(*os.SyscallError); ok {
+		t, ok := ne.Err.(temporary)
+		return ok && t.Temporary()
+	}
+	t, ok := e.Err.(temporary)
+	return ok && t.Temporary()
+}
+
 type AddrError struct {
 	Err  string
 	Addr string
@@ -287,6 +331,9 @@ func (e *AddrError) Error() string {
 	}
 	return s
 }
+
+func (e *AddrError) Timeout() bool   { return false }
+func (e *AddrError) Temporary() bool { return false }
 
 // errTimeout exists to return the historical "i/o timeout" string
 // for context.DeadlineExceeded. See mapErr.
@@ -310,6 +357,12 @@ func (e *timeoutError) Temporary() bool { return true }
 func (e *timeoutError) Is(err error) bool {
 	return err == context.DeadlineExceeded
 }
+
+type UnknownNetworkError string
+
+func (e UnknownNetworkError) Error() string   { return "unknown network " + string(e) }
+func (e UnknownNetworkError) Timeout() bool   { return false }
+func (e UnknownNetworkError) Temporary() bool { return false }
 
 // DNSError represents a DNS lookup error.
 type DNSError struct {
@@ -337,8 +390,12 @@ func (e *DNSError) Error() string {
 	return s
 }
 
-type UnknownNetworkError string
+// Timeout reports whether the DNS lookup is known to have timed out.
+// This is not always known; a DNS lookup may fail due to a timeout
+// and return a [DNSError] for which Timeout returns false.
+func (e *DNSError) Timeout() bool { return e.IsTimeout }
 
-func (e UnknownNetworkError) Error() string   { return "unknown network " + string(e) }
-func (e UnknownNetworkError) Timeout() bool   { return false }
-func (e UnknownNetworkError) Temporary() bool { return false }
+// Temporary reports whether the DNS error is known to be temporary.
+// This is not always known; a DNS lookup may fail due to a temporary
+// error and return a [DNSError] for which Temporary returns false.
+func (e *DNSError) Temporary() bool { return e.IsTimeout || e.IsTemporary }
