@@ -22,6 +22,52 @@ const (
 	http2Mode = testMode("h2") // HTTP/2
 )
 
+type testNotParallelOpt struct{}
+
+type TBRun[T any] interface {
+	testing.TB
+	Run(string, func(T)) bool
+}
+
+// run runs a client/server test in a variety of test configurations.
+//
+// Tests execute in HTTP/1.1 and HTTP/2 modes by default.
+// To run in a different set of configurations, pass a []testMode option.
+//
+// Tests call t.Parallel() by default.
+// To disable parallel execution, pass the testNotParallel option.
+func run[T TBRun[T]](t T, f func(t T, mode testMode), opts ...any) {
+	t.Helper()
+	// modes := []testMode{http1Mode, http2Mode}
+	modes := []testMode{http1Mode}
+	parallel := true
+	for _, opt := range opts {
+		switch opt := opt.(type) {
+		case []testMode:
+			modes = opt
+		case testNotParallelOpt:
+			parallel = false
+		default:
+			t.Fatalf("unknown option type %T", opt)
+		}
+	}
+	if t, ok := any(t).(*testing.T); ok && parallel {
+		setParallel(t)
+	}
+	for _, mode := range modes {
+		t.Run(string(mode), func(t T) {
+			t.Helper()
+			if t, ok := any(t).(*testing.T); ok && parallel {
+				setParallel(t)
+			}
+			t.Cleanup(func() {
+				afterTest(t)
+			})
+			f(t, mode)
+		})
+	}
+}
+
 type clientServerTest struct {
 	t  testing.TB
 	h2 bool
