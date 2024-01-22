@@ -168,8 +168,19 @@ type conn struct {
 
 	curState atomic.Uint64 // packed (unixtime<<8|uint8(ConnState))
 
-	// // mu guards hijackedv
-	// mu sync.Mutex
+	// mu guards hijackedv
+	mu sync.Mutex
+
+	// hijackedv is whether this connection has been hijacked
+	// by a Handler with the Hijacker interface.
+	// It is guarded by mu.
+	hijackedv bool
+}
+
+func (c *conn) hijacked() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.hijackedv
 }
 
 // This should be >= 512 bytes for DetectContentType,
@@ -232,24 +243,24 @@ func (cw *chunkWriter) close() {
 
 // A response represents the server side of an HTTP response.
 type response struct {
-	conn        *conn
-	req         *Request // request for this response
-	reqBody     io.ReadCloser
-	cancelCtx   context.CancelFunc // when ServeHTTP exits
-	wroteHeader bool               // a non-1xx header has been (logically) written
-	// wroteContinue    bool               // 100 Continue response was written
+	conn          *conn
+	req           *Request // request for this response
+	reqBody       io.ReadCloser
+	cancelCtx     context.CancelFunc // when ServeHTTP exits
+	wroteHeader   bool               // a non-1xx header has been (logically) written
+	wroteContinue bool               // 100 Continue response was written
 	// wants10KeepAlive bool               // HTTP/1.0 w/ Connection "keep-alive"
 	// wantsClose       bool               // HTTP request has Connection "close"
 
-	// // canWriteContinue is an atomic boolean that says whether or
-	// // not a 100 Continue header can be written to the
-	// // connection.
-	// // writeContinueMu must be held while writing the header.
-	// // These two fields together synchronize the body reader (the
-	// // expectContinueReader, which wants to write 100 Continue)
-	// // against the main writer.
-	// canWriteContinue atomic.Bool
-	// writeContinueMu  sync.Mutex
+	// canWriteContinue is an atomic boolean that says whether or
+	// not a 100 Continue header can be written to the
+	// connection.
+	// writeContinueMu must be held while writing the header.
+	// These two fields together synchronize the body reader (the
+	// expectContinueReader, which wants to write 100 Continue)
+	// against the main writer.
+	canWriteContinue atomic.Bool
+	writeContinueMu  sync.Mutex
 
 	w  *bufio.Writer // buffers output in chunks to chunkWriter
 	cw chunkWriter
@@ -504,6 +515,42 @@ func (srv *Server) maxHeaderBytes() int {
 
 func (srv *Server) initialReadLimitSize() int64 {
 	return int64(srv.maxHeaderBytes()) + 4096 // bufio slop
+}
+
+// wrapper around io.ReadCloser which on first read, sends an
+// HTTP/1.1 100 Continue header
+type expectContinueReader struct {
+	resp       *response
+	readCloser io.ReadCloser
+	closed     atomic.Bool
+	sawEOF     atomic.Bool
+}
+
+func (ecr *expectContinueReader) Read(p []byte) (n int, err error) {
+	if ecr.closed.Load() {
+		return 0, ErrBodyReadAfterClose
+	}
+	w := ecr.resp
+	if !w.wroteContinue && w.canWriteContinue.Load() && !w.conn.hijacked() {
+		w.wroteContinue = true
+		w.writeContinueMu.Lock()
+		if w.canWriteContinue.Load() {
+			w.conn.bufw.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
+			w.conn.bufw.Flush()
+			w.canWriteContinue.Store(false)
+		}
+		w.writeContinueMu.Unlock()
+	}
+	n, err = ecr.readCloser.Read(p)
+	if err == io.EOF {
+		ecr.sawEOF.Store(true)
+	}
+	return
+}
+
+func (ecr *expectContinueReader) Close() error {
+	ecr.closed.Store(true)
+	return ecr.readCloser.Close()
 }
 
 // TimeFormat is the time format to use when generating times in HTTP
@@ -1010,18 +1057,18 @@ func (c *conn) serve(ctx context.Context) {
 			}
 		}
 
-		// // Expect 100 Continue support
-		// req := w.req
-		// if req.expectsContinue() {
-		// 	if req.ProtoAtLeast(1, 1) && req.ContentLength != 0 {
-		// 		// Wrap the Body reader with one that replies on the connection
-		// 		req.Body = &expectContinueReader{readCloser: req.Body, resp: w}
-		// 		w.canWriteContinue.Store(true)
-		// 	}
-		// } else if req.Header.get("Expect") != "" {
-		// 	w.sendExpectationFailed()
-		// 	return
-		// }
+		// Expect 100 Continue support
+		req := w.req
+		if req.expectsContinue() {
+			if req.ProtoAtLeast(1, 1) && req.ContentLength != 0 {
+				// Wrap the Body reader with one that replies on the connection
+				req.Body = &expectContinueReader{readCloser: req.Body, resp: w}
+				w.canWriteContinue.Store(true)
+			}
+		} else if req.Header.get("Expect") != "" {
+			w.sendExpectationFailed()
+			return
+		}
 
 		c.curReq.Store(w)
 
@@ -1077,6 +1124,24 @@ func (c *conn) serve(ctx context.Context) {
 
 		c.rwc.SetReadDeadline(time.Time{})
 	}
+}
+
+func (w *response) sendExpectationFailed() {
+	// TODO(bradfitz): let ServeHTTP handlers handle
+	// requests with non-standard expectation[s]? Seems
+	// theoretical at best, and doesn't fit into the
+	// current ServeHTTP model anyway. We'd need to
+	// make the ResponseWriter an optional
+	// "ExpectReplier" interface or something.
+	//
+	// For now we'll just obey RFC 7231 5.1.1 which says
+	// "A server that receives an Expect field-value other
+	// than 100-continue MAY respond with a 417 (Expectation
+	// Failed) status code to indicate that the unexpected
+	// expectation cannot be met."
+	w.Header().Set("Connection", "close")
+	w.WriteHeader(StatusExpectationFailed)
+	w.finishRequest()
 }
 
 // The HandlerFunc type is an adapter to allow the use of
