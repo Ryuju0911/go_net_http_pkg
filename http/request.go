@@ -807,3 +807,10 @@ func requestMethodUsuallyLacksBody(method string) bool {
 	}
 	return false
 }
+
+// requiresHTTP1 reports whether this request requires being sent on
+// an HTTP/1 connection.
+func (r *Request) requiresHTTP1() bool {
+	return hasToken(r.Header.Get("Connection"), "upgrade") &&
+		ascii.EqualFold(r.Header.Get("Upgrade"), "websocket")
+}

@@ -531,8 +531,7 @@ func (t *Transport) connectMethodForRequst(treq *transportRequest) (cm connectMe
 	// if t.Proxy != nil {
 	// 	cm.proxyURL, err = t.Proxy(treq.Request)
 	// }
-	// cm.onlyH1 = treq.requiresHTTP1()
-	cm.onlyH1 = true
+	cm.onlyH1 = treq.requiresHTTP1()
 	return cm, err
 }
 
@@ -1189,12 +1188,12 @@ func (t *Transport) decConnsPerHost(key connectMethodKey) {
 
 func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *persistConn, err error) {
 	pconn = &persistConn{
-		t:        t,
-		cacheKey: cm.key(),
-		reqch:    make(chan requestAndChan, 1),
-		writech:  make(chan writeRequest, 1),
-		closech:  make(chan struct{}),
-		// writeErrCh:    make(chan error, 1),
+		t:             t,
+		cacheKey:      cm.key(),
+		reqch:         make(chan requestAndChan, 1),
+		writech:       make(chan writeRequest, 1),
+		closech:       make(chan struct{}),
+		writeErrCh:    make(chan error, 1),
 		writeLoopDone: make(chan struct{}),
 	}
 	wrapErr := func(err error) error {
@@ -1320,6 +1319,15 @@ func (cm *connectMethod) addr() string {
 type connectMethodKey struct {
 	proxy, scheme, addr string
 	onlyH1              bool
+}
+
+func (k connectMethodKey) String() string {
+	// Only used for tests.
+	var h1 string
+	if k.onlyH1 {
+		h1 = ",h1"
+	}
+	return fmt.Sprintf("%s|%s%s|%s", k.proxy, k.scheme, h1, k.addr)
 }
 
 // persistConn wraps a connection, usually a persistent one
@@ -1598,7 +1606,68 @@ func (pc *persistConn) readLoop() {
 			continue
 		}
 
-		// TODO
+		waitForBodyRead := make(chan bool, 2)
+		body := &bodyEOFSignal{
+			body: resp.Body,
+			earlyCloseFn: func() error {
+				waitForBodyRead <- false
+				<-eofc // will be closed by deferre call at the end of the function
+				return nil
+			},
+			fn: func(err error) error {
+				isEOF := err == io.EOF
+				waitForBodyRead <- isEOF
+				if isEOF {
+					<-eofc // see comment above eofc declaration
+				} else if err != nil {
+					if cerr := pc.canceled(); cerr != nil {
+						return cerr
+					}
+				}
+				return err
+			},
+		}
+
+		resp.Body = body
+		// if rc.addedGzip && ascii.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		// 	resp.Body = &gzipReader{body: body}
+		// 	resp.Header.Del("Content-Encoding")
+		// 	resp.Header.Del("Content-Length")
+		// 	resp.ContentLength = -1
+		// 	resp.Uncompressed = true
+		// }
+
+		select {
+		case rc.ch <- responseAndError{res: resp}:
+		case <-rc.callerGone:
+			return
+		}
+
+		// Before looping back to the top of this function and peeking on
+		// the bufio.Reader, wait for the caller goroutine to finish
+		// reading the response body. (or for cancellation or death)
+		select {
+		case bodyEOF := <-waitForBodyRead:
+			replaced := pc.t.replaceReqCanceler(rc.cancelKey, nil) // before pc might return to idle pool
+			alive = alive &&
+				bodyEOF &&
+				!pc.sawEOF &&
+				pc.wroteRequest() &&
+				replaced && tryPutIdleConn()
+			if bodyEOF {
+				eofc <- struct{}{}
+			}
+		case <-rc.req.Cancel:
+			alive = false
+			pc.t.cancelRequest(rc.cancelKey, errRequestCanceled)
+		case <-rc.req.Context().Done():
+			alive = false
+			pc.t.cancelRequest(rc.cancelKey, rc.req.Context().Err())
+		case <-pc.closech:
+			alive = false
+		}
+
+		// testHookReadLoopBeforeNextRead()
 	}
 }
 
@@ -1849,6 +1918,75 @@ func canonicalAddr(url *url.URL) string {
 		port = portMap[url.Scheme]
 	}
 	return net.JoinHostPort(idnaASCIIFromURL(url), port)
+}
+
+// bodyEOFSignal is used by the HTTP/1 transport when reading response
+// bodies to make sure we see the end of a response body before
+// proceeding and reading on the connection again.
+//
+// It wraps a ReadCloser but runs fn (if non-nil) at most
+// once, right before its final (error-producing) Read or Close call
+// returns. fn should return the new error to return from Read or Close.
+//
+// If earlyCloseFn is non-nil and Close is called before io.EOF is
+// seen, earlyCloseFn is called instead of fn, and its return value is
+// the return value from Close.
+type bodyEOFSignal struct {
+	body         io.ReadCloser
+	mu           sync.Mutex        // guards following 4 fields
+	closed       bool              // whether Close has been called
+	rerr         error             // sticky Read error
+	fn           func(error) error // err will be nil on Read io.EOF
+	earlyCloseFn func() error      // optional alt Close func used if io.EOF not seen
+}
+
+var errReadOnClosedResBody = errors.New("http: read on closed response body")
+
+func (es *bodyEOFSignal) Read(p []byte) (n int, err error) {
+	es.mu.Lock()
+	closed, rerr := es.closed, es.rerr
+	es.mu.Unlock()
+	if closed {
+		return 0, errReadOnClosedResBody
+	}
+	if rerr != nil {
+		return 0, rerr
+	}
+
+	n, err = es.body.Read(p)
+	if err != nil {
+		es.mu.Lock()
+		defer es.mu.Unlock()
+		if es.rerr == nil {
+			es.rerr = err
+		}
+		err = es.condfn(err)
+	}
+	return
+}
+
+func (es *bodyEOFSignal) Close() error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	if es.closed {
+		return nil
+	}
+	es.closed = true
+	if es.earlyCloseFn != nil && es.rerr != io.EOF {
+		return es.earlyCloseFn()
+	}
+	err := es.body.Close()
+	return es.condfn(err)
+}
+
+// caller must hold es.mu.
+func (es *bodyEOFSignal) condfn(err error) error {
+	if es.fn == nil {
+		return err
+	}
+	err = es.fn(err)
+	es.fn = nil
+	return err
 }
 
 // maxWriteWaitBeforeConnReuse is how long the a Transport RoundTrip
