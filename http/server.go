@@ -26,10 +26,19 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 // Errors used by the HTTP server.
 var (
+	// ErrHijacked is returned by ResponseWriter.Write calls when
+	// the underlying connection has been hijacked using the
+	// Hijacker interface. A zero-byte write on a hijacked
+	// connection will return ErrHijacked without any other side
+	// effects.
+	ErrHijacked = errors.New("http: connection has been hijacked")
+
 	// ErrContentLength is returned by ResponseWriter.Write calls
 	// when a Handler set a Content-Length response header with a
 	// declared size and then attempted to write more bytes than
@@ -586,13 +595,35 @@ func appendTime(b []byte, t time.Time) []byte {
 var errTooLarge = errors.New("http: request too large")
 
 // Read next request from connection.
-func (c *conn) readRequst(ctx context.Context) (w *response, err error) {
+func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
+	if c.hijacked() {
+		return nil, ErrHijacked
+	}
+
+	var (
+		wholeReqDeadline time.Time // or zero if none
+		hdrDeadline      time.Time // or zero if none
+	)
+	t0 := time.Now()
+	if d := c.server.readHeaderTimeout(); d > 0 {
+		hdrDeadline = t0.Add(d)
+	}
+	if d := c.server.ReadTimeout; d > 0 {
+		wholeReqDeadline = t0.Add(d)
+	}
+	c.rwc.SetReadDeadline(hdrDeadline)
+	if d := c.server.WriteTimeout; d > 0 {
+		defer func() {
+			c.rwc.SetWriteDeadline(time.Now().Add(d))
+		}()
+	}
+
 	c.r.setReadLimit(c.server.initialReadLimitSize())
-	// if c.lastMethod == "POST" {
-	// 	// RFC 7230 section 3 tolerance for old buggy clients.
-	// 	peek, _ := c.bufr.Peek(4) // ReadRequst will get err below
-	// 	c.bufr.Discard(numLeadingCRorLF(peek))
-	// }
+	if c.lastMethod == "POST" {
+		// RFC 7230 section 3 tolerance for old buggy clients.
+		peek, _ := c.bufr.Peek(4) // ReadRequst will get err below
+		c.bufr.Discard(numLeadingCRorLF(peek))
+	}
 	req, err := readRequest(c.bufr)
 	if err != nil {
 		if c.r.hitReadLimit() {
@@ -604,6 +635,26 @@ func (c *conn) readRequst(ctx context.Context) (w *response, err error) {
 	c.lastMethod = req.Method
 	c.r.setInfiniteReadLimit()
 
+	hosts := req.Header["Host"]
+	// isH2Upgrade := req.isH2Upgrade()
+	// if req.ProtoAtLeast(1, 1) && (!haveHost || len(hosts) == 0) && !isH2Upgrade && req.Method != "CONNECT" {
+	// 	return nil, badRequestError("missing required Host header")
+	// }
+	if len(hosts) == 1 && !httpguts.ValidHostHeader(hosts[0]) {
+		return nil, badRequestError("malformed Host header")
+	}
+	for k, vv := range req.Header {
+		if !httpguts.ValidHeaderFieldName(k) {
+			return nil, badRequestError("invalid header name")
+		}
+		for _, v := range vv {
+			if !httpguts.ValidHeaderFieldValue(v) {
+				return nil, badRequestError("invalid header value")
+			}
+		}
+	}
+	delete(req.Header, "Host")
+
 	ctx, cancelCtx := context.WithCancel(ctx)
 	req.ctx = ctx
 	req.RemoteAddr = c.remoteAddr
@@ -611,6 +662,11 @@ func (c *conn) readRequst(ctx context.Context) (w *response, err error) {
 	// if body, ok := req.Body.(*body); ok {
 	// 	body.doEarlyClose = true
 	// }
+
+	// Adjust the read deadline if necessary.
+	if !hdrDeadline.Equal(wholeReqDeadline) {
+		c.rwc.SetReadDeadline(wholeReqDeadline)
+	}
 
 	w = &response{
 		conn:          c,
@@ -1002,6 +1058,20 @@ func (c *conn) getState() (state ConnState, unixSec int64) {
 	return ConnState(packedState & 0xff), int64(packedState >> 8)
 }
 
+// badRequestError is a literal string (used by in the server in HTML,
+// unescaped) to tell the user why their request was bad. It should
+// be plain text without user info or other embedded errors.
+func badRequestError(e string) error { return statusError{StatusBadRequest, e} }
+
+// statusError is an error used to respond to a request with an HTTP status.
+// The text should be plain text without user info or other embedded errors.
+type statusError struct {
+	code int
+	text string
+}
+
+func (e statusError) Error() string { return StatusText(e.code) + ": " + e.text }
+
 // Serve a new connection.
 func (c *conn) serve(ctx context.Context) {
 	if ra := c.rwc.RemoteAddr(); ra != nil {
@@ -1034,7 +1104,7 @@ func (c *conn) serve(ctx context.Context) {
 	c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
 
 	for {
-		w, err := c.readRequst(ctx)
+		w, err := c.readRequest(ctx)
 		if c.r.remain != c.server.initialReadLimitSize() {
 			// If we read any bytes off the wire, we're active.
 			c.setState(c.rwc, StateActive, runHooks)
@@ -1050,7 +1120,26 @@ func (c *conn) serve(ctx context.Context) {
 				c.closeWriteAndWait()
 				return
 
+			// case isUnsupportedTEError(err):
+			// 	// Respond as per RFC 7230 Section 3.3.1 which says,
+			// 	//      A server that receives a request message with a
+			// 	//      transfer coding it does not understand SHOULD
+			// 	//      respond with 501 (Unimplemented).
+			// 	code := StatusNotImplemented
+
+			// 	// We purposefully aren't echoing back the transfer-encoding's value,
+			// 	// so as to mitigate the risk of cross side scripting by an attacker.
+			// 	fmt.Fprintf(c.rwc, "HTTP/1.1 %d %s%sUnsupported transfer encoding", code, StatusText(code), errorHeaders)
+			// 	return
+
+			// case isCommonNetReadError(err):
+			// 	return // don't reply
+
 			default:
+				if v, ok := err.(statusError); ok {
+					fmt.Fprintf(c.rwc, "HTTP/1.1 %d %s: %s%s%d %s: %s", v.code, StatusText(v.code), v.text, errorHeaders, v.code, StatusText(v.code), v.text)
+					return
+				}
 				const publicErr = "400 Bad Request"
 				fmt.Fprintf(c.rwc, "HTTP/1.1 "+publicErr+errorHeaders+publicErr)
 				return
@@ -1692,6 +1781,31 @@ type Server struct {
 	// See net.Dial for details of the address format.
 	Addr string
 
+	// ReadTimeout is the maximum duration for reading the entire
+	// request, including the body. A zero or negative value means
+	// there will be no timeout.
+	//
+	// Because ReadTimeout does not let Handlers make per-request
+	// decisions on each request body's acceptable deadline or
+	// upload rate, most users will prefer to use
+	// ReadHeaderTimeout. It is valid to use them both.
+	ReadTimeout time.Duration
+
+	// ReadHeaderTimeout is the amount of time allowed to read
+	// request headers. The connection's read deadline is reset
+	// after reading the headers and the Handler can decide what
+	// is considered too slow for the body. If ReadHeaderTimeout
+	// is zero, the value of ReadTimeout is used. If both are
+	// zero, there is no timeout.
+	ReadHeaderTimeout time.Duration
+
+	// WriteTimeout is the maximum duration before timing out
+	// writes of the response. It is reset whenever a new
+	// request's header is read. Like ReadTimeout, it does not
+	// let Handlers make decisions on a per-request basis.
+	// A zero or negative value means there will be no timeout.
+	WriteTimeout time.Duration
+
 	// MaxHeaderBytes controls the maximum number of bytes the
 	// server will read parsing the request header's keys and
 	// values, including the request line. It does not limit the
@@ -2052,6 +2166,13 @@ func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
 	handler.ServeHTTP(rw, req)
 }
 
+func (s *Server) readHeaderTimeout() time.Duration {
+	if s.ReadHeaderTimeout != 0 {
+		return s.ReadHeaderTimeout
+	}
+	return s.ReadTimeout
+}
+
 func (srv *Server) SetKeepAlivesEnabled(v bool) {
 	if v {
 		srv.disableKeepAlives.Store(false)
@@ -2112,6 +2233,17 @@ func (w checkConnErrorWriter) Write(p []byte) (n int, err error) {
 	if err != nil && w.c.werr == nil {
 		w.c.werr = err
 		w.c.cancelCtx()
+	}
+	return
+}
+
+func numLeadingCRorLF(v []byte) (n int) {
+	for _, b := range v {
+		if b == '\r' || b == '\n' {
+			n++
+			continue
+		}
+		break
 	}
 	return
 }
