@@ -702,8 +702,75 @@ func (w *response) Header() Header {
 	return w.handlerHeader
 }
 
+func checkWriteHeaderCode(code int) {
+	// Issue 22880: require valid WriteHeader status codes.
+	// For now we only enforce that it's three digits.
+	// In the future we might block things over 599 (600 and above aren't defined
+	// at https://httpwg.org/specs/rfc7231.html#status.codes).
+	// But for now any three digits.
+	//
+	// We used to send "HTTP/1.1 000 0" on the wire in responses but there's
+	// no equivalent bogus thing we can realistically send in HTTP/2,
+	// so we'll consistently panic instead and help people find their bugs
+	// early. (We can't return an error from WriteHeader even if we wanted to.)
+	if code < 100 || code > 999 {
+		panic(fmt.Sprintf("invalid WriteHeader code %v", code))
+	}
+}
+
+// relevantCaller searches the call stack for the first function outside of net/http.
+// The purpose of this function is to provide more helpful error messages.
+func relevantCaller() runtime.Frame {
+	pc := make([]uintptr, 16)
+	n := runtime.Callers(1, pc)
+	frames := runtime.CallersFrames(pc[:n])
+	var frame runtime.Frame
+	for {
+		frame, more := frames.Next()
+		if !strings.HasPrefix(frame.Function, "net/http") {
+			return frame
+		}
+		if !more {
+			break
+		}
+	}
+	return frame
+}
+
 func (w *response) WriteHeader(code int) {
-	// TODO: Handle the case when 100 <= code <= 199.
+	if w.conn.hijacked() {
+		caller := relevantCaller()
+		w.conn.server.logf("http: response.WriteHeader on hijacked connection from %s (%s:%d)", caller.Function, path.Base(caller.File), caller.Line)
+		return
+	}
+	if w.wroteHeader {
+		caller := relevantCaller()
+		w.conn.server.logf("http: superfluous response.WriteHeader call from %s (%s:%d)", caller.Function, path.Base(caller.File), caller.Line)
+		return
+	}
+	checkWriteHeaderCode(code)
+
+	// Handle informational headers.
+	//
+	// We shouldn't send any further headers after 101 Switching Protocols,
+	// so it takes the non-informational path.
+	if code >= 100 && code <= 199 && code != StatusSwitchingProtocols {
+		// Prevent a potential race with an automatically-sent 100 Continue triggered by Request.Body.Read()
+		if code == 100 && w.canWriteContinue.Load() {
+			w.writeContinueMu.Lock()
+			w.canWriteContinue.Store(false)
+			w.writeContinueMu.Unlock()
+		}
+
+		writeStatusLine(w.conn.bufw, w.req.ProtoAtLeast(1, 1), code, w.statusBuf[:])
+
+		// Per RFC 8297 we must not clear the current header map
+		w.handlerHeader.WriteSubset(w.conn.bufw, excludedHeadersNoBody)
+		w.conn.bufw.Write(crlf)
+		w.conn.bufw.Flush()
+
+		return
+	}
 
 	w.wroteHeader = true
 	w.status = code
@@ -1110,7 +1177,6 @@ func (c *conn) serve(ctx context.Context) {
 			c.setState(c.rwc, StateActive, runHooks)
 		}
 		if err != nil {
-			// TODO: Implement error handling based on error type.
 			const errorHeaders = "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
 
 			switch {
