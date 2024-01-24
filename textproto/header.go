@@ -8,6 +8,13 @@ package textproto
 // keys to sets of values.
 type MIMEHeader map[string][]string
 
+// Add adds the key, value pair to the header.
+// It appends to any existing values associated with key.
+func (h MIMEHeader) Add(key, value string) {
+	key = CanonicalMIMEHeaderKey(key)
+	h[key] = append(h[key], value)
+}
+
 // Set sets the header entries associated with key to
 // the single element value. It replaces any existing
 // values associated with key.

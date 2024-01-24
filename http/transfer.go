@@ -649,7 +649,30 @@ func fixLength(isResponse bool, status int, requestMethod string, header Header,
 	isRequest := !isResponse
 	contentLens := header["Content-Length"]
 
-	// TODO: Check if contentLens > 1
+	// Hardening against HTTP request smuggling
+	if len(contentLens) > 1 {
+		// Per RFC 7230 Section 3.3.2, prevent multiple
+		// Content-Length headers if they differ in value.
+		// If there are dups of the value, remove the dups.
+		// See Issue 16490.
+		first := textproto.TrimString(contentLens[0])
+		for _, ct := range contentLens[1:] {
+			if first != textproto.TrimString(ct) {
+				return 0, fmt.Errorf("http: message cannot contain multiple Content-Length headers; got %q", contentLens)
+			}
+		}
+
+		// deduplicate Content-Length
+		header.Del("Content-Length")
+		header.Add("Content-Length", first)
+
+		contentLens = header["Content-Length"]
+	}
+
+	// Logic based on response type or status
+	if isResponse && noResponseBodyExpected(requestMethod) {
+		return 0, nil
+	}
 
 	if status/100 == 1 {
 		return 0, nil
@@ -657,6 +680,11 @@ func fixLength(isResponse bool, status int, requestMethod string, header Header,
 	switch status {
 	case 204, 304:
 		return 0, nil
+	}
+
+	// Logic based on Transfer-Encoding
+	if chunked {
+		return -1, nil
 	}
 
 	if len(contentLens) > 0 {
@@ -749,17 +777,17 @@ func fixTrailer(header Header, chunked bool) (Header, error) {
 }
 
 type body struct {
-	src     io.Reader
-	hdr     any           // non-nil (Response or Request) value means read trailer
-	r       *bufio.Reader // underlying wire-format reader for the trailer
-	closing bool          // is the connection to be closed after reading body?
-	// doEarlyClose bool          // whether Close should stop early
+	src          io.Reader
+	hdr          any           // non-nil (Response or Request) value means read trailer
+	r            *bufio.Reader // underlying wire-format reader for the trailer
+	closing      bool          // is the connection to be closed after reading body?
+	doEarlyClose bool          // whether Close should stop early
 
-	mu     sync.Mutex // guards following, and calls to Read and Close
-	sawEOF bool
-	closed bool
-	// earlyClose bool   // Close called and we didn't read to the end of src
-	onHitEOF func() // if non-nil, func to call when EOF is Read
+	mu         sync.Mutex // guards following, and calls to Read and Close
+	sawEOF     bool
+	closed     bool
+	earlyClose bool   // Close called and we didn't read to the end of src
+	onHitEOF   func() // if non-nil, func to call when EOF is Read
 }
 
 // ErrBodyReadAfterClose is returned when reading a Request or Response
@@ -785,11 +813,32 @@ func (b *body) readLocked(p []byte) (n int, err error) {
 
 	if err == io.EOF {
 		b.sawEOF = true
-		if lr, ok := b.src.(*io.LimitedReader); ok && lr.N > 0 {
-			err = io.ErrUnexpectedEOF
+		// Chunked case. Read the trailer.
+		if b.hdr != nil {
+			if e := b.readTrailer(); e != nil {
+				err = e
+				// Something went wrong in the trailer, we must not allow any
+				// further reads of any kind to succeed from body, nor any
+				// subsequent requests on the server connection. See
+				// golang.org/issue/12027
+				b.sawEOF = false
+				b.closed = true
+			}
+			b.hdr = nil
+		} else {
+			// If the server declared the Content-Length, our body is a LimitedReader
+			// and we need to check whether this EOF arrived early.
+			if lr, ok := b.src.(*io.LimitedReader); ok && lr.N > 0 {
+				err = io.ErrUnexpectedEOF
+			}
 		}
 	}
 
+	// If we can return an EOF here along with the read data, do
+	// so. This is optional per the io.Reader contract, but doing
+	// so helps the HTTP transport code recycle its connection
+	// earlier (since it will see this EOF itself), even if the
+	// client doesn't do future reads or Close.
 	if err == nil && n > 0 {
 		if lr, ok := b.src.(*io.LimitedReader); ok && lr.N == 0 {
 			err = io.EOF
@@ -804,9 +853,132 @@ func (b *body) readLocked(p []byte) (n int, err error) {
 	return n, err
 }
 
-func (b *body) Close() error {
-	// TODO: Implement logic.
+var (
+	singleCRLF = []byte("\r\n")
+	doubleCRLF = []byte("\r\n\r\n")
+)
+
+func seeUpcomingDoubleCRLF(r *bufio.Reader) bool {
+	for peekSize := 4; ; peekSize++ {
+		// This loop stops when Peek returns an error,
+		// which it does when r's buffer has been filled.
+		buf, err := r.Peek(peekSize)
+		if bytes.HasSuffix(buf, doubleCRLF) {
+			return true
+		}
+		if err != nil {
+			break
+		}
+	}
+	return false
+}
+
+var errTrailerEOF = errors.New("http: unexpected EOF reading trailer")
+
+func (b *body) readTrailer() error {
+	// The common case, since nobody uses trailers.
+	buf, err := b.r.Peek(2)
+	if bytes.Equal(buf, singleCRLF) {
+		b.r.Discard(2)
+		return nil
+	}
+	if len(buf) < 2 {
+		return errTrailerEOF
+	}
+	if err != nil {
+		return err
+	}
+
+	// Make sure there's a header terminator coming up, to prevent
+	// a DoS with an unbounded size Trailer. It's not easy to
+	// slip in a LimitReader here, as textproto.NewReader requires
+	// a concrete *bufio.Reader. Also, we can't get all the way
+	// back up to our conn's LimitedReader that *might* be backing
+	// this bufio.Reader. Instead, a hack: we iteratively Peek up
+	// to the bufio.Reader's max size, looking for a double CRLF.
+	// This limits the trailer to the underlying buffer size, typically 4kB.
+	if !seeUpcomingDoubleCRLF(b.r) {
+		return errors.New("http: suspiciously long trailer after chunked body")
+	}
+
+	hdr, err := textproto.NewReader(b.r).ReadMIMEHeader()
+	if err != nil {
+		if err == io.EOF {
+			return errTrailerEOF
+		}
+		return err
+	}
+	switch rr := b.hdr.(type) {
+	case *Request:
+		mergeSetHeader(&rr.Trailer, Header(hdr))
+	case *Response:
+		mergeSetHeader(&rr.Trailer, Header(hdr))
+	}
 	return nil
+}
+
+func mergeSetHeader(dst *Header, src Header) {
+	if *dst == nil {
+		*dst = src
+		return
+	}
+	for k, vv := range src {
+		(*dst)[k] = vv
+	}
+}
+
+func (b *body) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil
+	}
+	var err error
+	switch {
+	case b.sawEOF:
+		// Already saw EOF, so no need going to look for it.
+	case b.hdr == nil && b.closing:
+		// no trailer and closing the connection next.
+		// no point in reading to EOF.
+	case b.doEarlyClose:
+		// Read up to maxPostHandlerReadBytes bytes of the body, looking
+		// for EOF (and trailers), so we can re-use this connection.
+		if lr, ok := b.src.(*io.LimitedReader); ok && lr.N > maxPostHandlerReadBytes {
+			// There was a declared Content-Length, and we have more bytes remaining
+			// than our maxPostHandlerReadBytes tolerance. So, give up.
+			b.earlyClose = true
+		} else {
+			var n int64
+			// Consume the body, or, which will also lead to us reading
+			// the trailer headers after the body, if present.
+			n, err = io.CopyN(io.Discard, bodyLocked{b}, maxPostHandlerReadBytes)
+			if err == io.EOF {
+				err = nil
+			}
+			if n == maxPostHandlerReadBytes {
+				b.earlyClose = true
+			}
+		}
+	default:
+		// Fully consume the body, which will also lead to us reading
+		// the trailer headers after the body, if present.
+		_, err = io.Copy(io.Discard, bodyLocked{b})
+	}
+	b.closed = true
+	return err
+}
+
+// bodyLocked is an io.Reader reading from a *body when its mutex is
+// already held.
+type bodyLocked struct {
+	b *body
+}
+
+func (bl bodyLocked) Read(p []byte) (n int, err error) {
+	if bl.b.closed {
+		return 0, ErrBodyReadAfterClose
+	}
+	return bl.b.readLocked(p)
 }
 
 // parseContentLength checks that the header is valid and then trims
