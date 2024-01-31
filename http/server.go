@@ -220,7 +220,7 @@ type chunkWriter struct {
 	// logically written.
 	wroteHeader bool
 
-	// set by the writeHeader method:
+	// // set by the writeHeader method:
 	// chunking bool // using chunked transfer encoding for reply body
 }
 
@@ -248,6 +248,17 @@ func (cw *chunkWriter) close() {
 	if !cw.wroteHeader {
 		cw.writeHeader(nil)
 	}
+	// if cw.chunking {
+	// 	bw := cw.res.conn.bufw // conn's bufio writer
+	// 	// zero chunk to mark EOF
+	// 	bw.WriteString("0\r\n")
+	// 	if trailers := cw.res.finalTrailers(); trailers != nil {
+	// 		trailers.Write(bw) // the writer handles noting errors
+	// 	}
+	// 	// final blank line after the trailers (whether
+	// 	// present or not)
+	// 	bw.WriteString("\r\n")
+	// }
 }
 
 // A response represents the server side of an HTTP response.
@@ -295,14 +306,14 @@ type response struct {
 	// // request body before starting to write a response.
 	// fullDuplex bool
 
-	// // requestBodyLimitHit is set by requestTooLarge when
-	// // maxBytesReader hits its max size. It is checked in
-	// // WriteHeader, to make sure we don't consume the
-	// // remaining request body to try to advance to the next HTTP
-	// // request. Instead, when this is set, we stop reading
-	// // subsequent requests on this connection and stop reading
-	// // input from it.
-	// requestBodyLimitHit bool
+	// requestBodyLimitHit is set by requestTooLarge when
+	// maxBytesReader hits its max size. It is checked in
+	// WriteHeader, to make sure we don't consume the
+	// remaining request body to try to advance to the next HTTP
+	// request. Instead, when this is set, we stop reading
+	// subsequent requests on this connection and stop reading
+	// input from it.
+	requestBodyLimitHit bool
 
 	// // trailers are the headers to be sent after the handler
 	// // finishes writing the body. This field is initialized from
@@ -849,7 +860,7 @@ func (w *response) WriteHeader(code int) {
 		if err == nil && v >= 0 {
 			w.contentLength = v
 		} else {
-			// w.conn.server.logf("http: invalid Content-Length of %q", cl)
+			w.conn.server.logf("http: invalid Content-Length of %q", cl)
 			w.handlerHeader.Del("Content-Length")
 		}
 	}
@@ -1111,6 +1122,61 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		setHeader.date = appendTime(cw.res.dateBuf[:0], time.Now())
 	}
 
+	// if w.req.Method == "HEAD" || !bodyAllowedForStatus(code) || code == StatusNoContent {
+	// 	// Response has no body.
+	// 	delHeader("Transfer-Encoding")
+	// } else if hasCL {
+	// 	// Content-Length has been provided, so no chunking is to be done.
+	// 	delHeader("Transfer-Encoding")
+	// } else if w.req.ProtoAtLeast(1, 1) {
+	// 	// HTTP/1.1 or greater: Transfer-Encoding has been set to identity, and no
+	// 	// content-length has been provided. The connection must be closed after the
+	// 	// reply is written, and no chunking is to be done. This is the setup
+	// 	// recommended in the Server-Sent Events candidate recommendation 11,
+	// 	// section 8.
+	// 	if hasTE && te == "identity" {
+	// 		cw.chunking = false
+	// 		w.closeAfterReply = true
+	// 		delHeader("Transfer-Encoding")
+	// 	} else {
+	// 		// HTTP/1.1 or greater: use chunked transfer encoding
+	// 		// to avoid closing the connection at EOF.
+	// 		cw.chunking = true
+	// 		setHeader.transferEncoding = "chunked"
+	// 		if hasTE && te == "chunked" {
+	// 			// We will send the chunked Transfer-Encoding header later.
+	// 			delHeader("Transfer-Encoding")
+	// 		}
+	// 	}
+	// } else {
+	// 	// HTTP version < 1.1: cannot do chunked transfer
+	// 	// encoding and we don't know the Content-Length so
+	// 	// signal EOF by closing connection.
+	// 	w.closeAfterReply = true
+	// 	delHeader("Transfer-Encoding") // in case already set
+	// }
+
+	// // Cannot use Content-Length with non-identity Transfer-Encoding.
+	// if cw.chunking {
+	// 	delHeader("Content-Length")
+	// }
+	if !w.req.ProtoAtLeast(1, 0) {
+		return
+	}
+
+	// Only override the Connection header if it is not a successful
+	// protocol switch response and if KeepAlives are not enabled.
+	// See https://golang.org/issue/36381.
+	delConnectionHeader := w.closeAfterReply &&
+		(!keepAlivesEnabled || !hasToken(cw.header.get("Connection"), "close")) &&
+		!isProtocolSwitchResponse(w.status, header)
+	if delConnectionHeader {
+		delHeader("Connection")
+		if w.req.ProtoAtLeast(1, 1) {
+			setHeader.connection = "close"
+		}
+	}
+
 	writeStatusLine(w.conn.bufw, w.req.ProtoAtLeast(1, 1), code, w.statusBuf[:])
 	cw.header.WriteSubset(w.conn.bufw, excludeHeader)
 	setHeader.Write(w.conn.bufw)
@@ -1156,6 +1222,49 @@ func writeStatusLine(bw *bufio.Writer, is11 bool, code int, scratch []byte) {
 	}
 }
 
+// bodyAllowed reports whether a Write is allowed for this response type.
+// It's illegal to call this before the header has been flushed.
+func (w *response) bodyAllowed() bool {
+	if !w.wroteHeader {
+		panic("")
+	}
+	return bodyAllowedForStatus(w.status)
+}
+
+// The Life Of A Write is like this:
+//
+// Handler starts. No header has been sent. The handler can either
+// write a header, or just start writing. Writing before sending a header
+// sends an implicitly empty 200 OK header.
+//
+// If the handler didn't declare a Content-Length up front, we either
+// go into chunking mode or, if the handler finishes running before
+// the chunking buffer size, we compute a Content-Length and send that
+// in the header instead.
+//
+// Likewise, if the handler didn't set a Content-Type, we sniff that
+// from the initial chunk of output.
+//
+// The Writers are wired together like:
+//
+//  1. *response (the ResponseWriter) ->
+//  2. (*response).w, a [*bufio.Writer] of bufferBeforeChunkingSize bytes ->
+//  3. chunkWriter.Writer (whose writeHeader finalizes Content-Length/Type)
+//     and which writes the chunk headers, if needed ->
+//  4. conn.bufw, a *bufio.Writer of default (4kB) bytes, writing to ->
+//  5. checkConnErrorWriter{c}, which notes any non-nil error on Write
+//     and populates c.werr with it if so, but otherwise writes to ->
+//  6. the rwc, the [net.Conn].
+//
+// TODO(bradfitz): short-circuit some of the buffering when the
+// initial header contains both a Content-Type and Content-Length.
+// Also short-circuit in (1) when the header's been sent and not in
+// chunking mode, writing directly to (4) instead, if (2) has no
+// buffered data. More generally, we could short-circuit from (1) to
+// (3) even in chunking mode if the write size from (1) is over some
+// threshold and nothing is in (2).  The answer might be mostly making
+// bufferBeforeChunkingSize smaller and having bufio's fast-paths deal
+// with this instead.
 func (w *response) Write(data []byte) (n int, err error) {
 	return w.write(len(data), data, "")
 }
@@ -1200,6 +1309,39 @@ func (w *response) finishRequest() {
 	// Close the body (regardless of w.closeAfterReply) so we can
 	// re-use its bufio.Reader later safely.
 	w.reqBody.Close()
+}
+
+// shouldReuseConnection reports whether the underlying TCP connection can be reused.
+// It must only be called after the handler is done executing.
+func (w *response) shouldReuseConnection() bool {
+	if w.closeAfterReply {
+		// The request or something set while executing the
+		// handler indicated we shouldn't reuse this
+		// connection.
+		return false
+	}
+
+	if w.req.Method != "HEAD" && w.contentLength != -1 && w.bodyAllowed() && w.contentLength != w.written {
+		// Did not write enough. Avoid getting out of sync.
+		return false
+	}
+
+	// There was some error writing to the underlying connection
+	// during the request, so don't re-use this conn.
+	if w.conn.werr != nil {
+		return false
+	}
+
+	if w.closedRequestBodyEarly() {
+		return false
+	}
+
+	return true
+}
+
+func (w *response) closedRequestBodyEarly() bool {
+	body, ok := w.req.Body.(*body)
+	return ok && body.didEarlyClose()
 }
 
 func (c *conn) finalFlush() {
@@ -1415,6 +1557,10 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 
+		if req.Close {
+			log.Println("w.req.Close is true: conn.serve")
+		}
+
 		c.curReq.Store(w)
 
 		if requestBodyRemains(req.Body) {
@@ -1436,12 +1582,12 @@ func (c *conn) serve(ctx context.Context) {
 		w.cancelCtx()
 		w.finishRequest()
 		c.rwc.SetWriteDeadline(time.Time{})
-		// if !w.shouldReuseConnection() {
-		// 	if w.requestBodyLimitHit || w.closedRequestBodyEarly() {
-		// 		c.closeWriteAndWait()
-		// 	}
-		// 	return
-		// }
+		if !w.shouldReuseConnection() {
+			if w.requestBodyLimitHit || w.closedRequestBodyEarly() {
+				c.closeWriteAndWait()
+			}
+			return
+		}
 		c.setState(c.rwc, StateIdle, runHooks)
 		c.curReq.Store(nil)
 

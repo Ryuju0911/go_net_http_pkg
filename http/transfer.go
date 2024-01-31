@@ -968,6 +968,12 @@ func (b *body) Close() error {
 	return err
 }
 
+func (b *body) didEarlyClose() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.earlyClose
+}
+
 // bodyRemains reports whether future Read calls might
 // yield data.
 func (b *body) bodyRemains() bool {

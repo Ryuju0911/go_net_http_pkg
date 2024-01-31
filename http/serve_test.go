@@ -18,6 +18,107 @@ import (
 	"testing"
 )
 
+func testTCPConnectionCloses(t *testing.T, req string, h Handler) {
+	setParallel(t)
+	s := newClientServerTest(t, http1Mode, h).ts
+
+	conn, err := net.Dial("tcp", s.Listener.Addr().String())
+	if err != nil {
+		t.Fatal("dial error:", err)
+	}
+	defer conn.Close()
+
+	_, err = fmt.Fprint(conn, req)
+	if err != nil {
+		t.Fatal("print error:", err)
+	}
+
+	r := bufio.NewReader(conn)
+	res, err := ReadResponse(r, &Request{Method: "GET"})
+	if err != nil {
+		t.Fatal("ReadResponse error:", err)
+	}
+
+	_, err = io.ReadAll(r)
+	if err != nil {
+		t.Fatal("read error:", err)
+	}
+
+	if !res.Close {
+		t.Errorf("Response.Close = false; want true")
+	}
+}
+
+func testTCPConnectionStaysOpen(t *testing.T, req string, handler Handler) {
+	setParallel(t)
+	ts := newClientServerTest(t, http1Mode, handler).ts
+	conn, err := net.Dial("tcp", ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+	for i := 0; i < 2; i++ {
+		if _, err := io.WriteString(conn, req); err != nil {
+			t.Fatal(err)
+		}
+		res, err := ReadResponse(br, nil)
+		if err != nil {
+			t.Fatalf("res %d: %v", i+1, err)
+		}
+		if _, err := io.Copy(io.Discard, res.Body); err != nil {
+			t.Fatalf("res %d body copy: %v", i+1, err)
+		}
+		res.Body.Close()
+	}
+}
+
+// // TestServeHTTP10Close verifies that HTTP/1.0 requests won't be kept alive.
+// func TestServeHTTP10Close(t *testing.T) {
+// 	testTCPConnectionCloses(t, "GET / HTTP/1.0\r\n\r\n", HandlerFunc(func(w ResponseWriter, r *Request) {
+// 		ServeFile(w, r, "testdata/file")
+// 	}))
+// }
+
+// TestClientCanClose verifies that clients can also force a connection to close.
+func TestClientCanClose(t *testing.T) {
+	testTCPConnectionCloses(t, "GET / HTTP/1.1\r\nHost: foo\r\nConnection: close\r\n\r\n", HandlerFunc(func(w ResponseWriter, r *Request) {
+		// Nothing.
+	}))
+}
+
+// TestHandlersCanSetConnectionClose verifies that handlers can force a connection to close,
+// even for HTTP/1.1 requests.
+func TestHandlersCanSetConnectionClose11(t *testing.T) {
+	testTCPConnectionCloses(t, "GET / HTTP/1.1\r\nHost: foo\r\n\r\n\r\n", HandlerFunc(func(w ResponseWriter, r *Request) {
+		w.Header().Set("Connection", "close")
+	}))
+}
+
+func TestHandlersCanSetConnectionClose10(t *testing.T) {
+	testTCPConnectionCloses(t, "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", HandlerFunc(func(w ResponseWriter, r *Request) {
+		w.Header().Set("Connection", "close")
+	}))
+}
+
+func send204(w ResponseWriter, r *Request) { w.WriteHeader(204) }
+func send304(w ResponseWriter, r *Request) { w.WriteHeader(304) }
+
+// Issue 15647: 204 responses can't have bodies, so HTTP/1.0 keep-alive conns should stay open.
+func TestHTTP10KeepAlive204Response(t *testing.T) {
+	testTCPConnectionStaysOpen(t, "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", HandlerFunc(send204))
+}
+
+func TestHTTP11KeepAlive204Response(t *testing.T) {
+	testTCPConnectionStaysOpen(t, "GET / HTTP/1.1\r\nHost: foo\r\n\r\n", HandlerFunc(send204))
+}
+
+func TestHTTP10KeepAlive304Response(t *testing.T) {
+	testTCPConnectionStaysOpen(t,
+		"GET / HTTP/1.0\r\nConnection: keep-alive\r\nIf-Modified-Since: Mon, 02 Jan 2006 15:04:05 GMT\r\n\r\n",
+		HandlerFunc(send304))
+}
+
 type serverExpectTest struct {
 	contentLength    int // of request body
 	chunked          bool
