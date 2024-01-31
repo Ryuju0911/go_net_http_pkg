@@ -365,6 +365,60 @@ func (cr *connReader) lock() {
 
 func (cr *connReader) unlock() { cr.mu.Unlock() }
 
+func (cr *connReader) startBackgroundRead() {
+	cr.lock()
+	defer cr.unlock()
+	if cr.inRead {
+		panic("invalid concurrent Body.Read call")
+	}
+	if cr.hasByte {
+		return
+	}
+	cr.inRead = true
+	cr.conn.rwc.SetReadDeadline(time.Time{})
+	go cr.backgroundRead()
+}
+
+func (cr *connReader) backgroundRead() {
+	n, err := cr.conn.rwc.Read(cr.byteBuf[:])
+	cr.lock()
+	if n == 1 {
+		cr.hasByte = true
+		// We were past the end of the previous request's body already
+		// (since we wouldn't be in a background read otherwise), so
+		// this is a pipelined HTTP request. Prior to Go 1.11 we used to
+		// send on the CloseNotify channel and cancel the context here,
+		// but the behavior was documented as only "may", and we only
+		// did that because that's how CloseNotify accidentally behaved
+		// in very early Go releases prior to context support. Once we
+		// added context support, people used a Handler's
+		// Request.Context() and passed it along. Having that context
+		// cancel on pipelined HTTP requests caused problems.
+		// Fortunately, almost nothing uses HTTP/1.x pipelining.
+		// Unfortunately, apt-get does, or sometimes does.
+		// New Go 1.11 behavior: don't fire CloseNotify or cancel
+		// contexts on pipelined requests. Shouldn't affect people, but
+		// fixes cases like Issue 23921. This does mean that a client
+		// closing their TCP connection after sending a pipelined
+		// request won't cancel the context, but we'll catch that on any
+		// write failure (in checkConnErrorWriter.Write).
+		// If the server never writes, yes, there are still contrived
+		// server & client behaviors where this fails to ever cancel the
+		// context, but that's kinda why HTTP/1.x pipelining died
+		// anyway.
+	}
+	if ne, ok := err.(net.Error); ok && cr.aborted && ne.Timeout() {
+		// Ignore this error. It's the expected error from
+		// another goroutine calling abortPendingRead.
+	} else if err != nil {
+		cr.handleReadError(err)
+	}
+	cr.aborted = false
+	cr.inRead = false
+	cr.unlock()
+	cr.cond.Broadcast()
+}
+
 func (cr *connReader) abortPendingRead() {
 	cr.lock()
 	defer cr.unlock()
@@ -659,9 +713,9 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	req.ctx = ctx
 	req.RemoteAddr = c.remoteAddr
 	// req.TLS = c.tlsState
-	// if body, ok := req.Body.(*body); ok {
-	// 	body.doEarlyClose = true
-	// }
+	if body, ok := req.Body.(*body); ok {
+		body.doEarlyClose = true
+	}
 
 	// Adjust the read deadline if necessary.
 	if !hdrDeadline.Equal(wholeReqDeadline) {
@@ -701,6 +755,17 @@ func (w *response) Header() Header {
 	w.calledHeader = true
 	return w.handlerHeader
 }
+
+// maxPostHandlerReadBytes is the max number of Request.Body bytes not
+// consumed by a handler that the server will read from the client
+// in order to keep a connection alive. If there are more bytes than
+// this then the server to be paranoid instead sends a "Connection:
+// close" response.
+//
+// This number is approximately what a typical machine's TCP buffer
+// size is anyway.  (if we have the bytes on the machine, we might as
+// well read them)
+const maxPostHandlerReadBytes = 256 << 10
 
 func checkWriteHeaderCode(code int) {
 	// Issue 22880: require valid WriteHeader status codes.
@@ -883,7 +948,21 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	}
 	var setHeader extraHeader
 
+	// Don't write out the fake "Trailer:foo" keys. See TrailerPrefix.
 	trailers := false
+	// for k := range cw.header {
+	// 	if strings.HasPrefix(k, TrailerPrefix) {
+	// 		if excludeHeader == nil {
+	// 			excludeHeader = make(map[string]bool)
+	// 		}
+	// 		excludeHeader[k] = true
+	// 		trailers = true
+	// 	}
+	// }
+	// for _, v := range cw.header["Trailer"] {
+	// 	trailers = true
+	// 	foreachHeaderElement(v, cw.res.declareTrailer)
+	// }
 
 	te := header.get("Transfer-Encoding")
 	hasTE := te != ""
@@ -906,6 +985,109 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		w.contentLength = int64(len(p))
 		setHeader.contentLength = strconv.AppendInt(cw.res.clenBuf[:0], int64(len(p)), 10)
 	}
+
+	// // If this was an HTTP/1.0 request with keep-alive and we sent a
+	// // Content-Length back, we can make this a keep-alive response ...
+	// if w.wants10KeepAlive && keepAlivesEnabled {
+	// 	sentLength := header.get("Content-Length") != ""
+	// 	if sentLength && header.get("Connection") == "keep-alive" {
+	// 		w.closeAfterReply = false
+	// 	}
+	// }
+
+	// Check for an explicit (and valid) Content-Length header.
+	// hasCL := w.contentLength != -1
+
+	// if w.wants10KeepAlive && (isHEAD || hasCL || !bodyAllowedForStatus(w.status)) {
+	// 	_, connectionHeaderSet := header["Connection"]
+	// 	if !connectionHeaderSet {
+	// 		setHeader.connection = "keep-alive"
+	// 	}
+	// } else if !w.req.ProtoAtLeast(1, 1) || w.wantsClose {
+	// 	w.closeAfterReply = true
+	// }
+
+	// if header.get("Connection") == "close" || !keepAlivesEnabled {
+	// 	w.closeAfterReply = true
+	// }
+
+	// If the client wanted a 100-continue but we never sent it to
+	// them (or, more strictly: we never finished reading their
+	// request body), don't reuse this connection because it's now
+	// in an unknown state: we might be sending this response at
+	// the same time the client is now sending its request body
+	// after a timeout.  (Some HTTP clients send Expect:
+	// 100-continue but knowing that some servers don't support
+	// it, the clients set a timer and send the body later anyway)
+	// If we haven't seen EOF, we can't skip over the unread body
+	// because we don't know if the next bytes on the wire will be
+	// the body-following-the-timer or the subsequent request.
+	// See Issue 11549.
+	// if ecr, ok := w.req.Body.(*expectContinueReader); ok && !ecr.sawEOF.Load() {
+	// 	w.closeAfterReply = true
+	// }
+
+	// We do this by default because there are a number of clients that
+	// send a full request before starting to read the response, and they
+	// can deadlock if we start writing the response with unconsumed body
+	// remaining. See Issue 15527 for some history.
+	//
+	// If full duplex mode has been enabled with ResponseController.EnableFullDuplex,
+	// then leave the request body alone.
+	// if w.req.ContentLength != 0 && !w.closeAfterReply && !w.fullDuplex {
+	// 	var discard, tooBig bool
+
+	// 	switch bdy := w.req.Body.(type) {
+	// 	case *expectContinueReader:
+	// 		if bdy.resp.wroteContinue {
+	// 			discard = true
+	// 		}
+	// 	case *body:
+	// 		bdy.mu.Lock()
+	// 		switch {
+	// 		case bdy.closed:
+	// 			if !bdy.sawEOF {
+	// 				// Body was closed in handler with non-EOF error.
+	// 				w.closeAfterReply = true
+	// 			}
+	// 		case bdy.unreadDataSizeLocked() >= maxPostHandlerReadBytes:
+	// 			tooBig = true
+	// 		default:
+	// 			discard = true
+	// 		}
+	// 		bdy.mu.Unlock()
+	// 	default:
+	// 		discard = true
+	// 	}
+
+	// 	if discard {
+	// 		_, err := io.CopyN(io.Discard, w.reqBody, maxPostHandlerReadBytes+1)
+	// 		switch err {
+	// 		case nil:
+	// 			// There must be even more data left over.
+	// 			tooBig = true
+	// 		case ErrBodyReadAfterClose:
+	// 			// Body was already consumed and closed.
+	// 		case io.EOF:
+	// 			// The remaining body was just consumed, close it.
+	// 			err = w.reqBody.Close()
+	// 			if err != nil {
+	// 				w.closeAfterReply = true
+	// 			}
+	// 		default:
+	// 			// Some other kind of error occurred, like a read timeout, or
+	// 			// corrupt chunked encoding. In any case, whatever remains
+	// 			// on the wire must not be parsed as another HTTP request.
+	// 			w.closeAfterReply = true
+	// 		}
+	// 	}
+
+	// 	if tooBig {
+	// 		w.requestTooLarge()
+	// 		delHeader("Connection")
+	// 		setHeader.connection = "close"
+	// 	}
+	// }
 
 	code := w.status
 	if bodyAllowedForStatus(code) {
@@ -1147,18 +1329,26 @@ func (c *conn) serve(ctx context.Context) {
 	ctx = context.WithValue(ctx, LocalAddrContextKey, c.rwc.LocalAddr())
 	var inFlightResponse *response
 	defer func() {
-		// TODO: Catch panic
+		// if err := recover(); err != nil && err != ErrAbortHandler {
+		// 	const size = 64 << 10
+		// 	buf := make([]byte, size)
+		// 	buf = buf[:runtime.Stack(buf, false)]
+		// 	c.server.logf("http: panic serving %v: %v\n%s", c.remoteAddr, err, buf)
+		// }
 		if inFlightResponse != nil {
 			inFlightResponse.cancelCtx()
 		}
-		// if !c.hijacked
-		if inFlightResponse != nil {
-			inFlightResponse.conn.r.abortPendingRead()
-			inFlightResponse.reqBody.Close()
+		if !c.hijacked() {
+			if inFlightResponse != nil {
+				inFlightResponse.conn.r.abortPendingRead()
+				inFlightResponse.reqBody.Close()
+			}
+			c.close()
+			c.setState(c.rwc, StateClosed, runHooks)
 		}
-		c.close()
-		c.setState(c.rwc, StateClosed, runHooks)
 	}()
+
+	// TODO: handle TLS.
 
 	// HTTP/1.x from here on.
 
@@ -1227,11 +1417,11 @@ func (c *conn) serve(ctx context.Context) {
 
 		c.curReq.Store(w)
 
-		// if requestBodyRemains(req.Body) {
-		// 	registerOnHitEOF(req.Body, w.conn.r.startBackgroundRead)
-		// } else {
-		// 	w.conn.r.startBackgroundRead()
-		// }
+		if requestBodyRemains(req.Body) {
+			registerOnHitEOF(req.Body, w.conn.r.startBackgroundRead)
+		} else {
+			w.conn.r.startBackgroundRead()
+		}
 
 		// HTTP cannot have multiple simultaneous active requests.[*]
 		// Until the server replies to this request, it can't read another,
@@ -1297,6 +1487,33 @@ func (w *response) sendExpectationFailed() {
 	w.Header().Set("Connection", "close")
 	w.WriteHeader(StatusExpectationFailed)
 	w.finishRequest()
+}
+
+func registerOnHitEOF(rc io.ReadCloser, fn func()) {
+	switch v := rc.(type) {
+	case *expectContinueReader:
+		registerOnHitEOF(v.readCloser, fn)
+	case *body:
+		v.registerOnHitEOF(fn)
+	default:
+		panic("unexpected type " + fmt.Sprintf("%T", rc))
+	}
+}
+
+// requestBodyRemains reports whether future calls to Read
+// on rc might yield more data.
+func requestBodyRemains(rc io.ReadCloser) bool {
+	if rc == NoBody {
+		return false
+	}
+	switch v := rc.(type) {
+	case *expectContinueReader:
+		return requestBodyRemains(v.readCloser)
+	case *body:
+		return v.bodyRemains()
+	default:
+		panic("unexpected type " + fmt.Sprintf("%T", rc))
+	}
 }
 
 // The HandlerFunc type is an adapter to allow the use of

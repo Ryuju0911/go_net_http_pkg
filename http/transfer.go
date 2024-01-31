@@ -968,6 +968,20 @@ func (b *body) Close() error {
 	return err
 }
 
+// bodyRemains reports whether future Read calls might
+// yield data.
+func (b *body) bodyRemains() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return !b.sawEOF
+}
+
+func (b *body) registerOnHitEOF(fn func()) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.onHitEOF = fn
+}
+
 // bodyLocked is an io.Reader reading from a *body when its mutex is
 // already held.
 type bodyLocked struct {
