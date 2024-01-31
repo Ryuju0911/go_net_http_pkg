@@ -762,7 +762,7 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 
 	fixPragmaCacheControl(req.Header)
 
-	// req.Close = shouldClose(req.ProtoMajor, req.ProtoMinor, req.Header, false)
+	req.Close = shouldClose(req.ProtoMajor, req.ProtoMinor, req.Header, false)
 
 	err = readTransfer(req, b)
 	if err != nil {
@@ -784,6 +784,13 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 
 func (r *Request) expectsContinue() bool {
 	return hasToken(r.Header.get("Expect"), "100-continue")
+}
+
+func (r *Request) wantsHttp10KeepAlive() bool {
+	if r.ProtoMajor != 1 || r.ProtoMinor != 0 {
+		return false
+	}
+	return hasToken(r.Header.get("Connection"), "keep-alive")
 }
 
 func (r *Request) wantsClose() bool {

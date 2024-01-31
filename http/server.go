@@ -252,14 +252,14 @@ func (cw *chunkWriter) close() {
 
 // A response represents the server side of an HTTP response.
 type response struct {
-	conn          *conn
-	req           *Request // request for this response
-	reqBody       io.ReadCloser
-	cancelCtx     context.CancelFunc // when ServeHTTP exits
-	wroteHeader   bool               // a non-1xx header has been (logically) written
-	wroteContinue bool               // 100 Continue response was written
-	// wants10KeepAlive bool               // HTTP/1.0 w/ Connection "keep-alive"
-	// wantsClose       bool               // HTTP request has Connection "close"
+	conn             *conn
+	req              *Request // request for this response
+	reqBody          io.ReadCloser
+	cancelCtx        context.CancelFunc // when ServeHTTP exits
+	wroteHeader      bool               // a non-1xx header has been (logically) written
+	wroteContinue    bool               // 100 Continue response was written
+	wants10KeepAlive bool               // HTTP/1.0 w/ Connection "keep-alive"
+	wantsClose       bool               // HTTP request has Connection "close"
 
 	// canWriteContinue is an atomic boolean that says whether or
 	// not a 100 Continue header can be written to the
@@ -285,11 +285,11 @@ type response struct {
 	contentLength int64 // explicitly-declared Content-Length; or -1
 	status        int   // status code passed to WriteHeader
 
-	// // close connection after this reply.  set on request and
-	// // updated after response from handler if there's a
-	// // "Connection: keep-alive" response header and a
-	// // Content-Length.
-	// closeAfterReply bool
+	// close connection after this reply.  set on request and
+	// updated after response from handler if there's a
+	// "Connection: keep-alive" response header and a
+	// Content-Length.
+	closeAfterReply bool
 
 	// // When fullDuplex is false (the default), we consume any remaining
 	// // request body before starting to write a response.
@@ -731,11 +731,11 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		contentLength: -1,
 		closeNotifyCh: make(chan bool, 1),
 
-		// // We populate these ahead of time so we're not
-		// // reading from req.Header after their Handler starts
-		// // and maybe mutates it (Issue 14940)
-		// wants10KeepAlive: req.wantsHttp10KeepAlive(),
-		// wantsClose:       req.wantsClose(),
+		// We populate these ahead of time so we're not
+		// reading from req.Header after their Handler starts
+		// and maybe mutates it (Issue 14940)
+		wants10KeepAlive: req.wantsHttp10KeepAlive(),
+		wantsClose:       req.wantsClose(),
 	}
 	// if isH2Upgrade {
 	// 	w.closeAfterReply = true
@@ -919,7 +919,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	cw.wroteHeader = true
 
 	w := cw.res
-	// keepAlivesEnabled := w.conn.server.doKeepAlives()
+	keepAlivesEnabled := w.conn.server.doKeepAlives()
 	isHEAD := w.req.Method == "HEAD"
 
 	// header is written out to w.conn.buf below. Depending on the
@@ -986,30 +986,30 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		setHeader.contentLength = strconv.AppendInt(cw.res.clenBuf[:0], int64(len(p)), 10)
 	}
 
-	// // If this was an HTTP/1.0 request with keep-alive and we sent a
-	// // Content-Length back, we can make this a keep-alive response ...
-	// if w.wants10KeepAlive && keepAlivesEnabled {
-	// 	sentLength := header.get("Content-Length") != ""
-	// 	if sentLength && header.get("Connection") == "keep-alive" {
-	// 		w.closeAfterReply = false
-	// 	}
-	// }
+	// If this was an HTTP/1.0 request with keep-alive and we sent a
+	// Content-Length back, we can make this a keep-alive response ...
+	if w.wants10KeepAlive && keepAlivesEnabled {
+		sentLength := header.get("Content-Length") != ""
+		if sentLength && header.get("Connection") == "keep-alive" {
+			w.closeAfterReply = false
+		}
+	}
 
 	// Check for an explicit (and valid) Content-Length header.
-	// hasCL := w.contentLength != -1
+	hasCL := w.contentLength != -1
 
-	// if w.wants10KeepAlive && (isHEAD || hasCL || !bodyAllowedForStatus(w.status)) {
-	// 	_, connectionHeaderSet := header["Connection"]
-	// 	if !connectionHeaderSet {
-	// 		setHeader.connection = "keep-alive"
-	// 	}
-	// } else if !w.req.ProtoAtLeast(1, 1) || w.wantsClose {
-	// 	w.closeAfterReply = true
-	// }
+	if w.wants10KeepAlive && (isHEAD || hasCL || !bodyAllowedForStatus(w.status)) {
+		_, connectionHeaderSet := header["Connection"]
+		if !connectionHeaderSet {
+			setHeader.connection = "keep-alive"
+		}
+	} else if !w.req.ProtoAtLeast(1, 1) || w.wantsClose {
+		w.closeAfterReply = true
+	}
 
-	// if header.get("Connection") == "close" || !keepAlivesEnabled {
-	// 	w.closeAfterReply = true
-	// }
+	if header.get("Connection") == "close" || !keepAlivesEnabled {
+		w.closeAfterReply = true
+	}
 
 	// If the client wanted a 100-continue but we never sent it to
 	// them (or, more strictly: we never finished reading their
@@ -2430,10 +2430,6 @@ func (s *Server) trackConn(c *conn, add bool) {
 	}
 }
 
-func (s *Server) shuttingDown() bool {
-	return s.inShutdown.Load()
-}
-
 // serverHandler delegates to either the server's Handler or
 // DefaultServeMux and also handles "OPTIONS *" requests.
 type serverHandler struct {
@@ -2456,6 +2452,18 @@ func (s *Server) readHeaderTimeout() time.Duration {
 	return s.ReadTimeout
 }
 
+func (s *Server) doKeepAlives() bool {
+	return !s.disableKeepAlives.Load() && !s.shuttingDown()
+}
+
+func (s *Server) shuttingDown() bool {
+	return s.inShutdown.Load()
+}
+
+// SetKeepAlivesEnabled controls whether HTTP keep-alives are enabled.
+// By default, keep-alives are always enabled. Only very
+// resource-constrained environments or servers in the process of
+// shutting down should disable them.
 func (srv *Server) SetKeepAlivesEnabled(v bool) {
 	if v {
 		srv.disableKeepAlives.Store(false)
