@@ -1034,9 +1034,9 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	// because we don't know if the next bytes on the wire will be
 	// the body-following-the-timer or the subsequent request.
 	// See Issue 11549.
-	// if ecr, ok := w.req.Body.(*expectContinueReader); ok && !ecr.sawEOF.Load() {
-	// 	w.closeAfterReply = true
-	// }
+	if ecr, ok := w.req.Body.(*expectContinueReader); ok && !ecr.sawEOF.Load() {
+		w.closeAfterReply = true
+	}
 
 	// We do this by default because there are a number of clients that
 	// send a full request before starting to read the response, and they
@@ -1555,10 +1555,6 @@ func (c *conn) serve(ctx context.Context) {
 		} else if req.Header.get("Expect") != "" {
 			w.sendExpectationFailed()
 			return
-		}
-
-		if req.Close {
-			log.Println("w.req.Close is true: conn.serve")
 		}
 
 		c.curReq.Store(w)
@@ -2199,6 +2195,22 @@ func (mux *ServeMux) registerErr(patstr string, handler Handler) error {
 	mux.index.addPattern(pat)
 	mux.patterns = append(mux.patterns, pat)
 	return nil
+}
+
+// Serve accepts incoming HTTP connections on the listener l,
+// creating a new service goroutine for each. The service goroutines
+// read requests and then call handler to reply to them.
+//
+// The handler is typically nil, in which case [DefaultServeMux] is used.
+//
+// HTTP/2 support is only enabled if the Listener returns [*tls.Conn]
+// connections and they were configured with "h2" in the TLS
+// Config.NextProtos.
+//
+// Serve always returns a non-nil error.
+func Serve(l net.Listener, handler Handler) error {
+	srv := &Server{Handler: handler}
+	return srv.Serve(l)
 }
 
 // A Server defines parameters for running an HTTP server.

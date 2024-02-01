@@ -8,6 +8,7 @@ package http_test
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -16,7 +17,67 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
+
+type dummyAddr string
+type oneConnListener struct {
+	conn net.Conn
+}
+
+func (l *oneConnListener) Accept() (c net.Conn, err error) {
+	c = l.conn
+	if c == nil {
+		err = io.EOF
+		return
+	}
+	err = nil
+	l.conn = nil
+	return
+}
+
+func (l *oneConnListener) Close() error {
+	return nil
+}
+
+func (l *oneConnListener) Addr() net.Addr {
+	return dummyAddr("test-address")
+}
+
+func (a dummyAddr) String() string {
+	return string(a)
+}
+
+type noopConn struct{}
+
+func (noopConn) LocalAddr() net.Addr                { return dummyAddr("local-addr") }
+func (noopConn) RemoteAddr() net.Addr               { return dummyAddr("remote-addr") }
+func (noopConn) SetReadDeadline(t time.Time) error  { return nil }
+func (noopConn) SetWriteDeadline(t time.Time) error { return nil }
+
+type rwTestConn struct {
+	io.Reader
+	io.Writer
+	noopConn
+
+	closeFunc func() error // called if non-nil
+	closec    chan bool    // else, if non-nil, send value to it on close
+}
+
+func (c *rwTestConn) Close() error {
+	if c.closeFunc != nil {
+		return c.closeFunc()
+	}
+	select {
+	case c.closec <- true:
+	default:
+	}
+	return nil
+}
+
+func reqBytes(req string) []byte {
+	return []byte(strings.ReplaceAll(strings.TrimSpace(req), "\n", "\r\n") + "\r\n\r\n")
+}
 
 func testTCPConnectionCloses(t *testing.T, req string, h Handler) {
 	setParallel(t)
@@ -261,5 +322,48 @@ func testServerExpect(t *testing.T, mode testMode) {
 
 	for _, test := range serverExpectTests {
 		runTest(test)
+	}
+}
+
+func TestIssue11549_Expect100(t *testing.T) {
+	req := reqBytes(`PUT /readbody HTTP/1.1
+User-Agent: PycURL/7.22.0
+Host: 127.0.0.1:9000
+Accept: */*
+Expect: 100-continue
+Content-Length: 10
+
+HelloWorldPUT /noreadbody HTTP/1.1
+User-Agent: PycURL/7.22.0
+Host: 127.0.0.1:9000
+Accept: */*
+Expect: 100-continue
+Content-Length: 10
+
+GET /should-be-ignored HTTP/1.1
+Host: foo
+
+`)
+	var buf strings.Builder
+	conn := &rwTestConn{
+		Reader: bytes.NewReader(req),
+		Writer: &buf,
+		closec: make(chan bool, 1),
+	}
+	ln := &oneConnListener{conn: conn}
+	numReq := 0
+	go Serve(ln, HandlerFunc(func(w ResponseWriter, r *Request) {
+		numReq++
+		if r.URL.Path == "/readbody" {
+			io.ReadAll(r.Body)
+		}
+		io.WriteString(w, "Hello world!")
+	}))
+	<-conn.closec
+	if numReq != 2 {
+		t.Errorf("num requests = %d; want 2", numReq)
+	}
+	if !strings.Contains(buf.String(), "Connection: close\r\n") {
+		t.Errorf("expected 'Connection: close' in response; got: %s", buf.String())
 	}
 }
