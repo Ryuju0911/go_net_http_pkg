@@ -302,9 +302,9 @@ type response struct {
 	// Content-Length.
 	closeAfterReply bool
 
-	// // When fullDuplex is false (the default), we consume any remaining
-	// // request body before starting to write a response.
-	// fullDuplex bool
+	// When fullDuplex is false (the default), we consume any remaining
+	// request body before starting to write a response.
+	fullDuplex bool
 
 	// requestBodyLimitHit is set by requestTooLarge when
 	// maxBytesReader hits its max size. It is checked in
@@ -333,6 +333,21 @@ type response struct {
 	// non-nil. Make this lazily-created again as it used to be?
 	closeNotifyCh  chan bool
 	didCloseNotify atomic.Bool // atomic (only false->true winner should send)
+}
+
+func (c *response) EnableFullDuplex() error {
+	c.fullDuplex = true
+	return nil
+}
+
+// requestTooLarge is called by maxBytesReader when too much input has
+// been read from the client.
+func (w *response) requestTooLarge() {
+	w.closeAfterReply = true
+	w.requestBodyLimitHit = true
+	if !w.wroteHeader {
+		w.Header().Set("Connection", "close")
+	}
 }
 
 func (srv *Server) newConn(rwc net.Conn) *conn {
@@ -1045,60 +1060,60 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	//
 	// If full duplex mode has been enabled with ResponseController.EnableFullDuplex,
 	// then leave the request body alone.
-	// if w.req.ContentLength != 0 && !w.closeAfterReply && !w.fullDuplex {
-	// 	var discard, tooBig bool
+	if w.req.ContentLength != 0 && !w.closeAfterReply && !w.fullDuplex {
+		var discard, tooBig bool
 
-	// 	switch bdy := w.req.Body.(type) {
-	// 	case *expectContinueReader:
-	// 		if bdy.resp.wroteContinue {
-	// 			discard = true
-	// 		}
-	// 	case *body:
-	// 		bdy.mu.Lock()
-	// 		switch {
-	// 		case bdy.closed:
-	// 			if !bdy.sawEOF {
-	// 				// Body was closed in handler with non-EOF error.
-	// 				w.closeAfterReply = true
-	// 			}
-	// 		case bdy.unreadDataSizeLocked() >= maxPostHandlerReadBytes:
-	// 			tooBig = true
-	// 		default:
-	// 			discard = true
-	// 		}
-	// 		bdy.mu.Unlock()
-	// 	default:
-	// 		discard = true
-	// 	}
+		switch bdy := w.req.Body.(type) {
+		case *expectContinueReader:
+			if bdy.resp.wroteContinue {
+				discard = true
+			}
+		case *body:
+			bdy.mu.Lock()
+			switch {
+			case bdy.closed:
+				if !bdy.sawEOF {
+					// Body was closed in handler with non-EOF error.
+					w.closeAfterReply = true
+				}
+			case bdy.unreadDataSizeLocked() >= maxPostHandlerReadBytes:
+				tooBig = true
+			default:
+				discard = true
+			}
+			bdy.mu.Unlock()
+		default:
+			discard = true
+		}
 
-	// 	if discard {
-	// 		_, err := io.CopyN(io.Discard, w.reqBody, maxPostHandlerReadBytes+1)
-	// 		switch err {
-	// 		case nil:
-	// 			// There must be even more data left over.
-	// 			tooBig = true
-	// 		case ErrBodyReadAfterClose:
-	// 			// Body was already consumed and closed.
-	// 		case io.EOF:
-	// 			// The remaining body was just consumed, close it.
-	// 			err = w.reqBody.Close()
-	// 			if err != nil {
-	// 				w.closeAfterReply = true
-	// 			}
-	// 		default:
-	// 			// Some other kind of error occurred, like a read timeout, or
-	// 			// corrupt chunked encoding. In any case, whatever remains
-	// 			// on the wire must not be parsed as another HTTP request.
-	// 			w.closeAfterReply = true
-	// 		}
-	// 	}
+		if discard {
+			_, err := io.CopyN(io.Discard, w.reqBody, maxPostHandlerReadBytes+1)
+			switch err {
+			case nil:
+				// There must be even more data left over.
+				tooBig = true
+			case ErrBodyReadAfterClose:
+				// Body was already consumed and closed.
+			case io.EOF:
+				// The remaining body was just consumed, close it.
+				err = w.reqBody.Close()
+				if err != nil {
+					w.closeAfterReply = true
+				}
+			default:
+				// Some other kind of error occurred, like a read timeout, or
+				// corrupt chunked encoding. In any case, whatever remains
+				// on the wire must not be parsed as another HTTP request.
+				w.closeAfterReply = true
+			}
+		}
 
-	// 	if tooBig {
-	// 		w.requestTooLarge()
-	// 		delHeader("Connection")
-	// 		setHeader.connection = "close"
-	// 	}
-	// }
+		if tooBig {
+			w.requestTooLarge()
+			delHeader("Connection")
+			setHeader.connection = "close"
+		}
+	}
 
 	code := w.status
 	if bodyAllowedForStatus(code) {

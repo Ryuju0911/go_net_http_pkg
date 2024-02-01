@@ -927,6 +927,16 @@ func mergeSetHeader(dst *Header, src Header) {
 	}
 }
 
+// unreadDataSizeLocked returns the number of bytes of unread input.
+// It returns -1 if unknown.
+// b.mu must be held.
+func (b *body) unreadDataSizeLocked() int64 {
+	if lr, ok := b.src.(*io.LimitedReader); ok {
+		return lr.N
+	}
+	return -1
+}
+
 func (b *body) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
