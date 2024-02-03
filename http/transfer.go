@@ -601,6 +601,13 @@ func (uste *unsupportedTEError) Error() string {
 	return uste.err
 }
 
+// isUnsupportedTEError checks if the error is of type
+// unsupportedTEError. It is usually invoked with a non-nil err.
+func isUnsupportedTEError(err error) bool {
+	_, ok := err.(*unsupportedTEError)
+	return ok
+}
+
 // parseTransferEncoding sets t.Chunked based on the Transfer-Encoding header.
 func (t *transferReader) parseTransferEncoding() error {
 	raw, present := t.Header["Transfer-Encoding"]

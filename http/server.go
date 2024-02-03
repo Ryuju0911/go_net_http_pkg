@@ -1533,17 +1533,17 @@ func (c *conn) serve(ctx context.Context) {
 				c.closeWriteAndWait()
 				return
 
-			// case isUnsupportedTEError(err):
-			// 	// Respond as per RFC 7230 Section 3.3.1 which says,
-			// 	//      A server that receives a request message with a
-			// 	//      transfer coding it does not understand SHOULD
-			// 	//      respond with 501 (Unimplemented).
-			// 	code := StatusNotImplemented
+			case isUnsupportedTEError(err):
+				// Respond as per RFC 7230 Section 3.3.1 which says,
+				//      A server that receives a request message with a
+				//      transfer coding it does not understand SHOULD
+				//      respond with 501 (Unimplemented).
+				code := StatusNotImplemented
 
-			// 	// We purposefully aren't echoing back the transfer-encoding's value,
-			// 	// so as to mitigate the risk of cross side scripting by an attacker.
-			// 	fmt.Fprintf(c.rwc, "HTTP/1.1 %d %s%sUnsupported transfer encoding", code, StatusText(code), errorHeaders)
-			// 	return
+				// We purposefully aren't echoing back the transfer-encoding's value,
+				// so as to mitigate the risk of cross side scripting by an attacker.
+				fmt.Fprintf(c.rwc, "HTTP/1.1 %d %s%sUnsupported transfer encoding", code, StatusText(code), errorHeaders)
+				return
 
 			// case isCommonNetReadError(err):
 			// 	return // don't reply
