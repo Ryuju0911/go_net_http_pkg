@@ -1602,13 +1602,13 @@ func (c *conn) serve(ctx context.Context) {
 		c.setState(c.rwc, StateIdle, runHooks)
 		c.curReq.Store(nil)
 
-		// if !w.conn.server.doKeepAlives() {
-		// 	// We're in shutdown mode. We might've replied
-		// 	// to the user without "Connection: close" and
-		// 	// they might think they can send another
-		// 	// request, but such is life with HTTP/1.1.
-		// 	return
-		// }
+		if !w.conn.server.doKeepAlives() {
+			// We're in shutdown mode. We might've replied
+			// to the user without "Connection: close" and
+			// they might think they can send another
+			// request, but such is life with HTTP/1.1.
+			return
+		}
 
 		// if d := c.server.idleTimeout(); d != 0 {
 		// 	c.rwc.SetReadDeadline(time.Now().Add(d))
