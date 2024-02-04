@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	. "net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"strings"
 	"sync"
@@ -365,5 +366,96 @@ Host: foo
 	}
 	if !strings.Contains(buf.String(), "Connection: close\r\n") {
 		t.Errorf("expected 'Connection: close' in response; got: %s", buf.String())
+	}
+}
+
+func TestServerIdleTimeout(t *testing.T) { run(t, testServerIdleTimeout, []testMode{http1Mode}) }
+func testServerIdleTimeout(t *testing.T, mode testMode) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	runTimeSensitiveTest(t, []time.Duration{
+		10 * time.Millisecond,
+		100 * time.Millisecond,
+		1 * time.Second,
+		10 * time.Second,
+	}, func(t *testing.T, readHeaderTimeout time.Duration) error {
+		cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+			io.Copy(io.Discard, r.Body)
+			io.WriteString(w, r.RemoteAddr)
+		}), func(ts *httptest.Server) {
+			ts.Config.ReadHeaderTimeout = readHeaderTimeout
+			ts.Config.IdleTimeout = 2 * readHeaderTimeout
+		})
+		defer cst.close()
+		ts := cst.ts
+		t.Logf("ReadHeaderTimeout = %v", ts.Config.ReadHeaderTimeout)
+		t.Logf("IdleTimeout = %v", ts.Config.IdleTimeout)
+		c := ts.Client()
+
+		get := func() (string, error) {
+			res, err := c.Get(ts.URL)
+			if err != nil {
+				return "", err
+			}
+			defer res.Body.Close()
+			slurp, err := io.ReadAll(res.Body)
+			if err != nil {
+				// If we're at this point the headers have definitely already been
+				// read and the server is not idle, so neither timeout applies:
+				// this should never fail.
+				t.Fatal(err)
+			}
+			return string(slurp), nil
+		}
+
+		a1, err := get()
+		if err != nil {
+			return err
+		}
+		a2, err := get()
+		if err != nil {
+			return err
+		}
+		if a1 != a2 {
+			return fmt.Errorf("did requests on different connections")
+		}
+		time.Sleep(ts.Config.IdleTimeout * 3 / 2)
+		a3, err := get()
+		if err != nil {
+			return err
+		}
+		if a2 == a3 {
+			return fmt.Errorf("request three unexpectedly on same connection")
+		}
+
+		// And test that ReadHeaderTimeout still works:
+		conn, err := net.Dial("tcp", ts.Listener.Addr().String())
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		conn.Write([]byte("GET / HTTP/1.1\r\nHost: foo.com\r\n"))
+		time.Sleep(ts.Config.ReadHeaderTimeout * 2)
+		if _, err := io.CopyN(io.Discard, conn, 1); err == nil {
+			return fmt.Errorf("copy byte succeeded; want err")
+		}
+
+		return nil
+	})
+}
+
+// runTimeSensitiveTest runs test with the provided durations until one passes.
+// If they all fail, t.Fatal is called with the last one's duration and error value.
+func runTimeSensitiveTest(t *testing.T, durations []time.Duration, test func(t *testing.T, d time.Duration) error) {
+	for i, d := range durations {
+		err := test(t, d)
+		if err == nil {
+			return
+		}
+		if i == len(durations)-1 || t.Failed() {
+			t.Fatalf("failed with duration %v: %v", d, err)
+		}
+		t.Logf("retrying after error with duration %v: %v", d, err)
 	}
 }

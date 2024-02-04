@@ -32,6 +32,11 @@ import (
 
 // Errors used by the HTTP server.
 var (
+	// ErrBodyNotAllowed is returned by ResponseWriter.Write calls
+	// when the HTTP method or response code does not permit a
+	// body.
+	ErrBodyNotAllowed = errors.New("http: request method or response status code does not allow body")
+
 	// ErrHijacked is returned by ResponseWriter.Write calls when
 	// the underlying connection has been hijacked using the
 	// Hijacker interface. A zero-byte write on a hijacked
@@ -1292,9 +1297,9 @@ func (w *response) write(lenData int, dataB []byte, dataS string) (n int, err er
 	if lenData == 0 {
 		return 0, nil
 	}
-	// if !w.bodyAllowed() {
-	// 	return 0, ErrBodyNotAllowed
-	// }
+	if !w.bodyAllowed() {
+		return 0, ErrBodyNotAllowed
+	}
 
 	w.written += int64(lenData) // ignoring errors, for errorKludge
 	if w.contentLength != -1 && w.written > w.contentLength {
@@ -1478,6 +1483,23 @@ type statusError struct {
 
 func (e statusError) Error() string { return StatusText(e.code) + ": " + e.text }
 
+// isCommonNetReadError reports whether err is a common error
+// encountered during reading a request off the network when the
+// client has gone away or had its read fail somehow. This is used to
+// determine which logs are interesting enough to log about.
+func isCommonNetReadError(err error) bool {
+	if err == io.EOF {
+		return true
+	}
+	if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+		return true
+	}
+	if oe, ok := err.(*net.OpError); ok && oe.Op == "read" {
+		return true
+	}
+	return false
+}
+
 // Serve a new connection.
 func (c *conn) serve(ctx context.Context) {
 	if ra := c.rwc.RemoteAddr(); ra != nil {
@@ -1545,8 +1567,8 @@ func (c *conn) serve(ctx context.Context) {
 				fmt.Fprintf(c.rwc, "HTTP/1.1 %d %s%sUnsupported transfer encoding", code, StatusText(code), errorHeaders)
 				return
 
-			// case isCommonNetReadError(err):
-			// 	return // don't reply
+			case isCommonNetReadError(err):
+				return // don't reply
 
 			default:
 				if v, ok := err.(statusError); ok {
@@ -1610,11 +1632,11 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 
-		// if d := c.server.idleTimeout(); d != 0 {
-		// 	c.rwc.SetReadDeadline(time.Now().Add(d))
-		// } else {
-		// 	c.rwc.SetReadDeadline(time.Time{})
-		// }
+		if d := c.server.idleTimeout(); d != 0 {
+			c.rwc.SetReadDeadline(time.Now().Add(d))
+		} else {
+			c.rwc.SetReadDeadline(time.Time{})
+		}
 
 		// Wait for the connection to become readable again before trying to
 		// read the next request. This prevents a ReadHeaderTimeout or
@@ -2262,6 +2284,12 @@ type Server struct {
 	// A zero or negative value means there will be no timeout.
 	WriteTimeout time.Duration
 
+	// IdleTimeout is the maximum amount of time to wait for the
+	// next request when keep-alives are enabled. If IdleTimeout
+	// is zero, the value of ReadTimeout is used. If both are
+	// zero, there is no timeout.
+	IdleTimeout time.Duration
+
 	// MaxHeaderBytes controls the maximum number of bytes the
 	// server will read parsing the request header's keys and
 	// values, including the request line. It does not limit the
@@ -2601,6 +2629,13 @@ func (s *Server) trackConn(c *conn, add bool) {
 	} else {
 		delete(s.activeConn, c)
 	}
+}
+
+func (s *Server) idleTimeout() time.Duration {
+	if s.IdleTimeout != 0 {
+		return s.IdleTimeout
+	}
+	return s.ReadTimeout
 }
 
 // serverHandler delegates to either the server's Handler or
