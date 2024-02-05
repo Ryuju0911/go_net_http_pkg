@@ -225,8 +225,8 @@ type chunkWriter struct {
 	// logically written.
 	wroteHeader bool
 
-	// // set by the writeHeader method:
-	// chunking bool // using chunked transfer encoding for reply body
+	// set by the writeHeader method:
+	chunking bool // using chunked transfer encoding for reply body
 }
 
 var (
@@ -253,17 +253,17 @@ func (cw *chunkWriter) close() {
 	if !cw.wroteHeader {
 		cw.writeHeader(nil)
 	}
-	// if cw.chunking {
-	// 	bw := cw.res.conn.bufw // conn's bufio writer
-	// 	// zero chunk to mark EOF
-	// 	bw.WriteString("0\r\n")
-	// 	if trailers := cw.res.finalTrailers(); trailers != nil {
-	// 		trailers.Write(bw) // the writer handles noting errors
-	// 	}
-	// 	// final blank line after the trailers (whether
-	// 	// present or not)
-	// 	bw.WriteString("\r\n")
-	// }
+	if cw.chunking {
+		bw := cw.res.conn.bufw // conn's bufio writer
+		// zero chunk to mark EOF
+		bw.WriteString("0\r\n")
+		if trailers := cw.res.finalTrailers(); trailers != nil {
+			trailers.Write(bw) // the writer handles noting errors
+		}
+		// final blank line after the trailers (whether
+		// present or not)
+		bw.WriteString("\r\n")
+	}
 }
 
 // A response represents the server side of an HTTP response.
@@ -320,11 +320,11 @@ type response struct {
 	// input from it.
 	requestBodyLimitHit bool
 
-	// // trailers are the headers to be sent after the handler
-	// // finishes writing the body. This field is initialized from
-	// // the Trailer response header when the response header is
-	// // written.
-	// trailers []string
+	// trailers are the headers to be sent after the handler
+	// finishes writing the body. This field is initialized from
+	// the Trailer response header when the response header is
+	// written.
+	trailers []string
 
 	handlerDone atomic.Bool // set true when the handler exits
 
@@ -343,6 +343,53 @@ type response struct {
 func (c *response) EnableFullDuplex() error {
 	c.fullDuplex = true
 	return nil
+}
+
+// TrailerPrefix is a magic prefix for [ResponseWriter.Header] map keys
+// that, if present, signals that the map entry is actually for
+// the response trailers, and not the response headers. The prefix
+// is stripped after the ServeHTTP call finishes and the values are
+// sent in the trailers.
+//
+// This mechanism is intended only for trailers that are not known
+// prior to the headers being written. If the set of trailers is fixed
+// or known before the header is written, the normal Go trailers mechanism
+// is preferred:
+//
+//	https://pkg.go.dev/net/http#ResponseWriter
+//	https://pkg.go.dev/net/http#example-ResponseWriter-Trailers
+const TrailerPrefix = "Trailer:"
+
+// finalTrailers is called after the Handler exits and returns a non-nil
+// value if the Handler set any trailers.
+func (w *response) finalTrailers() Header {
+	var t Header
+	for k, vv := range w.handlerHeader {
+		if kk, found := strings.CutPrefix(k, TrailerPrefix); found {
+			if t == nil {
+				t = make(Header)
+			}
+			t[kk] = vv
+		}
+	}
+	for _, k := range w.trailers {
+		if t == nil {
+			t = make(Header)
+		}
+		for _, v := range w.handlerHeader[k] {
+			t.Add(k, v)
+		}
+	}
+	return t
+}
+
+func (w *response) declareTrailer(k string) {
+	k = CanonicalHeaderKey(k)
+	if !httpguts.ValidTrailerHeader(k) {
+		// Forbidden by RFC 7230, section 4.1.2
+		return
+	}
+	w.trailers = append(w.trailers, k)
 }
 
 // requestTooLarge is called by maxBytesReader when too much input has
@@ -981,19 +1028,19 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 
 	// Don't write out the fake "Trailer:foo" keys. See TrailerPrefix.
 	trailers := false
-	// for k := range cw.header {
-	// 	if strings.HasPrefix(k, TrailerPrefix) {
-	// 		if excludeHeader == nil {
-	// 			excludeHeader = make(map[string]bool)
-	// 		}
-	// 		excludeHeader[k] = true
-	// 		trailers = true
-	// 	}
-	// }
-	// for _, v := range cw.header["Trailer"] {
-	// 	trailers = true
-	// 	foreachHeaderElement(v, cw.res.declareTrailer)
-	// }
+	for k := range cw.header {
+		if strings.HasPrefix(k, TrailerPrefix) {
+			if excludeHeader == nil {
+				excludeHeader = make(map[string]bool)
+			}
+			excludeHeader[k] = true
+			trailers = true
+		}
+	}
+	for _, v := range cw.header["Trailers"] {
+		trailers = true
+		foreachHeaderElement(v, cw.res.declareTrailer)
+	}
 
 	te := header.get("Transfer-Encoding")
 	hasTE := te != ""
@@ -1142,44 +1189,44 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		setHeader.date = appendTime(cw.res.dateBuf[:0], time.Now())
 	}
 
-	// if w.req.Method == "HEAD" || !bodyAllowedForStatus(code) || code == StatusNoContent {
-	// 	// Response has no body.
-	// 	delHeader("Transfer-Encoding")
-	// } else if hasCL {
-	// 	// Content-Length has been provided, so no chunking is to be done.
-	// 	delHeader("Transfer-Encoding")
-	// } else if w.req.ProtoAtLeast(1, 1) {
-	// 	// HTTP/1.1 or greater: Transfer-Encoding has been set to identity, and no
-	// 	// content-length has been provided. The connection must be closed after the
-	// 	// reply is written, and no chunking is to be done. This is the setup
-	// 	// recommended in the Server-Sent Events candidate recommendation 11,
-	// 	// section 8.
-	// 	if hasTE && te == "identity" {
-	// 		cw.chunking = false
-	// 		w.closeAfterReply = true
-	// 		delHeader("Transfer-Encoding")
-	// 	} else {
-	// 		// HTTP/1.1 or greater: use chunked transfer encoding
-	// 		// to avoid closing the connection at EOF.
-	// 		cw.chunking = true
-	// 		setHeader.transferEncoding = "chunked"
-	// 		if hasTE && te == "chunked" {
-	// 			// We will send the chunked Transfer-Encoding header later.
-	// 			delHeader("Transfer-Encoding")
-	// 		}
-	// 	}
-	// } else {
-	// 	// HTTP version < 1.1: cannot do chunked transfer
-	// 	// encoding and we don't know the Content-Length so
-	// 	// signal EOF by closing connection.
-	// 	w.closeAfterReply = true
-	// 	delHeader("Transfer-Encoding") // in case already set
-	// }
+	if w.req.Method == "HEAD" || !bodyAllowedForStatus(code) || code == StatusNoContent {
+		// Response has no body.
+		delHeader("Transfer-Encoding")
+	} else if hasCL {
+		// Content-Length has been provided, so no chunking is to be done.
+		delHeader("Transfer-Encoding")
+	} else if w.req.ProtoAtLeast(1, 1) {
+		// HTTP/1.1 or greater: Transfer-Encoding has been set to identity, and no
+		// content-length has been provided. The connection must be closed after the
+		// reply is written, and no chunking is to be done. This is the setup
+		// recommended in the Server-Sent Events candidate recommendation 11,
+		// section 8.
+		if hasTE && te == "identity" {
+			cw.chunking = false
+			w.closeAfterReply = true
+			delHeader("Transfer-Encoding")
+		} else {
+			// HTTP/1.1 or greater: use chunked transfer encoding
+			// to avoid closing the connection at EOF.
+			cw.chunking = true
+			setHeader.transferEncoding = "chunked"
+			if hasTE && te == "chunked" {
+				// We will send the chunked Transfer-Encoding header later.
+				delHeader("Transfer-Encoding")
+			}
+		}
+	} else {
+		// HTTP version < 1.1: cannot do chunked transfer
+		// encoding and we don't know the Content-Length so
+		// signal EOF by closing connection.
+		w.closeAfterReply = true
+		delHeader("Transfer-Encoding") // in case already set
+	}
 
-	// // Cannot use Content-Length with non-identity Transfer-Encoding.
-	// if cw.chunking {
-	// 	delHeader("Content-Length")
-	// }
+	// Cannot use Content-Length with non-identity Transfer-Encoding.
+	if cw.chunking {
+		delHeader("Content-Length")
+	}
 	if !w.req.ProtoAtLeast(1, 0) {
 		return
 	}
