@@ -76,8 +76,86 @@ func (c *rwTestConn) Close() error {
 	return nil
 }
 
+type testConn struct {
+	readMu   sync.Mutex // for TestHandlerBodyClose
+	readBuf  bytes.Buffer
+	writeBuf bytes.Buffer
+	closec   chan bool // 1-buffered; receives true when Close is called
+	noopConn
+}
+
+func (c *testConn) Read(b []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	return c.readBuf.Read(b)
+}
+
+func (c *testConn) Write(b []byte) (int, error) {
+	return c.writeBuf.Write(b)
+}
+
+func (c *testConn) Close() error {
+	select {
+	case c.closec <- true:
+	default:
+	}
+	return nil
+}
+
+// reqBytes treats req as a request (with \n delimiters) and returns it with \r\n delimiters,
+// ending in \r\n\r\n
 func reqBytes(req string) []byte {
 	return []byte(strings.ReplaceAll(strings.TrimSpace(req), "\n", "\r\n") + "\r\n\r\n")
+}
+
+func TestConsumingBodyOnNextConn(t *testing.T) {
+	t.Parallel()
+	defer afterTest(t)
+	conn := new(testConn)
+	for i := 0; i < 2; i++ {
+		conn.readBuf.Write([]byte(
+			"POST / HTTP/1.1\r\n" +
+				"Host: test\r\n" +
+				"Content-Length: 11\r\n" +
+				"\r\n" +
+				"foo=1&bar=1"))
+	}
+
+	reqNum := 0
+	ch := make(chan *Request)
+	servech := make(chan error)
+	listener := &oneConnListener{conn}
+	handler := func(res ResponseWriter, req *Request) {
+		reqNum++
+		ch <- req
+	}
+
+	go func() {
+		servech <- Serve(listener, HandlerFunc(handler))
+	}()
+
+	var req *Request
+	req = <-ch
+	if req == nil {
+		t.Fatal("Got nil first request.")
+	}
+	if req.Method != "POST" {
+		t.Errorf("For request #1's method, got %q; expected %q",
+			req.Method, "POST")
+	}
+
+	req = <-ch
+	if req == nil {
+		t.Fatal("Got nil second request.")
+	}
+	if req.Method != "POST" {
+		t.Errorf("For request #2's method, got %q; expected %q",
+			req.Method, "POST")
+	}
+
+	if serveerr := <-servech; serveerr != io.EOF {
+		t.Errorf("Serve returned %q; expected EOF", serveerr)
+	}
 }
 
 func testTCPConnectionCloses(t *testing.T, req string, h Handler) {
