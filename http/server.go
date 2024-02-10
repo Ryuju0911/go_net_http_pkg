@@ -1604,9 +1604,9 @@ func (c *conn) serve(ctx context.Context) {
 
 			case isUnsupportedTEError(err):
 				// Respond as per RFC 7230 Section 3.3.1 which says,
-				//      A server that receives a request message with a
-				//      transfer coding it does not understand SHOULD
-				//      respond with 501 (Unimplemented).
+				// A server that receives a request message with a
+				// transfer coding it does not understand SHOULD
+				// respond with 501 (Unimplemented).
 				code := StatusNotImplemented
 
 				// We purposefully aren't echoing back the transfer-encoding's value,

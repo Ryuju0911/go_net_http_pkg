@@ -32,14 +32,23 @@ func internetSocket(
 }
 
 func ipToSockaddrInet6(ip IP, port int, zone string) (syscall.SockaddrInet6, error) {
-	// TODO: Implement logic
-	if len(ip) == 0 {
+	// In general, an IP wildcard address, which is either
+	// "0.0.0.0" or "::", means the entire IP addressing
+	// space. For some historical reason, it is used to
+	// specify "any available address" on some operations
+	// of IP node.
+	//
+	// When the IP node supports IPv4-mapped IPv6 address,
+	// we allow a listener to listen to the wildcard
+	// address of both IP addressing spaces by specifying
+	// IPv6 wildcard address.
+	if len(ip) == 0 || ip.Equal(IPv4zero) {
 		ip = IPv6zero
 	}
-
+	// We accept any IPv6 address including IPv4-mapped
+	// IPv6 address.
 	ip6 := ip.To16()
 	if ip6 == nil {
-		// TODO: Implement ip.String and call it here.
 		return syscall.SockaddrInet6{}, &AddrError{Err: "non-IPv6 address", Addr: ip.String()}
 	}
 	sa := syscall.SockaddrInet6{Port: port}

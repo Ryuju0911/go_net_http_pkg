@@ -40,6 +40,11 @@ func IPv4(a, b, c, d byte) IP {
 
 var v4InV6Prefix = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff}
 
+// Well-known IPv4 addresses
+var (
+	IPv4zero = IPv4(0, 0, 0, 0) // all zeros
+)
+
 // Well-known IPv6 addresses
 var (
 	IPv6zero = IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
