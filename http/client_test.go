@@ -7,6 +7,7 @@
 package http_test
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	. "net/http"
@@ -59,5 +60,71 @@ func testClient(t *testing.T, mode testMode) {
 		t.Error(err)
 	} else if s := string(b); !strings.HasPrefix(s, "User-agent:") {
 		t.Errorf("Incorrect page body (did not begin with User-agent): %q", s)
+	}
+}
+
+type recordingTransport struct {
+	req *Request
+}
+
+func (t *recordingTransport) RoundTrip(req *Request) (resp *Response, err error) {
+	t.req = req
+	return nil, errors.New("dummy impl")
+}
+
+func TestGetRequestFormat(t *testing.T) {
+	setParallel(t)
+	defer afterTest(t)
+	tr := &recordingTransport{}
+	client := &Client{Transport: tr}
+	url := "http://dummy.faketld/"
+	client.Get(url) // Note: doesn't hit network
+	if tr.req.Method != "GET" {
+		t.Errorf("expected method %q; got %q", "GET", tr.req.Method)
+	}
+	if tr.req.URL.String() != url {
+		t.Errorf("expected URL %q; got %q", url, tr.req.URL.String())
+	}
+	if tr.req.Header == nil {
+		t.Errorf("expected non-nil request Header")
+	}
+}
+
+func TestStripPasswordFromError(t *testing.T) {
+	client := &Client{Transport: &recordingTransport{}}
+	testCases := []struct {
+		desc string
+		in   string
+		out  string
+	}{
+		{
+			desc: "Strip password from error message",
+			in:   "http://user:password@dummy.faketld/",
+			out:  `Get "http://user:***@dummy.faketld/": dummy impl`,
+		},
+		{
+			desc: "Don't Strip password from domain name",
+			in:   "http://user:password@password.faketld/",
+			out:  `Get "http://user:***@password.faketld/": dummy impl`,
+		},
+		{
+			desc: "Don't Strip password from path",
+			in:   "http://user:password@dummy.faketld/password",
+			out:  `Get "http://user:***@dummy.faketld/password": dummy impl`,
+		},
+		{
+			desc: "Strip escaped password",
+			in:   "http://user:pa%2Fssword@dummy.faketld/",
+			out:  `Get "http://user:***@dummy.faketld/": dummy impl`,
+		},
+	}
+	for _, tC := range testCases {
+		t.Run(tC.desc, func(t *testing.T) {
+			_, err := client.Get(tC.in)
+			if err.Error() != tC.out {
+				t.Errorf("Unexpected output for %q: expected %q, actual %q",
+					tC.in, tC.out, err.Error())
+			}
+		})
 	}
 }

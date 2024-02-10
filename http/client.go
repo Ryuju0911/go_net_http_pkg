@@ -425,12 +425,29 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 		reqs     []*Request
 		resp     *Response
 		// copyHeaders   = c.makeHeadersCopier(req)
-		// reqBodyClosed = false // have we closed the current req.Body?
+		reqBodyClosed = false // have we closed the current req.Body?
 
 		// // Redirect behavior:
 		// redirectMethod string
 		// includeBody    bool
 	)
+	uerr := func(err error) error {
+		// the body may have been called already by c.send()
+		if !reqBodyClosed {
+			req.closeBody()
+		}
+		var urlStr string
+		if resp != nil && resp.Request != nil {
+			urlStr = stripPassword(resp.Request.URL)
+		} else {
+			urlStr = stripPassword(req.URL)
+		}
+		return &url.Error{
+			Op:  urlErrorOp(reqs[0].Method),
+			URL: urlStr,
+			Err: err,
+		}
+	}
 	for {
 		// For all but the first request, create the next
 		// request hop and replace req.
@@ -444,13 +461,23 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 			}
 			// TODO: Handles the case when loc != nil.
 		}
+
 		reqs = append(reqs, req)
 		var err error
-		// var didTimeout func() bool
-		if resp, _, err = c.send(req, deadline); err != nil {
-			// TOOD: Implement logic
-			return nil, err
+		var didTimeout func() bool
+		if resp, didTimeout, err = c.send(req, deadline); err != nil {
+			// c.send() always closes req.Body
+			reqBodyClosed = true
+			if !deadline.IsZero() && didTimeout() {
+				err = &httpError{
+					err:     err.Error() + " (Client.Timeout exceeded while awaiting headers)",
+					timeout: true,
+				}
+			}
+			return nil, uerr(err)
 		}
+
+		req.closeBody()
 	}
 }
 
@@ -485,4 +512,12 @@ func (b *cancelTimerBody) Close() error {
 	err := b.rc.Close()
 	b.stop()
 	return err
+}
+
+func stripPassword(u *url.URL) string {
+	_, passSet := u.User.Password()
+	if passSet {
+		return strings.Replace(u.String(), u.User.String()+"@", u.User.Username()+":***@", 1)
+	}
+	return u.String()
 }
