@@ -700,6 +700,21 @@ func NewRequestWithContext(ctx context.Context, method, url string, body io.Read
 	return req, nil
 }
 
+// SetBasicAuth sets the request's Authorization header to use HTTP
+// Basic Authentication with the provided username and password.
+//
+// With HTTP Basic Authentication the provided username and password
+// are not encrypted. It should generally only be used in an HTTPS
+// request.
+//
+// The username may not contain a colon. Some protocols may impose
+// additional requirements on pre-escaping the username and
+// password. For instance, when used with OAuth2, both arguments must
+// be URL encoded first with [url.QueryEscape].
+func (r *Request) SetBasicAuth(username, password string) {
+	r.Header.Set("Authorization", "Basic "+basicAuth(username, password))
+}
+
 func parseRequestLine(line string) (method, requestURI, proto string, ok bool) {
 	method, rest, ok1 := strings.Cut(line, " ")
 	requestURI, proto, ok2 := strings.Cut(rest, " ")

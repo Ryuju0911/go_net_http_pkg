@@ -7,10 +7,12 @@
 package http_test
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	. "net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -87,6 +89,114 @@ func TestGetRequestFormat(t *testing.T) {
 	}
 	if tr.req.Header == nil {
 		t.Errorf("expected non-nil request Header")
+	}
+}
+
+func TestEmptyPasswordAuth(t *testing.T) { run(t, testEmptyPasswordAuth) }
+func testEmptyPasswordAuth(t *testing.T, mode testMode) {
+	gopher := "gopher"
+	ts := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		auth := r.Header.Get("Authorization")
+		if strings.HasPrefix(auth, "Basic") {
+			encoded := auth[6:]
+			decoded, err := base64.StdEncoding.DecodeString(encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			expected := gopher + ":"
+			s := string(decoded)
+			if expected != s {
+				t.Errorf("Invalid Authorization header. Got %q, wanted %q", s, expected)
+			}
+		} else {
+			t.Errorf("Invalid auth %q", auth)
+		}
+	})).ts
+	defer ts.Close()
+	req, err := NewRequest("GET", ts.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.URL.User = url.User(gopher)
+	c := ts.Client()
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+}
+
+func TestBasicAuth(t *testing.T) {
+	defer afterTest(t)
+	tr := &recordingTransport{}
+	client := &Client{Transport: tr}
+
+	url := "http://My%20User:My%20Pass@dummy.faketld/"
+	expected := "My User:My Pass"
+	client.Get(url)
+
+	if tr.req.Method != "GET" {
+		t.Errorf("got method %q, want %q", tr.req.Method, "GET")
+	}
+	if tr.req.URL.String() != url {
+		t.Errorf("got URL %q, want %q", tr.req.URL.String(), url)
+	}
+	if tr.req.Header == nil {
+		t.Fatalf("expected non-nil request Header")
+	}
+	auth := tr.req.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Basic ") {
+		encoded := auth[6:]
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := string(decoded)
+		if expected != s {
+			t.Errorf("Invalid Authorization header. Got %q, wanted %q", s, expected)
+		}
+	} else {
+		t.Errorf("Invalid auth %q", auth)
+	}
+}
+
+func TestBasicAuthHeadersPreserved(t *testing.T) {
+	defer afterTest(t)
+	tr := &recordingTransport{}
+	client := &Client{Transport: tr}
+
+	// If Authorization header is provided, username in URL should not override it
+	url := "http://My%20User@dummy.faketld/"
+	req, err := NewRequest("GET", url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth("My User", "My Pass")
+	expected := "My User:My Pass"
+	client.Do(req)
+
+	if tr.req.Method != "GET" {
+		t.Errorf("got method %q, want %q", tr.req.Method, "GET")
+	}
+	if tr.req.URL.String() != url {
+		t.Errorf("got URL %q, want %q", tr.req.URL.String(), url)
+	}
+	if tr.req.Header == nil {
+		t.Fatalf("expected non-nil request Header")
+	}
+	auth := tr.req.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Basic ") {
+		encoded := auth[6:]
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := string(decoded)
+		if expected != s {
+			t.Errorf("Invalid Authorization header. Got %q, wanted %q", s, expected)
+		}
+	} else {
+		t.Errorf("Invalid auth %q", auth)
 	}
 }
 

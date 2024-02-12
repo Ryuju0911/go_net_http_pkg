@@ -11,6 +11,7 @@ package http
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -156,7 +157,13 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, d
 		req.Header = make(Header)
 	}
 
-	// TODO: Check authentication
+	if u := req.URL.User; u != nil && req.Header.Get("Authorization") == "" {
+		username := u.Username()
+		password, _ := u.Password()
+		forkReq()
+		req.Header = cloneOrMakeHeader(ireq.Header)
+		req.Header.Set("Authorization", "Basic "+basicAuth(username, password))
+	}
 
 	if !deadline.IsZero() {
 		forkReq()
@@ -294,6 +301,16 @@ func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTi
 	}()
 
 	return stopTimer, timedOut.Load
+}
+
+// See 2 (end of page 4) https://www.ietf.org/rfc/rfc2617.txt
+// "To receive authorization, the client sends the userid and password,
+// separated by a single colon (":") character, within a base64
+// encoded string in the credentials."
+// It is not meant to be urlencoded.
+func basicAuth(username, password string) string {
+	auth := username + ":" + password
+	return base64.StdEncoding.EncodeToString([]byte(auth))
 }
 
 // Get issues a GET to the specified URL. If the response is one of
