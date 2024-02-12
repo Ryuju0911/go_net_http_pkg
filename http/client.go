@@ -253,6 +253,8 @@ func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTi
 	oldCtx := req.Context()
 
 	if req.Cancel == nil && knownTransport {
+		// If they already had a Request.Context that's
+		// expiring sonner, do nothing:
 		if !timeBeforeContextDeadline(deadline, oldCtx) {
 			return nop, alwaysFalse
 		}
@@ -264,7 +266,7 @@ func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTi
 	initialReqCancel := req.Cancel // the user's original Request.Cancel, if any
 
 	var cancelCtx func()
-	if !timeBeforeContextDeadline(deadline, oldCtx) {
+	if timeBeforeContextDeadline(deadline, oldCtx) {
 		req.ctx, cancelCtx = context.WithDeadline(oldCtx, deadline)
 	}
 

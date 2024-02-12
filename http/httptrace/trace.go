@@ -6,7 +6,11 @@
 // HTTP client requests.
 package httptrace
 
-import "context"
+import (
+	"context"
+	"net"
+	"time"
+)
 
 // unique type to prevent assignment.
 type clientEventContextKey struct{}
@@ -29,17 +33,17 @@ func ContextClientTrace(ctx context.Context) *ClientTrace {
 //
 // See https://blog.golang.org/http-tracing for more.
 type ClientTrace struct {
-	// // GetConn is called before a connection is created or
-	// // retrieved from an idle pool. The hostPort is the
-	// // "host:port" of the target or proxy. GetConn is called even
-	// // if there's already an idle cached connection available.
-	// GetConn func(hostPort string)
+	// GetConn is called before a connection is created or
+	// retrieved from an idle pool. The hostPort is the
+	// "host:port" of the target or proxy. GetConn is called even
+	// if there's already an idle cached connection available.
+	GetConn func(hostPort string)
 
-	// // GotConn is called after a successful connection is
-	// // obtained. There is no hook for failure to obtain a
-	// // connection; instead, use the error from
-	// // Transport.RoundTrip.
-	// GotConn func(GotConnInfo)
+	// GotConn is called after a successful connection is
+	// obtained. There is no hook for failure to obtain a
+	// connection; instead, use the error from
+	// Transport.RoundTrip.
+	GotConn func(GotConnInfo)
 
 	// // PutIdleConn is called when the connection is returned to
 	// // the idle pool. If err is nil, the connection was
@@ -112,4 +116,25 @@ type ClientTrace struct {
 	// // request and any body. It may be called multiple times
 	// // in the case of retried requests.
 	// WroteRequest func(WroteRequestInfo)
+}
+
+// GotConnInfo is the argument to the [ClientTrace.GotConn] function and
+// contains information about the obtained connection.
+type GotConnInfo struct {
+	// Conn is the connection that was obtained. It is owned by
+	// the http.Transport and should not be read, written or
+	// closed by users of ClientTrace.
+	Conn net.Conn
+
+	// Reused is whether this connection has been previously
+	// used for another HTTP request.
+	Reused bool
+
+	// WasIdle is whether this connection was obtained from an
+	// idle pool.
+	WasIdle bool
+
+	// IdleTime reports how long the connection was previously
+	// idle, if WasIdle is true.
+	IdleTime time.Duration
 }

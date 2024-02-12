@@ -1028,11 +1028,11 @@ func (q *wantConnQueue) cleanFront() (cleaned bool) {
 // is ready to write requests to.
 func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (pc *persistConn, err error) {
 	req := treq.Request
-	// trace := treq.trace
+	trace := treq.trace
 	ctx := req.Context()
-	// if trace != nil && trace.GetConn != nil {
-	// 	trace.GetConn(cm.addr())
-	// }
+	if trace != nil && trace.GetConn != nil {
+		trace.GetConn(cm.addr())
+	}
 
 	w := &wantConn{
 		cm:    cm,
@@ -1051,11 +1051,11 @@ func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (pc *persi
 	// Queue for idle connection.
 	if delivered := t.queueForIdleConn(w); delivered {
 		pc := w.pc
-		// // Trace only for HTTP/1.
-		// // HTTP/2 calls trace.GotConn itself.
-		// if pc.alt == nil && trace != nil && trace.GotConn != nil {
-		// 	trace.GotConn(pc.gotIdleConnTrace(pc.idleAt))
-		// }
+		// Trace only for HTTP/1.
+		// HTTP/2 calls trace.GotConn itself.
+		if pc.alt == nil && trace != nil && trace.GotConn != nil {
+			trace.GotConn(pc.gotIdleConnTrace(pc.idleAt))
+		}
 		// set request canceler to some non-nil function so we
 		// can detect whether it was cleared between now and when
 		// we enter roundTrip
@@ -1072,11 +1072,11 @@ func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (pc *persi
 	// Wait for completion or cancellation.
 	select {
 	case <-w.ready:
-		// // Trace success but only for HTTP/1.
-		// // HTTP/2 calls trace.GotConn itself.
-		// if w.pc != nil && w.pc.alt == nil && trace != nil && trace.GotConn != nil {
-		// 	trace.GotConn(httptrace.GotConnInfo{Conn: w.pc.conn, Reused: w.pc.isReused()})
-		// }
+		// Trace success but only for HTTP/1.
+		// HTTP/2 calls trace.GotConn itself.
+		if w.pc != nil && w.pc.alt == nil && trace != nil && trace.GotConn != nil {
+			trace.GotConn(httptrace.GotConnInfo{Conn: w.pc.conn, Reused: w.pc.isReused()})
+		}
 		if w.err != nil {
 			// If the request has been canceled, that's probably
 			// what caused w.err; if so, prefer to return the
@@ -1436,6 +1436,26 @@ func (pc *persistConn) canceled() error {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	return pc.canceledErr
+}
+
+// isReused reports whether this connection has been used before.
+func (pc *persistConn) isReused() bool {
+	pc.mu.Lock()
+	r := pc.reused
+	pc.mu.Unlock()
+	return r
+}
+
+func (pc *persistConn) gotIdleConnTrace(idleAt time.Time) (t httptrace.GotConnInfo) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	t.Reused = pc.reused
+	t.Conn = pc.conn
+	t.WasIdle = true
+	if !idleAt.IsZero() {
+		t.IdleTime = time.Since(idleAt)
+	}
+	return
 }
 
 func (pc *persistConn) cancelRequest(err error) {
