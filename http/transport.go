@@ -308,9 +308,9 @@ func (t *Transport) readBufferSize() int {
 // optional extra headers to write and stores any error to return
 // from roundTrip.
 type transportRequest struct {
-	*Request        // original request, not to be mutated
-	extra    Header // extra headers to write, or nil
-	// 	trace     *httptrace.ClientTrace // optional
+	*Request                         // original request, not to be mutated
+	extra     Header                 // extra headers to write, or nil
+	trace     *httptrace.ClientTrace // optional
 	cancelKey cancelKey
 
 	mu  sync.Mutex // guards err
@@ -336,7 +336,7 @@ func (tr *transportRequest) setError(err error) {
 func (t *Transport) roundTrip(req *Request) (*Response, error) {
 	// t.nextProtoOnce.Do(t.onceSetNextProtoDefaults)
 	ctx := req.Context()
-	// trace := httptrace.ContextClientTrace(ctx)
+	trace := httptrace.ContextClientTrace(ctx)
 
 	if req.URL == nil {
 		req.closeBody()
@@ -398,9 +398,9 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 			return nil, ctx.Err()
 		default:
 		}
+
 		// treq gets modified by roundTrip, so we need to recreate for each retry.
-		// treq := &transportRequest{Request: req, trace: trace, cancelKey: cancelKey}
-		treq := &transportRequest{Request: req, cancelKey: cancelKey}
+		treq := &transportRequest{Request: req, trace: trace, cancelKey: cancelKey}
 		cm, err := t.connectMethodForRequst(treq)
 		if err != nil {
 			req.closeBody()
@@ -450,13 +450,15 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 		// 	}
 		// 	testHookRoundTripRetried()
 
-		// 	// Rewind the body if we're able to.
-		// 	req, err = rewindBody(req)
-		// 	if err != nil {
-		// 		return nil, err
-		// 	}
+		// Rewind the body if we're able to.
+		req, err = rewindBody(req)
+		if err != nil {
+			return nil, err
+		}
 	}
 }
+
+var errCannotRewind = errors.New("net/http: cannot rewind body after connection loss")
 
 type readTrackingBody struct {
 	io.ReadCloser
@@ -485,6 +487,29 @@ func setupRewindBody(req *Request) *Request {
 	newReq := *req
 	newReq.Body = &readTrackingBody{ReadCloser: req.Body}
 	return &newReq
+}
+
+// rewindBody returns a new request with the body rewound.
+// It returns req unmodified if the body does not need rewinding.
+// rewindBody takes care of closing req.Body when appropriate
+// (in all cases except when rewindBody returns req unmodified).
+func rewindBody(req *Request) (rewound *Request, err error) {
+	if req.Body == nil || req.Body == NoBody || (!req.Body.(*readTrackingBody).didRead && !req.Body.(*readTrackingBody).didClose) {
+		return req, nil // nothing to rewind
+	}
+	if !req.Body.(*readTrackingBody).didClose {
+		req.closeBody()
+	}
+	if req.GetBody == nil {
+		return nil, errCannotRewind
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return nil, err
+	}
+	newReq := *req
+	newReq.Body = &readTrackingBody{ReadCloser: body}
+	return &newReq, nil
 }
 
 // CloseIdleConnections closes any connections which were previously

@@ -6,6 +6,18 @@
 // HTTP client requests.
 package httptrace
 
+import "context"
+
+// unique type to prevent assignment.
+type clientEventContextKey struct{}
+
+// ContextClientTrace returns the [ClientTrace] associated with the
+// provided context. If none, it returns nil.
+func ContextClientTrace(ctx context.Context) *ClientTrace {
+	trace, _ := ctx.Value(clientEventContextKey{}).(*ClientTrace)
+	return trace
+}
+
 // ClientTrace is a set of hooks to run at various stages of an outgoing
 // HTTP request. Any particular hook may be nil. Functions may be
 // called concurrently from different goroutines and some may be called
