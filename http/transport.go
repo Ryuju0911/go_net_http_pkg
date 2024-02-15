@@ -19,6 +19,7 @@ import (
 	"log"
 	"net"
 	"net/http/httptrace"
+	"net/textproto"
 	"net/url"
 	"sync"
 	"time"
@@ -1221,6 +1222,7 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 		writeErrCh:    make(chan error, 1),
 		writeLoopDone: make(chan struct{}),
 	}
+	// trace := httptrace.ContextClientTrace(ctx)
 	wrapErr := func(err error) error {
 		if cm.proxyURL != nil {
 			// Return a typed error, per Issue 16997
@@ -1550,10 +1552,16 @@ func (pc *persistConn) readLoop() {
 		pc.t.removeIdleConn(pc)
 	}()
 
-	tryPutIdleConn := func() bool {
+	tryPutIdleConn := func(trace *httptrace.ClientTrace) bool {
 		if err := pc.t.tryPutIdleConn(pc); err != nil {
 			closeErr = err
+			if trace != nil && trace.PutIdleConn != nil && err != errKeepAlivesDisabled {
+				trace.PutIdleConn(err)
+			}
 			return false
+		}
+		if trace != nil && trace.PutIdleConn != nil {
+			trace.PutIdleConn(nil)
 		}
 		return true
 	}
@@ -1583,11 +1591,11 @@ func (pc *persistConn) readLoop() {
 		pc.mu.Unlock()
 
 		rc := <-pc.reqch
-		// trace := httptrace.ContextClientTrace(rc.req.Context())
+		trace := httptrace.ContextClientTrace(rc.req.Context())
 
 		var resp *Response
 		if err == nil {
-			resp, err = pc.readResponse(rc, nil)
+			resp, err = pc.readResponse(rc, trace)
 		} else {
 			err = transportReadFromServerError{err}
 			closeErr = err
@@ -1632,7 +1640,7 @@ func (pc *persistConn) readLoop() {
 			alive = alive &&
 				!pc.sawEOF &&
 				pc.wroteRequest() &&
-				replaced && tryPutIdleConn()
+				replaced && tryPutIdleConn(trace)
 
 			if bodyWritable {
 				closeErr = errCallerOwnsConn
@@ -1698,7 +1706,7 @@ func (pc *persistConn) readLoop() {
 				bodyEOF &&
 				!pc.sawEOF &&
 				pc.wroteRequest() &&
-				replaced && tryPutIdleConn()
+				replaced && tryPutIdleConn(trace)
 			if bodyEOF {
 				eofc <- struct{}{}
 			}
@@ -1754,11 +1762,11 @@ func is408Message(buf []byte) bool {
 // 100-continue") from the server. It returns the final non-100 one.
 // trace is optional.
 func (pc *persistConn) readResponse(rc requestAndChan, trace *httptrace.ClientTrace) (resp *Response, err error) {
-	// if trace != nil && trace.GotFirstResponseByte != nil {
-	// 	if peek, err := pc.br.Peek(1); err == nil && len(peek) == 1 {
-	// 		trace.GotFirstResponseByte()
-	// 	}
-	// }
+	if trace != nil && trace.GotFirstResponseByte != nil {
+		if peek, err := pc.br.Peek(1); err == nil && len(peek) == 1 {
+			trace.GotFirstResponseByte()
+		}
+	}
 	num1xx := 0               // number of informational 1xx headers received
 	const max1xxResponses = 5 // arbitrary bound on number of informational responses
 
@@ -1771,9 +1779,9 @@ func (pc *persistConn) readResponse(rc requestAndChan, trace *httptrace.ClientTr
 		resCode := resp.StatusCode
 		if continueCh != nil {
 			if resCode == 100 {
-				// if trace != nil && trace.Got100Continue != nil {
-				// 	trace.Got100Continue()
-				// }
+				if trace != nil && trace.Got100Continue != nil {
+					trace.Got100Continue()
+				}
 				continueCh <- struct{}{}
 				continueCh = nil
 			} else if resCode <= 200 {
@@ -1790,11 +1798,11 @@ func (pc *persistConn) readResponse(rc requestAndChan, trace *httptrace.ClientTr
 				return nil, errors.New("net/http: too many 1xx informational responses")
 			}
 			pc.readLimit = pc.maxHeaderResponseSize() // reset the limit
-			// if trace != nil && trace.Got1xxResponse != nil {
-			// 	if err := trace.Got1xxResponse(resCode, textproto.MIMEHeader(resp.Header)); err != nil {
-			// 		return nil, err
-			// 	}
-			// }
+			if trace != nil && trace.Got1xxResponse != nil {
+				if err := trace.Got1xxResponse(resCode, textproto.MIMEHeader(resp.Header)); err != nil {
+					return nil, err
+				}
+			}
 			continue
 		}
 		break

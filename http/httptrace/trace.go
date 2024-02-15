@@ -9,6 +9,7 @@ package httptrace
 import (
 	"context"
 	"net"
+	"net/textproto"
 	"time"
 )
 
@@ -45,29 +46,29 @@ type ClientTrace struct {
 	// Transport.RoundTrip.
 	GotConn func(GotConnInfo)
 
-	// // PutIdleConn is called when the connection is returned to
-	// // the idle pool. If err is nil, the connection was
-	// // successfully returned to the idle pool. If err is non-nil,
-	// // it describes why not. PutIdleConn is not called if
-	// // connection reuse is disabled via Transport.DisableKeepAlives.
-	// // PutIdleConn is called before the caller's Response.Body.Close
-	// // call returns.
-	// // For HTTP/2, this hook is not currently used.
-	// PutIdleConn func(err error)
+	// PutIdleConn is called when the connection is returned to
+	// the idle pool. If err is nil, the connection was
+	// successfully returned to the idle pool. If err is non-nil,
+	// it describes why not. PutIdleConn is not called if
+	// connection reuse is disabled via Transport.DisableKeepAlives.
+	// PutIdleConn is called before the caller's Response.Body.Close
+	// call returns.
+	// For HTTP/2, this hook is not currently used.
+	PutIdleConn func(err error)
 
-	// // GotFirstResponseByte is called when the first byte of the response
-	// // headers is available.
-	// GotFirstResponseByte func()
+	// GotFirstResponseByte is called when the first byte of the response
+	// headers is available.
+	GotFirstResponseByte func()
 
-	// // Got100Continue is called if the server replies with a "100
-	// // Continue" response.
-	// Got100Continue func()
+	// Got100Continue is called if the server replies with a "100
+	// Continue" response.
+	Got100Continue func()
 
-	// // Got1xxResponse is called for each 1xx informational response header
-	// // returned before the final non-1xx response. Got1xxResponse is called
-	// // for "100 Continue" responses, even if Got100Continue is also defined.
-	// // If it returns an error, the client request is aborted with that error value.
-	// Got1xxResponse func(code int, header textproto.MIMEHeader) error
+	// Got1xxResponse is called for each 1xx informational response header
+	// returned before the final non-1xx response. Got1xxResponse is called
+	// for "100 Continue" responses, even if Got100Continue is also defined.
+	// If it returns an error, the client request is aborted with that error value.
+	Got1xxResponse func(code int, header textproto.MIMEHeader) error
 
 	// // DNSStart is called when a DNS lookup begins.
 	// DNSStart func(DNSStartInfo)
