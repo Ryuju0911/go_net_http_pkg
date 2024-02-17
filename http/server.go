@@ -125,6 +125,82 @@ type ResponseWriter interface {
 	WriteHeader(statusCode int)
 }
 
+// The Flusher interface is implemented by ResponseWriters that allow
+// an HTTP handler to flush buffered data to the client.
+//
+// The default HTTP/1.x and HTTP/2 [ResponseWriter] implementations
+// support [Flusher], but ResponseWriter wrappers may not. Handlers
+// should always test for this ability at runtime.
+//
+// Note that even for ResponseWriters that support Flush,
+// if the client is connected through an HTTP proxy,
+// the buffered data may not reach the client until the response
+// completes.
+type Flusher interface {
+	// Flush sends any buffered data to the client.
+	Flush()
+}
+
+// The Hijacker interface is implemented by ResponseWriters that allow
+// an HTTP handler to take over the connection.
+//
+// The default [ResponseWriter] for HTTP/1.x connections supports
+// Hijacker, but HTTP/2 connections intentionally do not.
+// ResponseWriter wrappers may also not support Hijacker. Handlers
+// should always test for this ability at runtime.
+type Hijacker interface {
+	// Hijack lets the caller take over the connection.
+	// After a call to Hijack the HTTP server library
+	// will not do anything else with the connection.
+	//
+	// It becomes the caller's responsibility to manage
+	// and close the connection.
+	//
+	// The returned net.Conn may have read or write deadlines
+	// already set, depending on the configuration of the
+	// Server. It is the caller's responsibility to set
+	// or clear those deadlines as needed.
+	//
+	// The returned bufio.Reader may contain unprocessed buffered
+	// data from the client.
+	//
+	// After a call to Hijack, the original Request.Body must not
+	// be used. The original Request's Context remains valid and
+	// is not canceled until the Request's ServeHTTP method
+	// returns.
+	Hijack() (net.Conn, *bufio.ReadWriter, error)
+}
+
+// The CloseNotifier interface is implemented by ResponseWriters which
+// allow detecting when the underlying connection has gone away.
+//
+// This mechanism can be used to cancel long operations on the server
+// if the client has disconnected before the response is ready.
+//
+// Deprecated: the CloseNotifier interface predates Go's context package.
+// New code should use [Request.Context] instead.
+type CloseNotifier interface {
+	// CloseNotify returns a channel that receives at most a
+	// single value (true) when the client connection has gone
+	// away.
+	//
+	// CloseNotify may wait to notify until Request.Body has been
+	// fully read.
+	//
+	// After the Handler has returned, there is no guarantee
+	// that the channel receives a value.
+	//
+	// If the protocol is HTTP/1.1 and CloseNotify is called while
+	// processing an idempotent request (such a GET) while
+	// HTTP/1.1 pipelining is in use, the arrival of a subsequent
+	// pipelined request may cause a value to be sent on the
+	// returned channel. In practice HTTP/1.1 pipelining is not
+	// enabled in browsers and not seen often in the wild. If this
+	// is a problem, use HTTP/2 or only use CloseNotify on methods
+	// such as POST.
+	CloseNotify() <-chan bool
+}
+
 var (
 	// ServerContextKey is a context key. It can be used in HTTP
 	// handlers with Context.Value to access the server that
@@ -197,6 +273,27 @@ func (c *conn) hijacked() bool {
 	return c.hijackedv
 }
 
+// c.mu must be held.
+func (c *conn) hijackLocked() (rwc net.Conn, buf *bufio.ReadWriter, err error) {
+	if c.hijackedv {
+		return nil, nil, ErrHijacked
+	}
+	c.r.abortPendingRead()
+
+	c.hijackedv = true
+	rwc = c.rwc
+	rwc.SetDeadline(time.Time{})
+
+	buf = bufio.NewReadWriter(c.bufr, bufio.NewWriter(rwc))
+	if c.r.hasByte {
+		if _, err := c.bufr.Peek(c.bufr.Buffered() + 1); err != nil {
+			return nil, nil, fmt.Errorf("unexpected Peek failure reading buffered byte: %v", err)
+		}
+	}
+	c.setState(rwc, StateHijacked, runHooks)
+	return
+}
+
 // This should be >= 512 bytes for DetectContentType,
 // but otherwise it's somewhat arbitrary.
 const bufferBeforeChunkingSize = 2048
@@ -247,6 +344,13 @@ func (cw *chunkWriter) Write(p []byte) (n int, err error) {
 		cw.res.conn.rwc.Close()
 	}
 	return
+}
+
+func (cw *chunkWriter) flush() error {
+	if !cw.wroteHeader {
+		cw.writeHeader(nil)
+	}
+	return cw.res.conn.bufw.Flush()
 }
 
 func (cw *chunkWriter) close() {
@@ -532,7 +636,7 @@ func (cr *connReader) handleReadError(_ error) {
 
 func (cr *connReader) closeNotify() {
 	res := cr.conn.curReq.Load()
-	if res != nil && res.didCloseNotify.Swap(true) {
+	if res != nil && !res.didCloseNotify.Swap(true) {
 		res.closeNotifyCh <- true
 	}
 }
@@ -1411,6 +1515,22 @@ func (w *response) closedRequestBodyEarly() bool {
 	return ok && body.didEarlyClose()
 }
 
+func (w *response) Flush() {
+	w.FlushError()
+}
+
+func (w *response) FlushError() error {
+	if !w.wroteHeader {
+		w.WriteHeader(StatusOK)
+	}
+	err := w.w.Flush()
+	e2 := w.cw.flush()
+	if err == nil {
+		err = e2
+	}
+	return err
+}
+
 func (c *conn) finalFlush() {
 	if c.bufr != nil {
 		putBufioReader(c.bufr)
@@ -1660,6 +1780,9 @@ func (c *conn) serve(ctx context.Context) {
 		serverHandler{c.server}.ServeHTTP(w, w.req)
 		inFlightResponse = nil
 		w.cancelCtx()
+		if c.hijacked() {
+			return
+		}
 		w.finishRequest()
 		c.rwc.SetWriteDeadline(time.Time{})
 		if !w.shouldReuseConnection() {
@@ -1713,6 +1836,37 @@ func (w *response) sendExpectationFailed() {
 	w.Header().Set("Connection", "close")
 	w.WriteHeader(StatusExpectationFailed)
 	w.finishRequest()
+}
+
+// Hijack implements the [Hijacker.Hijack] method. Our response is both a [ResponseWriter]
+// and a [Hijacker].
+func (w *response) Hijack() (rwc net.Conn, buf *bufio.ReadWriter, err error) {
+	if w.handlerDone.Load() {
+		panic("net/http: Hijack called after ServeHTTP finished")
+	}
+	if w.wroteHeader {
+		w.cw.flush()
+	}
+
+	c := w.conn
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Release the bufioWriter that writes to the chunk writer, it is not
+	// used after a connection has been hijacked.
+	rwc, buf, err = c.hijackLocked()
+	if err == nil {
+		putBufioWriter(w.w)
+		w.w = nil
+	}
+	return rwc, buf, err
+}
+
+func (w *response) CloseNotify() <-chan bool {
+	if w.handlerDone.Load() {
+		panic("net/http: CloseNotify called after ServeHTTP finished")
+	}
+	return w.closeNotifyCh
 }
 
 func registerOnHitEOF(rc io.ReadCloser, fn func()) {

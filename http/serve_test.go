@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	. "net/http"
 	"net/http/httptest"
@@ -53,6 +54,7 @@ type noopConn struct{}
 
 func (noopConn) LocalAddr() net.Addr                { return dummyAddr("local-addr") }
 func (noopConn) RemoteAddr() net.Addr               { return dummyAddr("remote-addr") }
+func (noopConn) SetDeadline(t time.Time) error      { return nil }
 func (noopConn) SetReadDeadline(t time.Time) error  { return nil }
 func (noopConn) SetWriteDeadline(t time.Time) error { return nil }
 
@@ -404,6 +406,86 @@ func testServerExpect(t *testing.T, mode testMode) {
 	}
 }
 
+func TestHijackBeforeRequestBodyRead(t *testing.T) {
+	run(t, testHijackBeforeRequestBodyRead, []testMode{http1Mode})
+}
+func testHijackBeforeRequestBodyRead(t *testing.T, mode testMode) {
+	var requestBody = bytes.Repeat([]byte("a"), 1<<20)
+	bodyOkay := make(chan bool, 1)
+	gotCloseNotify := make(chan bool, 1)
+	ts := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		defer close(bodyOkay) // caller will read false if nothing else
+
+		reqBody := r.Body
+		r.Body = nil // to test that server.go doesn't use this value.
+
+		gone := w.(CloseNotifier).CloseNotify()
+		slurp, err := io.ReadAll(reqBody)
+		if err != nil {
+			t.Errorf("Body read: %v", err)
+			return
+		}
+		if len(slurp) != len(requestBody) {
+			t.Errorf("Backend read %d request body bytes; want %d", len(slurp), len(requestBody))
+			return
+		}
+		if !bytes.Equal(slurp, requestBody) {
+			t.Error("Backend read wrong request body.") // 1MB; omitting details
+			return
+		}
+		bodyOkay <- true
+		<-gone
+		gotCloseNotify <- true
+	})).ts
+
+	conn, err := net.Dial("tcp", ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "POST / HTTP/1.1\r\nHost: foo\r\nContent-Length: %d\r\n\r\n%s",
+		len(requestBody), requestBody)
+	if !<-bodyOkay {
+		// already failed.
+		return
+	}
+	conn.Close()
+	<-gotCloseNotify
+}
+
+func TestWriteAfterHijack(t *testing.T) {
+	req := reqBytes("GET / HTTP/1.1\nHost: golang.org")
+	var buf strings.Builder
+	wrotec := make(chan bool, 1)
+	conn := &rwTestConn{
+		Reader: bytes.NewReader(req),
+		Writer: &buf,
+		closec: make(chan bool, 1),
+	}
+	handler := HandlerFunc(func(rw ResponseWriter, r *Request) {
+		conn, bufrw, err := rw.(Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		go func() {
+			bufrw.Write([]byte("[hijack-to-bufw]"))
+			bufrw.Flush()
+			conn.Write([]byte("[hijack-to-conn]"))
+			conn.Close()
+			wrotec <- true
+		}()
+	})
+	ln := &oneConnListener{conn: conn}
+	go Serve(ln, handler)
+	<-conn.closec
+	<-wrotec
+	if g, w := buf.String(), "[hijack-to-bufw][hijack-to-conn]"; g != w {
+		t.Errorf("wrote %q; want %q", g, w)
+	}
+}
+
 func TestIssue11549_Expect100(t *testing.T) {
 	req := reqBytes(`PUT /readbody HTTP/1.1
 User-Agent: PycURL/7.22.0
@@ -535,5 +617,126 @@ func runTimeSensitiveTest(t *testing.T, durations []time.Duration, test func(t *
 			t.Fatalf("failed with duration %v: %v", d, err)
 		}
 		t.Logf("retrying after error with duration %v: %v", d, err)
+	}
+}
+
+func TestDisableKeepAliveUpgrade(t *testing.T) {
+	run(t, testDisableKeepAliveUpgrade, []testMode{http1Mode})
+}
+func testDisableKeepAliveUpgrade(t *testing.T, mode testMode) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	s := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		w.Header().Set("Connection", "Upgrade")
+		w.Header().Set("Upgrade", "someProto")
+		w.WriteHeader(StatusSwitchingProtocols)
+		c, buf, err := w.(Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+
+		// Copy from the *bufio.ReadWriter, which may contain buffered data.
+		// Copy to the net.Conn, to avoid buffering the output.
+		io.Copy(c, buf)
+	}), func(ts *httptest.Server) {
+		ts.Config.SetKeepAlivesEnabled(false)
+	}).ts
+
+	cl := s.Client()
+	cl.Transport.(*Transport).DisableKeepAlives = true
+
+	resp, err := cl.Get(s.URL)
+	if err != nil {
+		t.Fatalf("failed to perform request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != StatusSwitchingProtocols {
+		t.Fatalf("unexpected status code: %v", resp.StatusCode)
+	}
+
+	rwc, ok := resp.Body.(io.ReadWriteCloser)
+	if !ok {
+		t.Fatalf("Response.Body is not an io.ReadWriteCloser: %T", resp.Body)
+	}
+
+	_, err = rwc.Write([]byte("hello"))
+	if err != nil {
+		t.Fatalf("failed to write to body: %v", err)
+	}
+
+	b := make([]byte, 5)
+	_, err = io.ReadFull(rwc, b)
+	if err != nil {
+		t.Fatalf("failed to read from body: %v", err)
+	}
+
+	if string(b) != "hello" {
+		t.Fatalf("unexpected value read from body:\ngot: %q\nwant: %q", b, "hello")
+	}
+}
+
+func TestWriteHeaderSwitchingProtocols(t *testing.T) {
+	run(t, testWriteHeaderSwitchingProtocols, []testMode{http1Mode})
+}
+func testWriteHeaderSwitchingProtocols(t *testing.T, mode testMode) {
+	const wantBody = "want"
+	const wantUpgrade = "someProto"
+	ts := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		w.Header().Set("Connection", "Upgrade")
+		w.Header().Set("Upgrade", wantUpgrade)
+		w.WriteHeader(StatusSwitchingProtocols)
+		NewResponseController(w).Flush()
+
+		// Writing headers or the body after sending a 101 header should fail.
+		w.WriteHeader(200)
+		if _, err := w.Write([]byte("x")); err == nil {
+			t.Errorf("Write to body after 101 Switching Protocols unexpectedly succeeded")
+		}
+
+		c, _, err := NewResponseController(w).Hijack()
+		if err != nil {
+			t.Errorf("Hijack: %v", err)
+			return
+		}
+		defer c.Close()
+		if _, err := c.Write([]byte(wantBody)); err != nil {
+			t.Errorf("Write to hijacked body: %v", err)
+		}
+	}), func(ts *httptest.Server) {
+		// Don't spam log with warning about superfluous WriteHeader call.
+		ts.Config.ErrorLog = log.New(testLogWriter{t}, "log: ", 0)
+	}).ts
+
+	conn, err := net.Dial("tcp", ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("net.Dial: %v", err)
+	}
+	_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: foo\r\n\r\n"))
+	if err != nil {
+		t.Fatalf("conn.Write: %v", err)
+	}
+	defer conn.Close()
+
+	r := bufio.NewReader(conn)
+	res, err := ReadResponse(r, &Request{Method: "GET"})
+	if err != nil {
+		t.Fatal("ReadResponse error:", err)
+	}
+	if res.StatusCode != StatusSwitchingProtocols {
+		t.Errorf("Response StatusCode=%v, want 101", res.StatusCode)
+	}
+	if got := res.Header.Get("Upgrade"); got != wantUpgrade {
+		t.Errorf("Response Upgrade header = %q, want %q", got, wantUpgrade)
+	}
+	body, err := io.ReadAll(r)
+	if err != nil {
+		t.Error(err)
+	}
+	if string(body) != wantBody {
+		t.Errorf("Response body = %q, want %q", string(body), wantBody)
 	}
 }

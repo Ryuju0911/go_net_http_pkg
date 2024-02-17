@@ -42,6 +42,10 @@ func (fd *netFD) Write(p []byte) (nn int, err error) {
 	return nn, wrapSyscallError(writeSyscallName, err)
 }
 
+func (fd *netFD) SetDeadline(t time.Time) error {
+	return fd.pfd.SetDeadline(t)
+}
+
 func (fd *netFD) SetReadDeadline(t time.Time) error {
 	return fd.pfd.SetReadDeadline(t)
 }
