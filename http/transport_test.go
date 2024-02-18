@@ -10,8 +10,11 @@
 package http_test
 
 import (
+	"bufio"
+	"fmt"
 	"io"
 	. "net/http"
+	"strings"
 	"testing"
 )
 
@@ -129,5 +132,79 @@ func testTransportMaxPerHostIdleConns(t *testing.T, mode testMode) {
 	<-donech
 	if g, w := tr.IdleConnCountForTesting("http", addr), maxIdleConnsPerHost; g != w {
 		t.Errorf("after third response, idle conns = %d; want %d", g, w)
+	}
+}
+
+// Issue 26161: the HTTP client must treat 101 responses
+// as the final response.
+func TestTransportTreat101Terminal(t *testing.T) {
+	run(t, testTransportTreat101Terminal, []testMode{http1Mode})
+}
+func testTransportTreat101Terminal(t *testing.T, mode testMode) {
+	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		conn, buf, _ := w.(Hijacker).Hijack()
+		buf.Write([]byte("HTTP/1.1 101 Switching Protocols\r\n\r\n"))
+		buf.Write([]byte("HTTP/1.1 204 No Content\r\n\r\n"))
+		buf.Flush()
+		conn.Close()
+	}))
+	res, err := cst.c.Get(cst.ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != StatusSwitchingProtocols {
+		t.Errorf("StatusCode = %v; want 101 Switching Protocols", res.StatusCode)
+	}
+}
+
+func TestTransportResponseBodyWritableOnProtocolSwitch(t *testing.T) {
+	run(t, testTransportResponseBodyWritableOnProtocolSwitch, []testMode{http1Mode})
+}
+func testTransportResponseBodyWritableOnProtocolSwitch(t *testing.T, mode testMode) {
+	done := make(chan struct{})
+	defer close(done)
+	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		conn, _, err := w.(Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		io.WriteString(conn, "HTTP/1.1 101 Switching Protocols Hi\r\nConnection: upgRADe\r\nUpgrade: foo\r\n\r\nSome buffered data\n")
+		bs := bufio.NewScanner(conn)
+		bs.Scan()
+		fmt.Fprintf(conn, "%s\n", strings.ToUpper(bs.Text()))
+		<-done
+	}))
+
+	req, _ := NewRequest("GET", cst.ts.URL, nil)
+	req.Header.Set("Upgrade", "foo")
+	req.Header.Set("Connection", "upgrade")
+	res, err := cst.c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != 101 {
+		t.Fatalf("expected 101 switching protocols; got %v, %v", res.Status, res.Header)
+	}
+	rwc, ok := res.Body.(io.ReadWriteCloser)
+	if !ok {
+		t.Fatalf("expected a ReadWriteCloser; got a %T", res.Body)
+	}
+	defer rwc.Close()
+	bs := bufio.NewScanner(rwc)
+	if !bs.Scan() {
+		t.Fatalf("expected readable input")
+	}
+	if got, want := bs.Text(), "Some buffered data"; got != want {
+		t.Errorf("read %q; want %q", got, want)
+	}
+	io.WriteString(rwc, "echo\n")
+	if !bs.Scan() {
+		t.Fatalf("expected another line")
+	}
+	if got, want := bs.Text(), "ECHO"; got != want {
+		t.Errorf("read %q; want %q", got, want)
 	}
 }
