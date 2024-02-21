@@ -75,14 +75,14 @@ type Response struct {
 	// ReadResponse nor Response.Write ever closes a connection.
 	Close bool
 
-	// // Uncompressed reports whether the response was sent compressed but
-	// // was decompressed by the http package. When true, reading from
-	// // Body yields the uncompressed content instead of the compressed
-	// // content actually set from the server, ContentLength is set to -1,
-	// // and the "Content-Length" and "Content-Encoding" fields are deleted
-	// // from the responseHeader. To get the original response from
-	// // the server, set Transport.DisableCompression to true.
-	// Uncompressed bool
+	// Uncompressed reports whether the response was sent compressed but
+	// was decompressed by the http package. When true, reading from
+	// Body yields the uncompressed content instead of the compressed
+	// content actually set from the server, ContentLength is set to -1,
+	// and the "Content-Length" and "Content-Encoding" fields are deleted
+	// from the responseHeader. To get the original response from
+	// the server, set Transport.DisableCompression to true.
+	Uncompressed bool
 
 	// Trailer maps trailer keys to values in the same
 	// format as Header.
@@ -111,8 +111,8 @@ type Response struct {
 }
 
 // ReadResponse reads and returns an HTTP response from r.
-// The req parameter optionally specifies the Request that corresponds
-// to this Response. If nil, a GET request is assumed.
+// The req parameter optionally specifies the [Request] that corresponds
+// to this [Response]. If nil, a GET request is assumed.
 // Clients must call resp.Body.Close when finished reading resp.Body.
 // After that call, clients can inspect resp.Trailer to find key/value
 // pairs included in the response trailer.
@@ -137,7 +137,7 @@ func ReadResponse(r *bufio.Reader, req *Request) (*Response, error) {
 	resp.Proto = proto
 	resp.Status = strings.TrimLeft(status, " ")
 
-	statusCode, _, _ := strings.Cut(status, " ")
+	statusCode, _, _ := strings.Cut(resp.Status, " ")
 	if len(statusCode) != 3 {
 		return nil, badStringError("malformed HTTP status code", statusCode)
 	}

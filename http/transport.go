@@ -11,6 +11,7 @@ package http
 
 import (
 	"bufio"
+	"compress/gzip"
 	"container/list"
 	"context"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"log"
 	"net"
 	"net/http/httptrace"
+	"net/http/internal/ascii"
 	"net/textproto"
 	"net/url"
 	"sync"
@@ -180,15 +182,15 @@ type Transport struct {
 	// This is unrelated to the similarly named TCP keep-alives.
 	DisableKeepAlives bool
 
-	// // DisableCompression, if true, prevents the Transport from
-	// // requesting compression with an "Accept-Encoding: gzip"
-	// // request header when the Request contains no existing
-	// // Accept-Encoding value. If the Transport requests gzip on
-	// // its own and gets a gzipped response, it's transparently
-	// // decoded in the Response.Body. However, if the user
-	// // explicitly requested gzip it is not automatically
-	// // uncompressed.
-	// DisableCompression bool
+	// DisableCompression, if true, prevents the Transport from
+	// requesting compression with an "Accept-Encoding: gzip"
+	// request header when the Request contains no existing
+	// Accept-Encoding value. If the Transport requests gzip on
+	// its own and gets a gzipped response, it's transparently
+	// decoded in the Response.Body. However, if the user
+	// explicitly requested gzip it is not automatically
+	// uncompressed.
+	DisableCompression bool
 
 	// MaxIdleConns controls the maximum number of idle (keep-alive)
 	// connections across all hosts. Zero means no limit.
@@ -1664,8 +1666,9 @@ func (pc *persistConn) readLoop() {
 			body: resp.Body,
 			earlyCloseFn: func() error {
 				waitForBodyRead <- false
-				<-eofc // will be closed by deferre call at the end of the function
+				<-eofc // will be closed by deferred call at the end of the function
 				return nil
+
 			},
 			fn: func(err error) error {
 				isEOF := err == io.EOF
@@ -1682,13 +1685,13 @@ func (pc *persistConn) readLoop() {
 		}
 
 		resp.Body = body
-		// if rc.addedGzip && ascii.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-		// 	resp.Body = &gzipReader{body: body}
-		// 	resp.Header.Del("Content-Encoding")
-		// 	resp.Header.Del("Content-Length")
-		// 	resp.ContentLength = -1
-		// 	resp.Uncompressed = true
-		// }
+		if rc.addedGzip && ascii.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+			resp.Body = &gzipReader{body: body}
+			resp.Header.Del("Content-Encoding")
+			resp.Header.Del("Content-Length")
+			resp.ContentLength = -1
+			resp.Uncompressed = true
+		}
 
 		select {
 		case rc.ch <- responseAndError{res: resp}:
@@ -1784,7 +1787,7 @@ func (pc *persistConn) readResponse(rc requestAndChan, trace *httptrace.ClientTr
 				}
 				continueCh <- struct{}{}
 				continueCh = nil
-			} else if resCode <= 200 {
+			} else if resCode >= 200 {
 				close(continueCh)
 				continueCh = nil
 			}
@@ -1909,6 +1912,231 @@ func (pc *persistConn) writeLoop() {
 			}
 		case <-pc.closech:
 			return
+		}
+	}
+}
+
+// maxWriteWaitBeforeConnReuse is how long the a Transport RoundTrip
+// will wait to see the Request's Body.Write result after getting a
+// response from the server. See comments in (*persistConn).wroteRequest.
+//
+// In tests, we set this to a large value to avoid flakiness from inconsistent
+// recycling of connections.
+var maxWriteWaitBeforeConnReuse = 50 * time.Millisecond
+
+// wroteRequest is a check before recycling a connection that the previous write
+// (from writeLoop above) happened and was successful.
+func (pc *persistConn) wroteRequest() bool {
+	select {
+	case err := <-pc.writeErrCh:
+		return err == nil
+	default:
+		t := time.NewTimer(maxWriteWaitBeforeConnReuse)
+		defer t.Stop()
+		select {
+		case err := <-pc.writeErrCh:
+			return err == nil
+		case <-t.C:
+			return false
+		}
+	}
+}
+
+// responseAndError is how the goroutine reading from an HTTP/1 server
+// communicates with the goroutine doing the RoundTrip.
+type responseAndError struct {
+	_   incomparable
+	res *Response // else use this response (see res method)
+	err error
+}
+
+type requestAndChan struct {
+	_         incomparable
+	req       *Request
+	cancelKey cancelKey
+	ch        chan responseAndError // unbuffered; always send in select on callerGone
+
+	// whether the Transport (as opposed to the user client code)
+	// added the Accept-Encoding gzip header. If the Transport
+	// set it, only then do we transparently decode the gzip.
+	addedGzip bool
+
+	// Optional blocking chan for Expect: 100-continue (for send).
+	// If the request has an "Expect: 100-continue" header and
+	// the server responds 100 Continue, readLoop send a value
+	// to writeLoop via this chan.
+	continueCh chan<- struct{}
+
+	callerGone <-chan struct{} // closed when roundTrip caller has returned
+}
+
+// A writeRequest is sent by the caller's goroutine to the
+// writeLoop's goroutine to write a request while the read loop
+// concurrently waits on both the write response and the server's
+// reply.
+type writeRequest struct {
+	req *transportRequest
+	ch  chan<- error
+
+	// Optional blocking chan for Expect: 100-continue (for receive).
+	// If not nil, writeLoop blocks sending request body until
+	// it receives from this chan.
+	continueCh <-chan struct{}
+}
+
+type httpError struct {
+	err     string
+	timeout bool
+}
+
+func (e *httpError) Error() string   { return e.err }
+func (e *httpError) Timeout() bool   { return e.timeout }
+func (e *httpError) Temporary() bool { return true }
+
+var errTimeout error = &httpError{err: "net/http: timeout awaiting response headers", timeout: true}
+
+// errRequestCanceled is set to be identical to the one from h2 to facilitate
+// testing.
+var errRequestCanceled = errors.New("net/http: request canceled")
+var errRequestCanceledConn = errors.New("net/http: request canceled while waiting for connection") // TODO: unify?
+
+func nop() {}
+
+func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
+	// testHookEnterRoundTrip()
+	if !pc.t.replaceReqCanceler(req.cancelKey, pc.cancelRequest) {
+		pc.t.putOrCloseIdleConn(pc)
+		return nil, errRequestCanceled
+	}
+	pc.mu.Lock()
+	pc.numExpectedResponses++
+	headerFn := pc.mutateHeaderFunc
+	pc.mu.Unlock()
+
+	if headerFn != nil {
+		headerFn(req.extraHeaders())
+	}
+
+	// Ask for a compressed version if the caller didn't set their
+	// own value for Accept-Encoding. We only attempt to
+	// uncompress the gzip stream if we were the layer that
+	// requested it.
+	requestedGzip := false
+	if !pc.t.DisableCompression &&
+		req.Header.Get("Accept-Encoding") == "" &&
+		req.Header.Get("Range") == "" &&
+		req.Method != "HEAD" {
+		// Request gzip only, not deflate. Deflate is ambiguous and
+		// not as universally supported anyway.
+		// See: https://zlib.net/zlib_faq.html#faq39
+		//
+		// Note that we don't request this for HEAD requests,
+		// due to a bug in nginx:
+		//   https://trac.nginx.org/nginx/ticket/358
+		//   https://golang.org/issue/5522
+		//
+		// We don't request gzip if the request is for a range, since
+		// auto-decoding a portion of a gzipped document will just fail
+		// anyway. See https://golang.org/issue/8923
+		requestedGzip = true
+		req.extraHeaders().Set("Accept-Encoding", "gzip")
+	}
+
+	var continueCh chan struct{}
+	if req.ProtoAtLeast(1, 1) && req.Body != nil && req.expectsContinue() {
+		continueCh = make(chan struct{}, 1)
+	}
+
+	if pc.t.DisableKeepAlives &&
+		!req.wantsClose() &&
+		!isProtocolSwitchHeader(req.Header) {
+		req.extraHeaders().Set("Connection", "close")
+	}
+
+	gone := make(chan struct{})
+	defer close(gone)
+
+	defer func() {
+		if err != nil {
+			pc.t.setReqCanceler(req.cancelKey, nil)
+		}
+	}()
+
+	// const debugRoundTrip = false
+
+	// Write the request concurrently with waiting for a response,
+	// in case the server decides to reply before reading our full
+	// request body.
+	startBytesWritten := pc.nwrite
+	writeErrCh := make(chan error, 1)
+	pc.writech <- writeRequest{req, writeErrCh, continueCh}
+
+	resc := make(chan responseAndError)
+	pc.reqch <- requestAndChan{
+		req:        req.Request,
+		cancelKey:  req.cancelKey,
+		ch:         resc,
+		addedGzip:  requestedGzip,
+		continueCh: continueCh,
+		callerGone: gone,
+	}
+
+	var respHeaderTimer <-chan time.Time
+	cancelChan := req.Request.Cancel
+	ctxDoneChan := req.Context().Done()
+	pcClosed := pc.closech
+	canceled := false
+	for {
+		// testHookWaitResLoop()
+		select {
+		case err := <-writeErrCh:
+			// if debugRoundTrip {
+			// 	req.logf("writeErrCh resv: %T/%#v", err, err)
+			// }
+			if err != nil {
+				pc.close(fmt.Errorf("write error: %w", err))
+				return nil, pc.mapRoundTripError(req, startBytesWritten, err)
+			}
+			if d := pc.t.ResponseHeaderTimeout; d > 0 {
+				// if debugRoundTrip {
+				// 	req.logf("starting timer for %v", d)
+				// }
+				timer := time.NewTimer(d)
+				defer timer.Stop() // prevent leaks
+				respHeaderTimer = timer.C
+			}
+		case <-pcClosed:
+			pcClosed = nil
+			if canceled || pc.t.replaceReqCanceler(req.cancelKey, nil) {
+				// if debugRoundTrip {
+				// 	req.logf("closech recv: %T %#v", pc.closed, pc.closed)
+				// }
+				return nil, pc.mapRoundTripError(req, startBytesWritten, pc.closed)
+			}
+		case <-respHeaderTimer:
+			// if debugRoundTrip {
+			// 	req.logf("timeout waiting for response headers.")
+			// }
+			pc.close(errTimeout)
+			return nil, errTimeout
+		case re := <-resc:
+			if (re.res == nil) == (re.err == nil) {
+				panic(fmt.Sprintf("internal error: exactly one of res or err should be set; nil=%v", re.res == nil))
+			}
+			// if debugRoundTrip {
+			// 	req.logf("resc recv: %p, %T/%#v", re.res, re.err, re.err)
+			// }
+			if re.err != nil {
+				return nil, pc.mapRoundTripError(req, startBytesWritten, re.err)
+			}
+			return re.res, nil
+		case <-cancelChan:
+			canceled = pc.t.cancelRequest(req.cancelKey, errRequestCanceled)
+			cancelChan = nil
+		case <-ctxDoneChan:
+			canceled = pc.t.cancelRequest(req.cancelKey, req.Context().Err())
+			cancelChan = nil
+			ctxDoneChan = nil
 		}
 	}
 }
@@ -2042,229 +2270,39 @@ func (es *bodyEOFSignal) condfn(err error) error {
 	return err
 }
 
-// maxWriteWaitBeforeConnReuse is how long the a Transport RoundTrip
-// will wait to see the Request's Body.Write result after getting a
-// response from the server. See comments in (*persistConn).wroteRequest.
-//
-// In tests, we set this to a large value to avoid flakiness from inconsistent
-// recycling of connections.
-var maxWriteWaitBeforeConnReuse = 50 * time.Millisecond
+// gzipReader wraps a response body so it can lazily
+// call gzip.NewReader on the first call to Read
+type gzipReader struct {
+	_    incomparable
+	body *bodyEOFSignal // underlying HTTP/1 response body framing
+	zr   *gzip.Reader   // lazily-initialized gzip reader
+	zerr error          // any error from gzip.NewReader; sticky
+}
 
-// wroteRequest is a check before recycling a connection that the previous write
-// (from writeLoop above) happened and was successful.
-func (pc *persistConn) wroteRequest() bool {
-	select {
-	case err := <-pc.writeErrCh:
-		return err == nil
-	default:
-		t := time.NewTimer(maxWriteWaitBeforeConnReuse)
-		defer t.Stop()
-		select {
-		case err := <-pc.writeErrCh:
-			return err == nil
-		case <-t.C:
-			return false
+func (gz *gzipReader) Read(p []byte) (n int, err error) {
+	if gz.zr == nil {
+		if gz.zerr == nil {
+			gz.zr, gz.zerr = gzip.NewReader(gz.body)
+		}
+		if gz.zerr != nil {
+			return 0, gz.zerr
 		}
 	}
+
+	gz.body.mu.Lock()
+	if gz.body.closed {
+		err = errReadOnClosedResBody
+	}
+	gz.body.mu.Unlock()
+
+	if err != nil {
+		return 0, err
+	}
+	return gz.zr.Read(p)
 }
 
-// responseAndError is how the goroutine reading from an HTTP/1 server
-// communicates with the goroutine doing the RoundTrip.
-type responseAndError struct {
-	_   incomparable
-	res *Response // else use this response (see res method)
-	err error
-}
-
-type requestAndChan struct {
-	_         incomparable
-	req       *Request
-	cancelKey cancelKey
-	ch        chan responseAndError // unbuffered; always send in select on callerGone
-
-	// // whether the Transport (as opposed to the user client code)
-	// // added the Accept-Encoding gzip header. If the Transport
-	// // set it, only then do we transparently decode the gzip.
-	// addedGzip bool
-
-	// Optional blocking chan for Expect: 100-continue (for send).
-	// If the request has an "Expect: 100-continue" header and
-	// the server responds 100 Continue, readLoop send a value
-	// to writeLoop via this chan.
-	continueCh chan<- struct{}
-
-	callerGone <-chan struct{} // closed when roundTrip caller has returned
-}
-
-// A writeRequest is sent by the caller's goroutine to the
-// writeLoop's goroutine to write a request while the read loop
-// concurrently waits on both the write response and the server's
-// reply.
-type writeRequest struct {
-	req *transportRequest
-	ch  chan<- error
-
-	// Optional blocking chan for Expect: 100-continue (for receive).
-	// If not nil, writeLoop blocks sending request body until
-	// it receives from this chan.
-	continueCh <-chan struct{}
-}
-
-type httpError struct {
-	err     string
-	timeout bool
-}
-
-func (e *httpError) Error() string   { return e.err }
-func (e *httpError) Timeout() bool   { return e.timeout }
-func (e *httpError) Temporary() bool { return true }
-
-var errTimeout error = &httpError{err: "net/http: timeout awaiting response headers", timeout: true}
-
-// errRequestCanceled is set to be identical to the one from h2 to facilitate
-// testing.
-var errRequestCanceled = errors.New("net/http: request canceled")
-var errRequestCanceledConn = errors.New("net/http: request canceled while waiting for connection") // TODO: unify?
-
-func nop() {}
-
-func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
-	// testHookEnterRoundTrip()
-	if !pc.t.replaceReqCanceler(req.cancelKey, pc.cancelRequest) {
-		pc.t.putOrCloseIdleConn(pc)
-		return nil, errRequestCanceled
-	}
-	pc.mu.Lock()
-	pc.numExpectedResponses++
-	headerFn := pc.mutateHeaderFunc
-	pc.mu.Unlock()
-
-	if headerFn != nil {
-		headerFn(req.extraHeaders())
-	}
-
-	// // Ask for a compressed version if the caller didn't set their
-	// // own value for Accept-Encoding. We only attempt to
-	// // uncompress the gzip stream if we were the layer that
-	// // requested it.
-	// requestedGzip := false
-	// if !pc.t.DisableCompression &&
-	// 	req.Header.Get("Accept-Encoding") == "" &&
-	// 	req.Header.Get("Range") == "" &&
-	// 	req.Method != "HEAD" {
-	// 	// Request gzip only, not deflate. Deflate is ambiguous and
-	// 	// not as universally supported anyway.
-	// 	// See: https://zlib.net/zlib_faq.html#faq39
-	// 	//
-	// 	// Note that we don't request this for HEAD requests,
-	// 	// due to a bug in nginx:
-	// 	//   https://trac.nginx.org/nginx/ticket/358
-	// 	//   https://golang.org/issue/5522
-	// 	//
-	// 	// We don't request gzip if the request is for a range, since
-	// 	// auto-decoding a portion of a gzipped document will just fail
-	// 	// anyway. See https://golang.org/issue/8923
-	// 	requestedGzip = true
-	// 	req.extraHeaders().Set("Accept-Encoding", "gzip")
-	// }
-
-	var continueCh chan struct{}
-	if req.ProtoAtLeast(1, 1) && req.Body != nil && req.expectsContinue() {
-		continueCh = make(chan struct{}, 1)
-	}
-
-	if pc.t.DisableKeepAlives &&
-		!req.wantsClose() &&
-		!isProtocolSwitchHeader(req.Header) {
-		req.extraHeaders().Set("Connection", "close")
-	}
-
-	gone := make(chan struct{})
-	defer close(gone)
-
-	defer func() {
-		if err != nil {
-			pc.t.setReqCanceler(req.cancelKey, nil)
-		}
-	}()
-
-	// const debugRoundTrip = false
-
-	// Write the request concurrently with waiting for a response,
-	// in case the server decides to reply before reading our full
-	// request body.
-	startBytesWritten := pc.nwrite
-	writeErrCh := make(chan error, 1)
-	pc.writech <- writeRequest{req, writeErrCh, continueCh}
-
-	resc := make(chan responseAndError)
-	pc.reqch <- requestAndChan{
-		req:       req.Request,
-		cancelKey: req.cancelKey,
-		ch:        resc,
-		// addedGzip: requestedGzip,
-		continueCh: continueCh,
-		callerGone: gone,
-	}
-
-	var respHeaderTimer <-chan time.Time
-	cancelChan := req.Request.Cancel
-	ctxDoneChan := req.Context().Done()
-	pcClosed := pc.closech
-	canceled := false
-	for {
-		// testHookWaitResLoop()
-		select {
-		case err := <-writeErrCh:
-			// if debugRoundTrip {
-			// 	req.logf("writeErrCh resv: %T/%#v", err, err)
-			// }
-			if err != nil {
-				pc.close(fmt.Errorf("write error: %w", err))
-				return nil, pc.mapRoundTripError(req, startBytesWritten, err)
-			}
-			if d := pc.t.ResponseHeaderTimeout; d > 0 {
-				// if debugRoundTrip {
-				// 	req.logf("starting timer for %v", d)
-				// }
-				timer := time.NewTimer(d)
-				defer timer.Stop() // prevent leaks
-				respHeaderTimer = timer.C
-			}
-		case <-pcClosed:
-			pcClosed = nil
-			if canceled || pc.t.replaceReqCanceler(req.cancelKey, nil) {
-				// if debugRoundTrip {
-				// 	req.logf("closech recv: %T %#v", pc.closed, pc.closed)
-				// }
-				return nil, pc.mapRoundTripError(req, startBytesWritten, pc.closed)
-			}
-		case <-respHeaderTimer:
-			// if debugRoundTrip {
-			// 	req.logf("timeout waiting for response headers.")
-			// }
-			pc.close(errTimeout)
-			return nil, errTimeout
-		case re := <-resc:
-			if (re.res == nil) == (re.err == nil) {
-				panic(fmt.Sprintf("internal error: exactly one of res or err should be set; nil=%v", re.res == nil))
-			}
-			// if debugRoundTrip {
-			// 	req.logf("resc recv: %p, %T/%#v", re.res, re.err, re.err)
-			// }
-			if re.err != nil {
-				return nil, pc.mapRoundTripError(req, startBytesWritten, re.err)
-			}
-			return re.res, nil
-		case <-cancelChan:
-			canceled = pc.t.cancelRequest(req.cancelKey, errRequestCanceled)
-			cancelChan = nil
-		case <-ctxDoneChan:
-			canceled = pc.t.cancelRequest(req.cancelKey, req.Context().Err())
-			cancelChan = nil
-			ctxDoneChan = nil
-		}
-	}
+func (gz *gzipReader) Close() error {
+	return gz.body.Close()
 }
 
 type connLRU struct {
