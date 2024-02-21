@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http/internal/ascii"
 	"net/textproto"
 	"net/url"
@@ -17,6 +19,10 @@ import (
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/idna"
+)
+
+const (
+	defaultMaxMemory = 32 << 20 // 32 MB
 )
 
 // ProtocolError represents an HTTP protocol error.
@@ -48,13 +54,13 @@ var (
 	// // compare errors against this variable.
 	// ErrUnexpectedTrailer = &ProtocolError{"trailer header without chunked transfer encoding"}
 
-	// // ErrMissingBoundary is returned by Request.MultipartReader when the
-	// // request's Content-Type does not include a "boundary" parameter.
-	// ErrMissingBoundary = &ProtocolError{"no multipart boundary param in Content-Type"}
+	// ErrMissingBoundary is returned by Request.MultipartReader when the
+	// request's Content-Type does not include a "boundary" parameter.
+	ErrMissingBoundary = &ProtocolError{"no multipart boundary param in Content-Type"}
 
-	// // ErrNotMultipart is returned by Request.MultipartReader when the
-	// // request's Content-Type is not multipart/form-data.
-	// ErrNotMultipart = &ProtocolError{"request Content-Type isn't multipart/form-data"}
+	// ErrNotMultipart is returned by Request.MultipartReader when the
+	// request's Content-Type is not multipart/form-data.
+	ErrNotMultipart = &ProtocolError{"request Content-Type isn't multipart/form-data"}
 
 	// // Deprecated: ErrHeaderTooLong is no longer returned by
 	// // anything in the net/http package. Callers should not
@@ -219,23 +225,23 @@ type Request struct {
 	// domain name.
 	Host string
 
-	// // Form contains the parsed form data, including both the URL
-	// // field's query parameters and the PATCH, POST, or PUT form data.
-	// // This field is only available after ParseForm is called.
-	// // The HTTP client ignores Form and uses Body instead.
-	// Form url.Values
+	// Form contains the parsed form data, including both the URL
+	// field's query parameters and the PATCH, POST, or PUT form data.
+	// This field is only available after ParseForm is called.
+	// The HTTP client ignores Form and uses Body instead.
+	Form url.Values
 
-	// // PostForm contains the parsed form data from PATCH, POST
-	// // or PUT body parameters.
-	// //
-	// // This field is only available after ParseForm is called.
-	// // The HTTP client ignores PostForm and uses Body instead.
-	// PostForm url.Values
+	// PostForm contains the parsed form data from PATCH, POST
+	// or PUT body parameters.
+	//
+	// This field is only available after ParseForm is called.
+	// The HTTP client ignores PostForm and uses Body instead.
+	PostForm url.Values
 
-	// // MultipartForm is the parsed multipart form, including file uploads.
-	// // This field is only available after ParseMultipartForm is called.
-	// // The HTTP client ignores MultipartForm and uses Body instead.
-	// MultipartForm *multipart.Form
+	// MultipartForm is the parsed multipart form, including file uploads.
+	// This field is only available after ParseMultipartForm is called.
+	// The HTTP client ignores MultipartForm and uses Body instead.
+	MultipartForm *multipart.Form
 
 	// Trailer specifies additional headers that are sent after the request
 	// body.
@@ -347,6 +353,48 @@ func (r *Request) AddCookie(c *Cookie) {
 	} else {
 		r.Header.Set("Cookie", s)
 	}
+}
+
+// MultipartReader returns a MIME multipart reader if this is a
+// multipart/form-data or a multipart/mixed POST request, else returns nil and an error.
+// Use this function instead of [Request.ParseMultipartForm] to
+// process the request body as a stream.
+func (r *Request) MultipartReader() (*multipart.Reader, error) {
+	if r.MultipartForm == multipartByReader {
+		return nil, errors.New("http: MultipartReader called twice")
+	}
+	if r.MultipartForm != nil {
+		return nil, errors.New("http: multipart handled by ParseMultipartForm")
+	}
+	r.MultipartForm = multipartByReader
+	return r.multipartReader(true)
+}
+
+// multipartByReader is a sentinel value.
+// Its presence in Request.MultipartForm indicates that parsing of the request
+// body has been handed off to a MultipartReader instead of ParseMultipartForm.
+var multipartByReader = &multipart.Form{
+	Value: make(map[string][]string),
+	File:  make(map[string][]*multipart.FileHeader),
+}
+
+func (r *Request) multipartReader(allowMixed bool) (*multipart.Reader, error) {
+	v := r.Header.Get("Content-Type")
+	if v == "" {
+		return nil, ErrNotMultipart
+	}
+	if r.Body == nil {
+		return nil, errors.New("missing form body")
+	}
+	d, params, err := mime.ParseMediaType(v)
+	if err != nil || !(d == "multipart/form-data" || allowMixed && d == "multipart/mixed") {
+		return nil, ErrNotMultipart
+	}
+	boundary, ok := params["boundary"]
+	if !ok {
+		return nil, ErrMissingBoundary
+	}
+	return multipart.NewReader(r.Body, boundary), nil
 }
 
 // Return value if nonempty, def otherwise.
@@ -888,6 +936,257 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 	// 	req.Close = true
 	// }
 	return req, nil
+}
+
+// MaxBytesError is returned by [MaxBytesReader] when its read limit is exceeded.
+type MaxBytesError struct {
+	Limit int64
+}
+
+func (e *MaxBytesError) Error() string {
+	// Due to Hyrum's law, this text cannot be changed.
+	return "http: request body too large"
+}
+
+type maxBytesReader struct {
+	w   ResponseWriter
+	r   io.ReadCloser // underlying reader
+	i   int64         // max bytes initially, for MaxBytesError
+	n   int64         // max bytes remaining
+	err error         // sticky error
+}
+
+func (l *maxBytesReader) Read(p []byte) (n int, err error) {
+	if l.err != nil {
+		return 0, l.err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	// If they asked for a 32KB byte read but only 5 bytes are
+	// remaining, no need to read 32KB. 6 bytes will answer the
+	// question of the whether we hit the limit or go past it.
+	// 0 < len(p) < 2^63
+	if int64(len(p)-1) > l.n {
+		p = p[:l.n+1]
+	}
+	n, err = l.r.Read(p)
+
+	if int64(n) <= l.n {
+		l.n -= int64(n)
+		l.err = err
+		return n, err
+	}
+
+	n = int(l.n)
+	l.n = 0
+
+	// The server code and client code both use
+	// maxBytesReader. This "requestTooLarge" check is
+	// only used by the server code. To prevent binaries
+	// which only using the HTTP Client code (such as
+	// cmd/go) from also linking in the HTTP server, don't
+	// use a static type assertion to the server
+	// "*response" type. Check this interface instead:
+	type requestTooLarger interface {
+		requestTooLarge()
+	}
+	if res, ok := l.w.(requestTooLarger); ok {
+		res.requestTooLarge()
+	}
+	l.err = &MaxBytesError{l.i}
+	return n, l.err
+}
+
+func (l *maxBytesReader) Close() error {
+	return l.r.Close()
+}
+
+func copyValues(dst, src url.Values) {
+	for k, vs := range src {
+		dst[k] = append(dst[k], vs...)
+	}
+}
+
+func parsePostForm(r *Request) (vs url.Values, err error) {
+	if r.Body == nil {
+		err = errors.New("missing form body")
+		return
+	}
+	ct := r.Header.Get("Content-Type")
+	// RFC 7231, section 3.1.1.5 - empty type
+	//   MAY be treated as application/octet-stream
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	ct, _, err = mime.ParseMediaType(ct)
+	switch {
+	case ct == "application/x-www-form-urlencoded":
+		var reader io.Reader = r.Body
+		maxFormSize := int64(1<<63 - 1)
+		if _, ok := r.Body.(*maxBytesReader); !ok {
+			maxFormSize = int64(10 << 20) // 10MB is a lot of text.
+			reader = io.LimitReader(r.Body, maxFormSize+1)
+		}
+		b, e := io.ReadAll(reader)
+		if e != nil {
+			if err == nil {
+				err = e
+			}
+			break
+		}
+		if int64(len(b)) > maxFormSize {
+			err = errors.New("http: POST too large")
+			return
+		}
+		vs, e = url.ParseQuery(string(b))
+		if err == nil {
+			err = e
+		}
+	case ct == "multipart/form-data":
+		// handled by ParseMultipartForm (which is calling us, or should be)
+		// TODO(bradfitz): there are too many possible
+		// orders to call too many functions here.
+		// Clean this up and write more tests.
+		// request_test.go contains the start of this,
+		// in TestParseMultipartFormOrder and others.
+	}
+	return
+}
+
+// ParseForm populates r.Form and r.PostForm.
+//
+// For all requests, ParseForm parses the raw query from the URL and updates
+// r.Form.
+//
+// For POST, PUT, and PATCH requests, it also reads the request body, parses it
+// as a form and puts the results into both r.PostForm and r.Form. Request body
+// parameters take precedence over URL query string values in r.Form.
+//
+// If the request Body's size has not already been limited by [MaxBytesReader],
+// the size is capped at 10MB.
+//
+// For other HTTP methods, or when the Content-Type is not
+// application/x-www-form-urlencoded, the request Body is not read, and
+// r.PostForm is initialized to a non-nil, empty value.
+//
+// [Request.ParseMultipartForm] calls ParseForm automatically.
+// ParseForm is idempotent.
+func (r *Request) ParseForm() error {
+	var err error
+	if r.PostForm == nil {
+		if r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
+			r.PostForm, err = parsePostForm(r)
+		}
+		if r.PostForm == nil {
+			r.PostForm = make(url.Values)
+		}
+	}
+	if r.Form == nil {
+		if len(r.PostForm) > 0 {
+			r.Form = make(url.Values)
+			copyValues(r.Form, r.PostForm)
+		}
+		var newValues url.Values
+		if r.URL != nil {
+			var e error
+			newValues, e = url.ParseQuery(r.URL.RawQuery)
+			if err == nil {
+				err = e
+			}
+		}
+		if newValues == nil {
+			newValues = make(url.Values)
+		}
+		if r.Form == nil {
+			r.Form = newValues
+		} else {
+			copyValues(r.Form, newValues)
+		}
+	}
+	return err
+}
+
+// ParseMultipartForm parses a request body as multipart/form-data.
+// The whole request body is parsed and up to a total of maxMemory bytes of
+// its file parts are stored in memory, with the remainder stored on
+// disk in temporary files.
+// ParseMultipartForm calls [Request.ParseForm] if necessary.
+// If ParseForm returns an error, ParseMultipartForm returns it but also
+// continues parsing the request body.
+// After one call to ParseMultipartForm, subsequent calls have no effect.
+func (r *Request) ParseMultipartForm(maxMemory int64) error {
+	if r.MultipartForm == multipartByReader {
+		return errors.New("http: multipart handled by MultipartReader")
+	}
+	var parseFormErr error
+	if r.Form == nil {
+		// Let errors in ParseForm fall through, and just
+		// return it at the end.
+		parseFormErr = r.ParseForm()
+	}
+	if r.MultipartForm != nil {
+		return nil
+	}
+
+	mr, err := r.multipartReader(false)
+	if err != nil {
+		return err
+	}
+
+	f, err := mr.ReadForm(maxMemory)
+	if err != nil {
+		return err
+	}
+
+	if r.PostForm == nil {
+		r.PostForm = make(url.Values)
+	}
+	for k, v := range f.Value {
+		r.Form[k] = append(r.Form[k], v...)
+		// r.PostForm should also be populated. See Issue 9305.
+		r.PostForm[k] = append(r.PostForm[k], v...)
+	}
+
+	r.MultipartForm = f
+
+	return parseFormErr
+}
+
+// FormValue returns the first value for the named component of the query.
+// The precedence order:
+//  1. application/x-www-form-urlencoded form body (POST, PUT, PATCH only)
+//  2. query parameters (always)
+//  3. multipart/form-data form body (always)
+//
+// FormValue calls [Request.ParseMultipartForm] and [Request.ParseForm]
+// if necessary and ignores any errors returned by these functions.
+// If key is not present, FormValue returns the empty string.
+// To access multiple values of the same key, call ParseForm and
+// then inspect [Request.Form] directly.
+func (r *Request) FormValue(key string) string {
+	if r.Form == nil {
+		r.ParseMultipartForm(defaultMaxMemory)
+	}
+	if vs := r.Form[key]; len(vs) > 0 {
+		return vs[0]
+	}
+	return ""
+}
+
+// PostFormValue returns the first value for the named component of the POST,
+// PUT, or PATCH request body. URL query parameters are ignored.
+// PostFormValue calls [Request.ParseMultipartForm] and [Request.ParseForm] if necessary and ignores
+// any errors returned by these functions.
+// If key is not present, PostFormValue returns the empty string.
+func (r *Request) PostFormValue(key string) string {
+	if r.PostForm == nil {
+		r.ParseMultipartForm(defaultMaxMemory)
+	}
+	if vs := r.PostForm[key]; len(vs) > 0 {
+		return vs[0]
+	}
+	return ""
 }
 
 func (r *Request) expectsContinue() bool {
