@@ -339,7 +339,17 @@ func (cw *chunkWriter) Write(p []byte) (n int, err error) {
 		// Eat writes.
 		return len(p), nil
 	}
+	if cw.chunking {
+		_, err = fmt.Fprintf(cw.res.conn.bufw, "%x\r\n", len(p))
+		if err != nil {
+			cw.res.conn.rwc.Close()
+			return
+		}
+	}
 	n, err = cw.res.conn.bufw.Write(p)
+	if cw.chunking && err == nil {
+		_, err = cw.res.conn.bufw.Write(crlf)
+	}
 	if err != nil {
 		cw.res.conn.rwc.Close()
 	}
@@ -1141,7 +1151,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 			trailers = true
 		}
 	}
-	for _, v := range cw.header["Trailers"] {
+	for _, v := range cw.header["Trailer"] {
 		trailers = true
 		foreachHeaderElement(v, cw.res.declareTrailer)
 	}
@@ -1293,6 +1303,15 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		setHeader.date = appendTime(cw.res.dateBuf[:0], time.Now())
 	}
 
+	if hasCL && hasTE && te != "identity" {
+		// TODO: return an error if WriteHeader gets a return parameter
+		// For now just ignore the Content-Length.
+		w.conn.server.logf("http: WriteHeader called with both Transfer-Encoding of %q and a Content-Length of %d",
+			te, w.contentLength)
+		delHeader("Content-Length")
+		hasCL = false
+	}
+
 	if w.req.Method == "HEAD" || !bodyAllowedForStatus(code) || code == StatusNoContent {
 		// Response has no body.
 		delHeader("Transfer-Encoding")
@@ -1442,6 +1461,24 @@ func (w *response) Write(data []byte) (n int, err error) {
 
 // either dataB or dataS is non-zero.
 func (w *response) write(lenData int, dataB []byte, dataS string) (n int, err error) {
+	if w.conn.hijacked() {
+		if lenData > 0 {
+			caller := relevantCaller()
+			w.conn.server.logf("http: response.Write on hijacked connection from %s (%s:%d)", caller.Function, path.Base(caller.File), caller.Line)
+		}
+		return 0, ErrHijacked
+	}
+
+	if w.canWriteContinue.Load() {
+		// Body reader wants to write 100 Continue but hasn't yet.
+		// Tell it not to. The store must be done while holding the lock
+		// because the lock makes sure that there is not an active write
+		// this very moment.
+		w.writeContinueMu.Lock()
+		w.canWriteContinue.Store(false)
+		w.writeContinueMu.Unlock()
+	}
+
 	if !w.wroteHeader {
 		w.WriteHeader(StatusOK)
 	}
@@ -1480,6 +1517,10 @@ func (w *response) finishRequest() {
 	// Close the body (regardless of w.closeAfterReply) so we can
 	// re-use its bufio.Reader later safely.
 	w.reqBody.Close()
+
+	if w.req.MultipartForm != nil {
+		w.req.MultipartForm.RemoveAll()
+	}
 }
 
 // shouldReuseConnection reports whether the underlying TCP connection can be reused.
