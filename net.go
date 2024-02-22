@@ -7,6 +7,7 @@ package net
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"syscall"
 	"time"
@@ -83,22 +84,29 @@ type conn struct {
 
 func (c *conn) ok() bool { return c != nil && c.fd != nil }
 
+// Implementation of the Conn interface.
+
+// Read implements the Conn Read method.
 func (c *conn) Read(b []byte) (int, error) {
 	if !c.ok() {
 		return 0, syscall.EINVAL
 	}
 	n, err := c.fd.Read(b)
+	if err != nil && err != io.EOF {
+		err = &OpError{Op: "read", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
+	}
 	return n, err
 }
 
+// Write implements the Conn Write method.
 func (c *conn) Write(b []byte) (int, error) {
 	if !c.ok() {
 		return 0, syscall.EINVAL
 	}
 	n, err := c.fd.Write(b)
-	// if err != nil {
-	// 	err = &OpError{Op: "write", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
-	// }
+	if err != nil {
+		err = &OpError{Op: "write", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
+	}
 	return n, err
 }
 
@@ -108,6 +116,9 @@ func (c *conn) Close() error {
 		return syscall.EINVAL
 	}
 	err := c.fd.Close()
+	if err != nil {
+		err = &OpError{Op: "close", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}
+	}
 	return err
 }
 
@@ -148,7 +159,7 @@ func (c *conn) SetReadDeadline(t time.Time) error {
 		return syscall.EINVAL
 	}
 	if err := c.fd.SetReadDeadline(t); err != nil {
-		return err
+		return &OpError{Op: "set", Net: c.fd.net, Source: nil, Addr: c.fd.laddr, Err: err}
 	}
 	return nil
 }
@@ -159,7 +170,7 @@ func (c *conn) SetWriteDeadline(t time.Time) error {
 		return syscall.EINVAL
 	}
 	if err := c.fd.SetWriteDeadline(t); err != nil {
-		return err
+		return &OpError{Op: "set", Net: c.fd.net, Source: nil, Addr: c.fd.laddr, Err: err}
 	}
 	return nil
 }
@@ -201,6 +212,7 @@ type Error interface {
 	Temporary() bool
 }
 
+// Various errors contained in OpError.
 var (
 	// For connection setup and write operations.
 	errMissingAddress = errors.New("missing address")
