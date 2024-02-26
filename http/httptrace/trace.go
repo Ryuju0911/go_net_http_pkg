@@ -103,20 +103,27 @@ type ClientTrace struct {
 	// might be buffered and not yet written to the network.
 	WroteHeaderField func(key string, value []string)
 
-	// // WroteHeaders is called after the Transport has written
-	// // all request headers.
-	// WroteHeaders func()
+	// WroteHeaders is called after the Transport has written
+	// all request headers.
+	WroteHeaders func()
 
-	// // Wait100Continue is called if the Request specified
-	// // "Expect: 100-continue" and the Transport has written the
-	// // request headers but is waiting for "100 Continue" from the
-	// // server before writing the request body.
-	// Wait100Continue func()
+	// Wait100Continue is called if the Request specified
+	// "Expect: 100-continue" and the Transport has written the
+	// request headers but is waiting for "100 Continue" from the
+	// server before writing the request body.
+	Wait100Continue func()
 
-	// // WroteRequest is called with the result of writing the
-	// // request and any body. It may be called multiple times
-	// // in the case of retried requests.
-	// WroteRequest func(WroteRequestInfo)
+	// WroteRequest is called with the result of writing the
+	// request and any body. It may be called multiple times
+	// in the case of retried requests.
+	WroteRequest func(WroteRequestInfo)
+}
+
+// WroteRequestInfo contains information provided to the WroteRequest
+// hook.
+type WroteRequestInfo struct {
+	// Err is any error encountered while writing the Request.
+	Err error
 }
 
 // GotConnInfo is the argument to the [ClientTrace.GotConn] function and

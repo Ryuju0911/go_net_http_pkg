@@ -9,6 +9,7 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	"net/http/httptrace"
 	"net/http/internal/ascii"
 	"net/textproto"
 	"net/url"
@@ -419,14 +420,14 @@ var errMissingHost = errors.New("http: Request.Write on Request with no Host or 
 // waitForContinue may be nil
 // always closes body
 func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitForContinue func() bool) (err error) {
-	// trace := httptrace.ContextClientTrace(r.Context())
-	// if trace != nil && trace.WroteRequest != nil {
-	// 	defer func() {
-	// 		trace.WroteRequest(httptrace.WroteRequestInfo{
-	// 			Err: err,
-	// 		})
-	// 	}()
-	// }
+	trace := httptrace.ContextClientTrace(r.Context())
+	if trace != nil && trace.WroteRequest != nil {
+		defer func() {
+			trace.WroteRequest(httptrace.WroteRequestInfo{
+				Err: err,
+			})
+		}()
+	}
 	closed := false
 	defer func() {
 		if closed {
@@ -514,9 +515,9 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 	if err != nil {
 		return err
 	}
-	// if trace != nil && trace.WroteHeaderField != nil {
-	// 	trace.WroteHeaderField("Host", []string{host})
-	// }
+	if trace != nil && trace.WroteHeaderField != nil {
+		trace.WroteHeaderField("Host", []string{host})
+	}
 
 	// Use the defaultUserAgent unless the Header contains one, which
 	// may be blank to not send the header.
@@ -531,9 +532,9 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 		if err != nil {
 			return err
 		}
-		// if trace != nil && trace.WroteHeaderField != nil {
-		// 	trace.WroteHeaderField("User-Agent", []string{userAgent})
-		// }
+		if trace != nil && trace.WroteHeaderField != nil {
+			trace.WroteHeaderField("User-Agent", []string{userAgent})
+		}
 	}
 
 	// Process Body.ContentLength,Close,Trailer
@@ -563,9 +564,9 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 		return err
 	}
 
-	// if trace != nil && trace.WroteHeaders != nil {
-	// 	trace.WroteHeaders()
-	// }
+	if trace != nil && trace.WroteHeaders != nil {
+		trace.WroteHeaders()
+	}
 
 	// Flush and wait for 100-continue if expected.
 	if waitForContinue != nil {
@@ -575,9 +576,9 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 				return err
 			}
 		}
-		// if trace != nil && trace.Wait100Continue != nil {
-		// 	trace.Wait100Continue()
-		// }
+		if trace != nil && trace.Wait100Continue != nil {
+			trace.Wait100Continue()
+		}
 		if !waitForContinue() {
 			closed = true
 			r.closeBody()
@@ -839,6 +840,22 @@ func newTextprotoReader(br *bufio.Reader) *textproto.Reader {
 func putTextprotoReader(r *textproto.Reader) {
 	r.R = nil
 	textprotoReaderPool.Put(r)
+}
+
+// ReadRequest reads and parses an incoming request from b.
+//
+// ReadRequest is a low-level function and should only be used for
+// specialized applications; most code should use the [Server] to read
+// requests and handle them via the [Handler] interface. ReadRequest
+// only supports HTTP/1.x requests. For HTTP/2, use golang.org/x/net/http2.
+func ReadRequest(b *bufio.Reader) (*Request, error) {
+	req, err := readRequest(b)
+	if err != nil {
+		return nil, err
+	}
+
+	delete(req.Header, "Host")
+	return req, err
 }
 
 func readRequest(b *bufio.Reader) (req *Request, err error) {
