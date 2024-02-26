@@ -10,12 +10,14 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"internal/testenv"
 	"io"
 	"log"
 	"net"
 	. "net/http"
 	"net/http/httptest"
 	"net/http/httputil"
+	"net/http/internal"
 	"strings"
 	"sync"
 	"testing"
@@ -403,6 +405,174 @@ func testServerExpect(t *testing.T, mode testMode) {
 
 	for _, test := range serverExpectTests {
 		runTest(test)
+	}
+}
+
+type handlerBodyCloseTest struct {
+	bodySize     int
+	bodyChunked  bool
+	reqConnClose bool
+
+	wantEOFSearch bool // should Handler's Body.Close do Reads, looking for EOF?
+	wantNextReq   bool // should it find the next request on the same conn?
+}
+
+func (t handlerBodyCloseTest) connectionHeader() string {
+	if t.reqConnClose {
+		return "Connection: close\r\n"
+	}
+	return ""
+}
+
+var handlerBodyCloseTests = [...]handlerBodyCloseTest{
+	// Small enough to slurp past to the next request +
+	// has Content-Length.
+	0: {
+		bodySize:      20 << 10,
+		bodyChunked:   false,
+		reqConnClose:  false,
+		wantEOFSearch: true,
+		wantNextReq:   true,
+	},
+
+	// Small enough to slurp past to the next request +
+	// is chunked.
+	1: {
+		bodySize:      20 << 10,
+		bodyChunked:   true,
+		reqConnClose:  false,
+		wantEOFSearch: true,
+		wantNextReq:   true,
+	},
+
+	// Small enough to slurp past to the next request +
+	// has Content-Length +
+	// declares Connection: close (so pointless to read more).
+	2: {
+		bodySize:      20 << 10,
+		bodyChunked:   false,
+		reqConnClose:  true,
+		wantEOFSearch: false,
+		wantNextReq:   false,
+	},
+
+	// Small enough to slurp past to the next request +
+	// declares Connection: close,
+	// but chunked, so it might have trailers.
+	// TODO: maybe skip this search if no trailers were declared
+	// in the headers.
+	3: {
+		bodySize:      20 << 10,
+		bodyChunked:   true,
+		reqConnClose:  true,
+		wantEOFSearch: true,
+		wantNextReq:   false,
+	},
+
+	// Big with Content-Length, so give up immediately if we know it's too big.
+	4: {
+		bodySize:      1 << 20,
+		bodyChunked:   false, // has a Content-Length
+		reqConnClose:  false,
+		wantEOFSearch: false,
+		wantNextReq:   false,
+	},
+
+	// Big chunked, so read a bit before giving up.
+	5: {
+		bodySize:      1 << 20,
+		bodyChunked:   true,
+		reqConnClose:  false,
+		wantEOFSearch: true,
+		wantNextReq:   false,
+	},
+
+	// Big with Connection: close, but chunked, so search for trailers.
+	// TODO: maybe skip this search if no trailers were declared
+	// in the headers.
+	6: {
+		bodySize:      1 << 20,
+		bodyChunked:   true,
+		reqConnClose:  true,
+		wantEOFSearch: true,
+		wantNextReq:   false,
+	},
+
+	// Big with Connection: close, so don't do any reads on Close.
+	// With Content-Length.
+	7: {
+		bodySize:      1 << 20,
+		bodyChunked:   false,
+		reqConnClose:  true,
+		wantEOFSearch: false,
+		wantNextReq:   false,
+	},
+}
+
+func TestHandlerBodyClose(t *testing.T) {
+	setParallel(t)
+	if testing.Short() && testenv.Builder() == "" {
+		t.Skip("skipping in -short mode")
+	}
+	for i, tt := range handlerBodyCloseTests {
+		testHandlerBodyClose(t, i, tt)
+	}
+}
+
+func testHandlerBodyClose(t *testing.T, i int, tt handlerBodyCloseTest) {
+	conn := new(testConn)
+	body := strings.Repeat("x", tt.bodySize)
+	if tt.bodyChunked {
+		conn.readBuf.WriteString("POST / HTTP/1.1\r\n" +
+			"Host: test\r\n" +
+			tt.connectionHeader() +
+			"Transfer-Encoding: chunked\r\n" +
+			"\r\n")
+		cw := internal.NewChunkedWriter(&conn.readBuf)
+		io.WriteString(cw, body)
+		cw.Close()
+		conn.readBuf.WriteString("\r\n")
+	} else {
+		conn.readBuf.Write([]byte(fmt.Sprintf(
+			"POST / HTTP/1.1\r\n"+
+				"Host: test\r\n"+
+				tt.connectionHeader()+
+				"Content-Length: %d\r\n"+
+				"\r\n", len(body))))
+		conn.readBuf.Write([]byte(body))
+	}
+	if !tt.reqConnClose {
+		conn.readBuf.WriteString("GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+	}
+	conn.closec = make(chan bool, 1)
+
+	readBufLen := func() int {
+		conn.readMu.Lock()
+		defer conn.readMu.Unlock()
+		return conn.readBuf.Len()
+	}
+
+	ls := &oneConnListener{conn}
+	var numReqs int
+	var size0, size1 int
+	go Serve(ls, HandlerFunc(func(rw ResponseWriter, req *Request) {
+		numReqs++
+		if numReqs == 1 {
+			size0 = readBufLen()
+			req.Body.Close()
+			size1 = readBufLen()
+		}
+	}))
+	<-conn.closec
+	if numReqs < 1 || numReqs > 2 {
+		t.Fatalf("%d. bug in test. unexpected number of requests = %d", i, numReqs)
+	}
+	didSearch := size0 != size1
+	if didSearch != tt.wantEOFSearch {
+		t.Errorf("%d. did EOF search = %v; want %v (size went from %d to %d)", i, didSearch, !didSearch, size0, size1)
+	}
+	if tt.wantNextReq && numReqs != 2 {
+		t.Errorf("%d. numReq = %d; want 2", i, numReqs)
 	}
 }
 
