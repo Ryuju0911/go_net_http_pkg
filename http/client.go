@@ -18,17 +18,61 @@ import (
 	"log"
 	"net/http/internal/ascii"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+// A Client is an HTTP client. Its zero value ([DefaultClient]) is a
+// usable client that uses [DefaultTransport].
+//
+// The [Client.Transport] typically has internal state (cached TCP
+// connections), so Clients should be reused instead of created as
+// needed. Clients are safe for concurrent use by multiple goroutines.
+//
+// A Client is higher-level than a [RoundTripper] (such as [Transport])
+// and additionally handles HTTP details such as cookies and
+// redirects.
+//
+// When following redirects, the Client will forward all headers set on the
+// initial [Request] except:
+//
+//   - when forwarding sensitive headers like "Authorization",
+//     "WWW-Authenticate", and "Cookie" to untrusted targets.
+//     These headers will be ignored when following a redirect to a domain
+//     that is not a subdomain match or exact match of the initial domain.
+//     For example, a redirect from "foo.com" to either "foo.com" or "sub.foo.com"
+//     will forward the sensitive headers, but a redirect to "bar.com" will not.
+//   - when forwarding the "Cookie" header with a non-nil cookie Jar.
+//     Since each redirect may mutate the state of the cookie jar,
+//     a redirect may possibly alter a cookie set in the initial request.
+//     When forwarding the "Cookie" header, any mutated cookies will be omitted,
+//     with the expectation that the Jar will insert those mutated cookies
+//     with the updated values (assuming the origin matches).
+//     If Jar is nil, the initial cookies are forwarded without change.
 type Client struct {
 	// Transport specifies the mechanism by which individual
 	// HTTP requests are made.
 	// If nil, DefaultTransport is used.
 	Transport RoundTripper
+
+	// CheckRedirect specifies the policy for handling redirects.
+	// If CheckRedirect is not nil, the client calls it before
+	// following an HTTP redirect. The arguments req and via are
+	// the upcoming request and the requests made already, oldest
+	// first. If CheckRedirect returns an error, the Client's Get
+	// method returns both the previous Response (with its Body
+	// closed) and CheckRedirect's error (wrapped in a url.Error)
+	// instead of issuing the Request req.
+	// As a special case, if CheckRedirect returns ErrUseLastResponse,
+	// then the most recent response is returned with its body
+	// unclosed, along with a nil error.
+	//
+	// If CheckRedirect is nil, the Client uses its default policy,
+	// which is to stop after 10 consecutive requests.
+	CheckRedirect func(req *Request, via []*Request) error
 
 	// Jar specifies the cookie jar.
 	//
@@ -93,6 +137,35 @@ type RoundTripper interface {
 	//
 	// The Request's URL and Header fields must be initialized.
 	RoundTrip(*Request) (*Response, error)
+}
+
+// refererForURL returns a referer without any authentication info or
+// an empty string if lastReq scheme is https and newReq scheme is http.
+// If the referer was explicitly set, then it will continue to be used.
+func refererForURL(lastReq, newReq *url.URL, explicitRef string) string {
+	// https://tools.ietf.org/html/rfc7231#section-5.5.2
+	//   "Clients SHOULD NOT include a Referer header field in a
+	//    (non-secure) HTTP request if the referring page was
+	//    transferred with a secure protocol."
+	if lastReq.Scheme == "https" && newReq.Scheme == "http" {
+		return ""
+	}
+	if explicitRef != "" {
+		return explicitRef
+	}
+
+	referer := lastReq.String()
+	if lastReq.User != nil {
+		// This is not very efficient, but is the best we can
+		// do without:
+		// - introducing a new method on URL
+		// - creating a race condition
+		// - copying the URL struct manually, which would cause
+		//   maintenance problems down the line
+		auth := lastReq.User.String() + "@"
+		referer = strings.Replace(referer, auth, "", 1)
+	}
+	return referer
 }
 
 // didTimeout is non-nil only if err != nil.
@@ -388,6 +461,54 @@ func (c *Client) Get(url string) (resp *Response, err error) {
 
 func alwaysFalse() bool { return false }
 
+// ErrUseLastResponse can be returned by Client.CheckRedirect hooks to
+// control how redirects are processed. If returned, the next request
+// is not sent and the most recent response is returned with its body
+// unclosed.
+var ErrUseLastResponse = errors.New("net/http: use last response")
+
+// checkRedirect calls either the user's configured CheckRedirect
+// function, or the default.
+func (c *Client) checkRedirect(req *Request, via []*Request) error {
+	fn := c.CheckRedirect
+	if fn == nil {
+		fn = defaultCheckRedirect
+	}
+	return fn(req, via)
+}
+
+// redirectBehavior describes what should happen when the
+// client encounters a 3xx status code from the server.
+func redirectBehavior(reqMethod string, resp *Response, ireq *Request) (redirectMethod string, shouldRedirect, includeBody bool) {
+	switch resp.StatusCode {
+	case 301, 302, 303:
+		redirectMethod = reqMethod
+		shouldRedirect = true
+		includeBody = false
+
+		// RFC 2616 allowed automatic redirection only with GET and
+		// HEAD requests. RFC 7231 lifts this restriction, but we still
+		// restrict other methods to GET to maintain compatibility.
+		// See Issue 18570.
+		if reqMethod != "GET" && reqMethod != "HEAD" {
+			redirectMethod = "GET"
+		}
+	case 307, 308:
+		redirectMethod = reqMethod
+		shouldRedirect = true
+		includeBody = true
+
+		if ireq.GetBody == nil && ireq.outgoingLength() != 0 {
+			// We had a request body, and 307/308 require
+			// re-sending it, but GetBody is not defined. So just
+			// return this response to the user instead of an
+			// error, like we did in Go 1.7 and earlier.
+			shouldRedirect = false
+		}
+	}
+	return redirectMethod, shouldRedirect, includeBody
+}
+
 func urlErrorOp(method string) string {
 	if method == "" {
 		return "Get"
@@ -440,6 +561,9 @@ func (c *Client) Do(req *Request) (*Response, error) {
 }
 
 func (c *Client) do(req *Request) (retres *Response, reterr error) {
+	// if testHookClientDoResult != nil {
+	// 	defer func() { testHookClientDoResult(retres, reterr) }()
+	// }
 	if req.URL == nil {
 		req.closeBody()
 		return nil, &url.Error{
@@ -449,15 +573,15 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 	}
 
 	var (
-		deadline = c.deadline()
-		reqs     []*Request
-		resp     *Response
-		// copyHeaders   = c.makeHeadersCopier(req)
+		deadline      = c.deadline()
+		reqs          []*Request
+		resp          *Response
+		copyHeaders   = c.makeHeadersCopier(req)
 		reqBodyClosed = false // have we closed the current req.Body?
 
-		// // Redirect behavior:
-		// redirectMethod string
-		// includeBody    bool
+		// Redirect behavior:
+		redirectMethod string
+		includeBody    bool
 	)
 	uerr := func(err error) error {
 		// the body may have been called already by c.send()
@@ -487,7 +611,79 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 				// observed in the wild. See issues #17773 and #49281.
 				return resp, nil
 			}
-			// TODO: Handles the case when loc != nil.
+			u, err := req.URL.Parse(loc)
+			if err != nil {
+				resp.closeBody()
+				return nil, uerr(fmt.Errorf("failed to parse Location header %q: %v", loc, err))
+			}
+			host := ""
+			if req.Host != "" && req.Host != req.URL.Host {
+				// If the caller specified a custom Host header and the
+				// redirect location is relative, preserve the Host header
+				// through the redirect. See issue #22233.
+				if u, _ := url.Parse(loc); u != nil && !u.IsAbs() {
+					host = req.Host
+				}
+			}
+			ireq := reqs[0]
+			req = &Request{
+				Method:   redirectMethod,
+				Response: resp,
+				URL:      u,
+				Header:   make(Header),
+				Host:     host,
+				Cancel:   ireq.Cancel,
+				ctx:      ireq.ctx,
+			}
+			if includeBody && ireq.GetBody != nil {
+				req.Body, err = ireq.GetBody()
+				if err != nil {
+					resp.closeBody()
+					return nil, uerr(err)
+				}
+				req.ContentLength = ireq.ContentLength
+			}
+
+			// Copy original headers before setting the Referer,
+			// in case the user set Referer on their first request.
+			// If they really want to override, they can do it in
+			// their CheckRedirect func.
+			copyHeaders(req)
+
+			// Add the Referer header from the most recent
+			// request URL to the new one, if it's not https->http:
+			if ref := refererForURL(reqs[len(reqs)-1].URL, req.URL, req.Header.Get("Referer")); ref != "" {
+				req.Header.Set("Referer", ref)
+			}
+			err = c.checkRedirect(req, reqs)
+
+			// Sentinel error to let users select the
+			// previous response, without closing its
+			// body. See Issue 10069.
+			if err == ErrUseLastResponse {
+				return resp, nil
+			}
+
+			// Close the previous response's body. But
+			// read at least some of the body so if it's
+			// small the underlying TCP connection will be
+			// re-used. No need to check for errors: if it
+			// fails, the Transport won't reuse it anyway.
+			const maxBodySlurpSize = 2 << 10
+			if resp.ContentLength == -1 || resp.ContentLength <= maxBodySlurpSize {
+				io.CopyN(io.Discard, resp.Body, maxBodySlurpSize)
+			}
+			resp.Body.Close()
+
+			if err != nil {
+				// Special case for Go 1 compatibility: return both the response
+				// and an error if the CheckRedirect function failed.
+				// See https://golang.org/issue/3795
+				// The resp.Body has already been closed.
+				ue := uerr(err)
+				ue.(*url.Error).URL = loc
+				return resp, ue
+			}
 		}
 
 		reqs = append(reqs, req)
@@ -505,8 +701,105 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
 			return nil, uerr(err)
 		}
 
+		var shouldRedirect bool
+		redirectMethod, shouldRedirect, includeBody = redirectBehavior(req.Method, resp, reqs[0])
+		if !shouldRedirect {
+			return resp, nil
+		}
+
 		req.closeBody()
 	}
+}
+
+// makeHeadersCopier makes a function that copies headers from the
+// initial Request, ireq. For every redirect, this function must be called
+// so that it can copy headers into the upcoming Request.
+func (c *Client) makeHeadersCopier(ireq *Request) func(*Request) {
+	// The headers to copy are from the very initial request.
+	// We use a closured callback to keep a reference to these original headers.
+	var (
+		ireqhdr  = cloneOrMakeHeader(ireq.Header)
+		icookies map[string][]*Cookie
+	)
+	if c.Jar != nil && ireq.Header.Get("Cookie") != "" {
+		icookies = make(map[string][]*Cookie)
+		for _, c := range ireq.Cookies() {
+			icookies[c.Name] = append(icookies[c.Name], c)
+		}
+	}
+
+	preq := ireq // The previous request
+	return func(req *Request) {
+		// If Jar is present and there was some initial cookies provided
+		// via the request header, then we may need to alter the initial
+		// cookies as we follow redirects since each redirect may end up
+		// modifying a pre-existing cookie.
+		//
+		// Since cookies already set in the request header do not contain
+		// information about the original domain and path, the logic below
+		// assumes any new set cookies override the original cookie
+		// regardless of domain or path.
+		//
+		// See https://golang.org/issue/17494
+		if c.Jar != nil && icookies != nil {
+			var changed bool
+			resp := req.Response // The response that caused the upcoming redirect
+			for _, c := range resp.Cookies() {
+				if _, ok := icookies[c.Name]; ok {
+					delete(icookies, c.Name)
+					changed = true
+				}
+			}
+			if changed {
+				ireqhdr.Del("Cookie")
+				var ss []string
+				for _, cs := range icookies {
+					for _, c := range cs {
+						ss = append(ss, c.Name+"="+c.Value)
+					}
+				}
+				sort.Strings(ss) // Ensure deterministic headers
+				ireqhdr.Set("Cookie", strings.Join(ss, "; "))
+			}
+		}
+
+		// Copy the initial request's Header values
+		// (at least the safe ones)
+		for k, vv := range ireqhdr {
+			if shouldCopyHeaderOnRedirect(k, preq.URL, req.URL) {
+				req.Header[k] = vv
+			}
+		}
+
+		preq = req // Update previous Request with the current request
+	}
+}
+
+func defaultCheckRedirect(req *Request, via []*Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	return nil
+}
+
+// Head issues a HEAD to the specified URL. If the response is one of the
+// following redirect codes, Head follows the redirect after calling the
+// [Client.CheckRedirect] function:
+//
+//	301 (Moved Permanently)
+//	302 (Found)
+//	303 (See Other)
+//	307 (Temporary Redirect)
+//	308 (Permanent Redirect)
+//
+// To make a request with a specified [context.Context], use [NewRequestWithContext]
+// and [Client.Do].
+func (c *Client) Head(url string) (resp *Response, err error) {
+	req, err := NewRequest("HEAD", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.Do(req)
 }
 
 // cancelTimerBody is an io.ReadCloser that wraps rc with two features:
@@ -540,6 +833,47 @@ func (b *cancelTimerBody) Close() error {
 	err := b.rc.Close()
 	b.stop()
 	return err
+}
+
+func shouldCopyHeaderOnRedirect(headerKey string, initial, dest *url.URL) bool {
+	switch CanonicalHeaderKey(headerKey) {
+	case "Authorization", "Www-Authenticate", "Cookie", "Cookie2":
+		// Permit sending auth/cookie headers from "foo.com"
+		// to "sub.foo.com".
+
+		// Note that we don't send all cookies to subdomains
+		// automatically. This function is only used for
+		// Cookies set explicitly on the initial outgoing
+		// client request. Cookies automatically added via the
+		// CookieJar mechanism continue to follow each
+		// cookie's scope as set by Set-Cookie. But for
+		// outgoing requests with the Cookie header set
+		// directly, we don't know their scope, so we assume
+		// it's for *.domain.com.
+
+		ihost := idnaASCIIFromURL(initial)
+		dhost := idnaASCIIFromURL(dest)
+		return isDomainOrSubdomain(dhost, ihost)
+	}
+	// All other headers are copied:
+	return true
+}
+
+// isDomainOrSubdomain reports whether sub is a subdomain (or exact
+// match) of the parent domain.
+//
+// Both domains must already be in canonical form.
+func isDomainOrSubdomain(sub, parent string) bool {
+	if sub == parent {
+		return true
+	}
+	// If sub is "foo.example.com" and parent is "example.com",
+	// that means sub must end in "."+parent.
+	// Do it without allocating.
+	if !strings.HasSuffix(sub, parent) {
+		return false
+	}
+	return sub[len(sub)-len(parent)-1] == '.'
 }
 
 func stripPassword(u *url.URL) string {

@@ -6,7 +6,11 @@ package http
 
 import (
 	"log"
+	"net/http/internal/ascii"
+	"net/textproto"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // A Cookie represents an HTTP cookie as sent in the Set-Cookie header of an
@@ -17,20 +21,182 @@ type Cookie struct {
 	Name  string
 	Value string
 
-	// Path       string    // optional
-	// Domain     string    // optional
-	// Expires    time.Time // optional
-	// RawExpires string    // for reading cookies only
+	Path       string    // optional
+	Domain     string    // optional
+	Expires    time.Time // optional
+	RawExpires string    // for reading cookies only
 
-	// // MaxAge=0 means no 'Max-Age' attribute specified.
-	// // MaxAge<0 means delete cookie now, equivalently 'Max-Age: 0'
-	// // MaxAge>0 means Max-Age attribute present and given in seconds
-	// MaxAge   int
-	// Secure   bool
-	// HttpOnly bool
-	// SameSite SameSite
-	// Raw      string
-	// Unparsed []string // Raw text of unparsed attribute-value pairs
+	// MaxAge=0 means no 'Max-Age' attribute specified.
+	// MaxAge<0 means delete cookie now, equivalently 'Max-Age: 0'
+	// MaxAge>0 means Max-Age attribute present and given in seconds
+	MaxAge   int
+	Secure   bool
+	HttpOnly bool
+	SameSite SameSite
+	Raw      string
+	Unparsed []string // Raw text of unparsed attribute-value pairs
+}
+
+// SameSite allows a server to define a cookie attribute making it impossible for
+// the browser to send this cookie along with cross-site requests. The main
+// goal is to mitigate the risk of cross-origin information leakage, and provide
+// some protection against cross-site request forgery attacks.
+//
+// See https://tools.ietf.org/html/draft-ietf-httpbis-cookie-same-site-00 for details.
+type SameSite int
+
+const (
+	SameSiteDefaultMode SameSite = iota + 1
+	SameSiteLaxMode
+	SameSiteStrictMode
+	SameSiteNoneMode
+)
+
+// readSetCookies parses all "Set-Cookie" values from
+// the header h and returns the successfully parsed Cookies.
+func readSetCookies(h Header) []*Cookie {
+	cookieCount := len(h["Set-Cookie"])
+	if cookieCount == 0 {
+		return []*Cookie{}
+	}
+	cookies := make([]*Cookie, 0, cookieCount)
+	for _, line := range h["Set-Cookie"] {
+		parts := strings.Split(textproto.TrimString(line), ";")
+		if len(parts) == 1 && parts[0] == "" {
+			continue
+		}
+		parts[0] = textproto.TrimString(parts[0])
+		name, value, ok := strings.Cut(parts[0], "=")
+		if !ok {
+			continue
+		}
+		name = textproto.TrimString(name)
+		if !isCookieNameValid(name) {
+			continue
+		}
+		value, ok = parseCookieValue(value, true)
+		if !ok {
+			continue
+		}
+		c := &Cookie{
+			Name:  name,
+			Value: value,
+			Raw:   line,
+		}
+		for i := 0; i < len(parts); i++ {
+			parts[i] = textproto.TrimString(parts[i])
+			if len(parts[i]) == 0 {
+				continue
+			}
+
+			attr, val, _ := strings.Cut(parts[i], "=")
+			lowerAttr, isASCII := ascii.ToLower(attr)
+			if !isASCII {
+				continue
+			}
+			val, ok = parseCookieValue(val, false)
+			if !ok {
+				c.Unparsed = append(c.Unparsed, parts[i])
+				continue
+			}
+
+			switch lowerAttr {
+			case "samesite":
+				lowerVal, ascii := ascii.ToLower(val)
+				if !ascii {
+					c.SameSite = SameSiteDefaultMode
+					continue
+				}
+				switch lowerVal {
+				case "lax":
+					c.SameSite = SameSiteLaxMode
+				case "strict":
+					c.SameSite = SameSiteStrictMode
+				case "none":
+					c.SameSite = SameSiteNoneMode
+				default:
+					c.SameSite = SameSiteDefaultMode
+				}
+				continue
+			case "secure":
+				c.Secure = true
+				continue
+			case "httponly":
+				c.HttpOnly = true
+				continue
+			case "domain":
+				c.Domain = val
+				continue
+			case "max-age":
+				secs, err := strconv.Atoi(val)
+				if err != nil || secs != 0 && val[0] == '0' {
+					break
+				}
+				if secs <= 0 {
+					secs = -1
+				}
+				c.MaxAge = secs
+				continue
+			case "expires":
+				c.RawExpires = val
+				exptime, err := time.Parse(time.RFC1123, val)
+				if err != nil {
+					exptime, err = time.Parse("Mon, 02-Jan-2006 15:04:05 MST", val)
+					if err != nil {
+						c.Expires = time.Time{}
+						break
+					}
+				}
+				c.Expires = exptime.UTC()
+				continue
+			case "path":
+				c.Path = val
+				continue
+			}
+			c.Unparsed = append(c.Unparsed, parts[i])
+		}
+		cookies = append(cookies, c)
+	}
+	return cookies
+}
+
+// readCookies parses all "Cookie" values from the header h and
+// returns the successfully parsed Cookies.
+//
+// if filter isn't empty, only cookies of that name are returned.
+func readCookies(h Header, filter string) []*Cookie {
+	lines := h["Cookie"]
+	if len(lines) == 0 {
+		return []*Cookie{}
+	}
+
+	cookies := make([]*Cookie, 0, len(lines)+strings.Count(lines[0], ";"))
+	for _, line := range lines {
+		line = textproto.TrimString(line)
+
+		var part string
+		for len(line) > 0 { // continue since we have rest
+			part, line, _ = strings.Cut(line, ";")
+			part = textproto.TrimString(part)
+			if part == "" {
+				continue
+			}
+			name, val, _ := strings.Cut(part, "=")
+			name = textproto.TrimString(name)
+			if !isCookieNameValid(name) {
+				continue
+			}
+			if filter != "" && filter != name {
+				continue
+			}
+			val, ok := parseCookieValue(val, true)
+			if !ok {
+				continue
+			}
+			cookies = append(cookies, &Cookie{Name: name, Value: val})
+		}
+	}
+	return cookies
 }
 
 var cookieNameSanitizer = strings.NewReplacer("\n", "-", "\r", "-")
@@ -87,4 +253,24 @@ func sanitizeOrWarn(fieldName string, valid func(byte) bool, v string) string {
 		}
 	}
 	return string(buf)
+}
+
+func parseCookieValue(raw string, allowDoubleQuote bool) (string, bool) {
+	// Strip the quotes, if present.
+	if allowDoubleQuote && len(raw) > 1 && raw[0] == '"' && raw[len(raw)-1] == '"' {
+		raw = raw[1 : len(raw)-1]
+	}
+	for i := 0; i < len(raw); i++ {
+		if !validCookieValueByte(raw[i]) {
+			return "", false
+		}
+	}
+	return raw, true
+}
+
+func isCookieNameValid(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	return strings.IndexFunc(raw, isNotToken) < 0
 }

@@ -118,6 +118,11 @@ type Response struct {
 	// TLS *tls.ConnectionState
 }
 
+// Cookies parses and returns the cookies set in the Set-Cookie headers.
+func (r *Response) Cookies() []*Cookie {
+	return readSetCookies(r.Header)
+}
+
 // ReadResponse reads and returns an HTTP response from r.
 // The req parameter optionally specifies the [Request] that corresponds
 // to this [Response]. If nil, a GET request is assumed.
@@ -304,6 +309,12 @@ func (r *Response) Write(w io.Writer) error {
 
 	// Success
 	return nil
+}
+
+func (r *Response) closeBody() {
+	if r.Body != nil {
+		r.Body.Close()
+	}
 }
 
 // bodyIsWritable reports whether the Body supports writing. The

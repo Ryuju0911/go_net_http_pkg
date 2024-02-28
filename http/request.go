@@ -341,6 +341,11 @@ func (r *Request) ProtoAtLeast(major, minor int) bool {
 		r.ProtoMajor == major && r.ProtoMinor >= minor
 }
 
+// Cookies parses and returns the HTTP cookies sent with the request.
+func (r *Request) Cookies() []*Cookie {
+	return readCookies(r.Header, "")
+}
+
 // AddCookie adds a cookie to the request. Per RFC 6265 section 5.4,
 // AddCookie does not attach more than one Cookie header field. That
 // means all cookies, if any, are written into the same line,
@@ -479,15 +484,15 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 	host = removeZone(host)
 
 	ruri := r.URL.RequestURI()
-	// if usingProxy && r.URL.Scheme != "" && r.URL.Opaque == "" {
-	// 	ruri = r.URL.Scheme + "://" + host + ruri
-	// } else if r.Method == "CONNECT" && r.URL.Path == "" {
-	// 	// CONNECT requests normally give just the host and port, not a full URL.
-	// 	ruri = host
-	// 	if r.URL.Opaque != "" {
-	// 		ruri = r.URL.Opaque
-	// 	}
-	// }
+	if usingProxy && r.URL.Scheme != "" && r.URL.Opaque == "" {
+		ruri = r.URL.Scheme + "://" + host + ruri
+	} else if r.Method == "CONNECT" && r.URL.Path == "" {
+		// CONNECT requests normally give just the host and port, not a full URL.
+		ruri = host
+		if r.URL.Opaque != "" {
+			ruri = r.URL.Opaque
+		}
+	}
 	if stringContainsCTLByte(ruri) {
 		return errors.New("net/http: can't write control character in Request.URL")
 	}
@@ -888,28 +893,28 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 		return nil, badStringError("malformed HTTP version", req.Proto)
 	}
 
-	// // CONNECT requests are used two different ways, and neither uses a full URL:
-	// // The standard use is to tunnel HTTPS through an HTTP proxy.
-	// // It looks like "CONNECT www.google.com:443 HTTP/1.1", and the parameter is
-	// // just the authority section of a URL. This information should go in req.URL.Host.
-	// //
-	// // The net/rpc package also uses CONNECT, but there the parameter is a path
-	// // that starts with a slash. It can be parsed with the regular URL parser,
-	// // and the path will end up in req.URL.Path, where it needs to be in order for
-	// // RPC to work.
-	// justAuthority := req.Method == "CONNECT" && !strings.HasPrefix(rawurl, "/")
-	// if justAuthority {
-	// 	rawurl = "http://" + rawurl
-	// }
+	// CONNECT requests are used two different ways, and neither uses a full URL:
+	// The standard use is to tunnel HTTPS through an HTTP proxy.
+	// It looks like "CONNECT www.google.com:443 HTTP/1.1", and the parameter is
+	// just the authority section of a URL. This information should go in req.URL.Host.
+	//
+	// The net/rpc package also uses CONNECT, but there the parameter is a path
+	// that starts with a slash. It can be parsed with the regular URL parser,
+	// and the path will end up in req.URL.Path, where it needs to be in order for
+	// RPC to work.
+	justAuthority := req.Method == "CONNECT" && !strings.HasPrefix(rawurl, "/")
+	if justAuthority {
+		rawurl = "http://" + rawurl
+	}
 
 	if req.URL, err = url.ParseRequestURI(rawurl); err != nil {
 		return nil, err
 	}
 
-	// if justAuthority {
-	// 	// Strip the bogus "http://" back off.
-	// 	req.URL.Scheme = ""
-	// }
+	if justAuthority {
+		// Strip the bogus "http://" back off.
+		req.URL.Scheme = ""
+	}
 
 	// Subsequent lines: Key: value.
 	mimeHeader, err := tp.ReadMIMEHeader()
