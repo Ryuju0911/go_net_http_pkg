@@ -361,6 +361,18 @@ func (r *Request) AddCookie(c *Cookie) {
 	}
 }
 
+// Referer returns the referring URL, if sent in the request.
+//
+// Referer is misspelled as in the request itself, a mistake from the
+// earliest days of HTTP.  This value can also be fetched from the
+// [Header] map as Header["Referer"]; the benefit of making it available
+// as a method is that the compiler can diagnose programs that use the
+// alternate (correct English) spelling req.Referrer() but cannot
+// diagnose programs that use Header["Referrer"].
+func (r *Request) Referer() string {
+	return r.Header.Get("Referer")
+}
+
 // MultipartReader returns a MIME multipart reader if this is a
 // multipart/form-data or a multipart/mixed POST request, else returns nil and an error.
 // Use this function instead of [Request.ParseMultipartForm] to
