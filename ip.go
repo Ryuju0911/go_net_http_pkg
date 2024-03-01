@@ -26,6 +26,18 @@ const (
 // be an IPv4 address.
 type IP []byte
 
+// An IPMask is a bitmask that can be used to manipulate
+// IP addresses for IP addressing and routing.
+//
+// See type [IPNet] and func [ParseCIDR] for details.
+type IPMask []byte
+
+// An IPNet represents an IP network.
+type IPNet struct {
+	IP   IP     // network number
+	Mask IPMask // network mask
+}
+
 // IPv4 returns the IP address (in 16-byte form) of the
 // IPv4 address a.b.c.d.
 func IPv4(a, b, c, d byte) IP {
@@ -85,6 +97,34 @@ func (ip IP) To16() IP {
 	return nil
 }
 
+func allFF(b []byte) bool {
+	for _, c := range b {
+		if c != 0xff {
+			return false
+		}
+	}
+	return true
+}
+
+// Mask returns the result of masking the IP address ip with mask.
+func (ip IP) Mask(mask IPMask) IP {
+	if len(mask) == IPv6len && len(ip) == IPv4len && allFF(mask[:12]) {
+		mask = mask[12:]
+	}
+	if len(mask) == IPv4len && len(ip) == IPv6len && bytealg.Equal(ip[:12], v4InV6Prefix) {
+		ip = ip[12:]
+	}
+	n := len(ip)
+	if n != len(mask) {
+		return nil
+	}
+	out := make(IP, n)
+	for i := 0; i < n; i++ {
+		out[i] = ip[i] & mask[i]
+	}
+	return out
+}
+
 // String returns the string form of the IP address ip.
 // It returns one of 4 forms:
 //   - "<nil>", if ip has length 0
@@ -137,4 +177,24 @@ func (ip IP) Equal(x IP) bool {
 		return bytealg.Equal(ip[0:12], v4InV6Prefix) && bytealg.Equal(ip[12:], x)
 	}
 	return false
+}
+
+// ParseIP parses s as an IP address, returning the result.
+// The string s can be in IPv4 dotted decimal ("192.0.2.1"), IPv6
+// ("2001:db8::68"), or IPv4-mapped IPv6 ("::ffff:192.0.2.1") form.
+// If s is not a valid textual representation of an IP address,
+// ParseIP returns nil.
+func ParseIP(s string) IP {
+	if addr, valid := parseIP(s); valid {
+		return IP(addr[:])
+	}
+	return nil
+}
+
+func parseIP(s string) ([16]byte, bool) {
+	ip, err := netip.ParseAddr(s)
+	if err != nil || ip.Zone() != "" {
+		return [16]byte{}, false
+	}
+	return ip.As16(), true
 }
