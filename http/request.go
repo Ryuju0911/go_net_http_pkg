@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -279,14 +280,14 @@ type Request struct {
 	// It is an error to set this field in an HTTP client request.
 	RequestURI string
 
-	// // TLS allows HTTP servers and other software to record
-	// // information about the TLS connection on which the request
-	// // was received. This field is not filled in by ReadRequest.
-	// // The HTTP server in this package sets the field for
-	// // TLS-enabled connections before invoking a handler;
-	// // otherwise it leaves the field nil.
-	// // This field is ignored by the HTTP client.
-	// TLS *tls.ConnectionState
+	// TLS allows HTTP servers and other software to record
+	// information about the TLS connection on which the request
+	// was received. This field is not filled in by ReadRequest.
+	// The HTTP server in this package sets the field for
+	// TLS-enabled connections before invoking a handler;
+	// otherwise it leaves the field nil.
+	// This field is ignored by the HTTP client.
+	TLS *tls.ConnectionState
 
 	// Cancel is an optional channel whose closure indicates that the client
 	// request should be regarded as canceled. Not all implementations of

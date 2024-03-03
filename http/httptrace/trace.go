@@ -8,6 +8,7 @@ package httptrace
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"net/textproto"
 	"time"
@@ -88,15 +89,15 @@ type ClientTrace struct {
 	// // enabled, this may be called multiple times.
 	// ConnectDone func(network, addr string, err error)
 
-	// // TLSHandshakeStart is called when the TLS handshake is started. When
-	// // connecting to an HTTPS site via an HTTP proxy, the handshake happens
-	// // after the CONNECT request is processed by the proxy.
-	// TLSHandshakeStart func()
+	// TLSHandshakeStart is called when the TLS handshake is started. When
+	// connecting to an HTTPS site via an HTTP proxy, the handshake happens
+	// after the CONNECT request is processed by the proxy.
+	TLSHandshakeStart func()
 
-	// // TLSHandshakeDone is called after the TLS handshake with either the
-	// // successful handshake's connection state, or a non-nil error on handshake
-	// // failure.
-	// TLSHandshakeDone func(tls.ConnectionState, error)
+	// TLSHandshakeDone is called after the TLS handshake with either the
+	// successful handshake's connection state, or a non-nil error on handshake
+	// failure.
+	TLSHandshakeDone func(tls.ConnectionState, error)
 
 	// WroteHeaderField is called after the Transport has written
 	// each request header. At the time of this call the values

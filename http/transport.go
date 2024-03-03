@@ -14,6 +14,7 @@ import (
 	"compress/gzip"
 	"container/list"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -41,9 +42,9 @@ var DefaultTransport RoundTripper = &Transport{
 		KeepAlive: 30 * time.Second,
 	}),
 	// ForceAttemptHTTP2:     true,
-	MaxIdleConns:    100,
-	IdleConnTimeout: 90 * time.Second,
-	// TLSHandshakeTimeout:   10 * time.Second,
+	MaxIdleConns:          100,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 1 * time.Second,
 }
 
@@ -103,20 +104,20 @@ type Transport struct {
 	connsPerHost     map[connectMethodKey]int
 	connsPerHostWait map[connectMethodKey]wantConnQueue // waiting getConns
 
-	// // Proxy specifies a function to return a proxy for a given
-	// // Request. If the function returns a non-nil error, the
-	// // request is aborted with the provided error.
-	// //
-	// // The proxy type is determined by the URL scheme. "http",
-	// // "https", and "socks5" are supported. If the scheme is empty,
-	// // "http" is assumed.
-	// //
-	// // If the proxy URL contains a userinfo subcomponent,
-	// // the proxy request will pass the username and password
-	// // in a Proxy-Authorization header.
-	// //
-	// // If Proxy is nil or returns a nil *URL, no proxy is used.
-	// Proxy func(*Request) (*url.URL, error)
+	// Proxy specifies a function to return a proxy for a given
+	// Request. If the function returns a non-nil error, the
+	// request is aborted with the provided error.
+	//
+	// The proxy type is determined by the URL scheme. "http",
+	// "https", and "socks5" are supported. If the scheme is empty,
+	// "http" is assumed.
+	//
+	// If the proxy URL contains a userinfo subcomponent,
+	// the proxy request will pass the username and password
+	// in a Proxy-Authorization header.
+	//
+	// If Proxy is nil or returns a nil *URL, no proxy is used.
+	Proxy func(*Request) (*url.URL, error)
 
 	// // OnProxyConnectResponse is called when the Transport gets an HTTP response from
 	// // a proxy for a CONNECT request. It's called before the check for a 200 OK response.
@@ -145,35 +146,35 @@ type Transport struct {
 	// If both are set, DialContext takes priority.
 	Dial func(network, addr string) (net.Conn, error)
 
-	// // DialTLSContext specifies an optional dial function for creating
-	// // TLS connections for non-proxied HTTPS requests.
-	// //
-	// // If DialTLSContext is nil (and the deprecated DialTLS below is also nil),
-	// // DialContext and TLSClientConfig are used.
-	// //
-	// // If DialTLSContext is set, the Dial and DialContext hooks are not used for HTTPS
-	// // requests and the TLSClientConfig and TLSHandshakeTimeout
-	// // are ignored. The returned net.Conn is assumed to already be
-	// // past the TLS handshake.
-	// DialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	// DialTLSContext specifies an optional dial function for creating
+	// TLS connections for non-proxied HTTPS requests.
+	//
+	// If DialTLSContext is nil (and the deprecated DialTLS below is also nil),
+	// DialContext and TLSClientConfig are used.
+	//
+	// If DialTLSContext is set, the Dial and DialContext hooks are not used for HTTPS
+	// requests and the TLSClientConfig and TLSHandshakeTimeout
+	// are ignored. The returned net.Conn is assumed to already be
+	// past the TLS handshake.
+	DialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
-	// // DialTLS specifies an optional dial function for creating
-	// // TLS connections for non-proxied HTTPS requests.
-	// //
-	// // Deprecated: Use DialTLSContext instead, which allows the transport
-	// // to cancel dials as soon as they are no longer needed.
-	// // If both are set, DialTLSContext takes priority.
-	// DialTLS func(network, addr string) (net.Conn, error)
+	// DialTLS specifies an optional dial function for creating
+	// TLS connections for non-proxied HTTPS requests.
+	//
+	// Deprecated: Use DialTLSContext instead, which allows the transport
+	// to cancel dials as soon as they are no longer needed.
+	// If both are set, DialTLSContext takes priority.
+	DialTLS func(network, addr string) (net.Conn, error)
 
-	// // TLSClientConfig specifies the TLS configuration to use with
-	// // tls.Client.
-	// // If nil, the default configuration is used.
-	// // If non-nil, HTTP/2 support may not be enabled by default.
-	// TLSClientConfig *tls.Config
+	// TLSClientConfig specifies the TLS configuration to use with
+	// tls.Client.
+	// If nil, the default configuration is used.
+	// If non-nil, HTTP/2 support may not be enabled by default.
+	TLSClientConfig *tls.Config
 
-	// // TLSHandshakeTimeout specifies the maximum amount of time to
-	// // wait for a TLS handshake. Zero means no timeout.
-	// TLSHandshakeTimeout time.Duration
+	// TLSHandshakeTimeout specifies the maximum amount of time to
+	// wait for a TLS handshake. Zero means no timeout.
+	TLSHandshakeTimeout time.Duration
 
 	// DisableKeepAlives, if true, disables HTTP keep-alives and
 	// will only use the connection to the server for a single
@@ -278,12 +279,12 @@ type Transport struct {
 	// h2transport        h2Transport // non-nil if http2 wired up
 	// tlsNextProtoWasNil bool        // whether TLSNextProto was nil when the Once fired
 
-	// // ForceAttemptHTTP2 controls whether HTTP/2 is enabled when a non-zero
-	// // Dial, DialTLS, or DialContext func or TLSClientConfig is provided.
-	// // By default, use of any those fields conservatively disables HTTP/2.
-	// // To use a custom dialer or TLS config and still attempt HTTP/2
-	// // upgrades, set this to true.
-	// ForceAttemptHTTP2 bool
+	// ForceAttemptHTTP2 controls whether HTTP/2 is enabled when a non-zero
+	// Dial, DialTLS, or DialContext func or TLSClientConfig is provided.
+	// By default, use of any those fields conservatively disables HTTP/2.
+	// To use a custom dialer or TLS config and still attempt HTTP/2
+	// upgrades, set this to true.
+	ForceAttemptHTTP2 bool
 }
 
 // A cancelKey is the key of the reqCanceler map.
@@ -305,6 +306,18 @@ func (t *Transport) readBufferSize() int {
 		return t.ReadBufferSize
 	}
 	return 4 << 10
+}
+
+func (t *Transport) hasCustomTLSDialer() bool {
+	return t.DialTLS != nil || t.DialTLSContext != nil
+}
+
+// ProxyURL returns a proxy function (for use in a [Transport])
+// that always returns the same URL.
+func ProxyURL(fixedURL *url.URL) func(*Request) (*url.URL, error) {
+	return func(r *Request) (*url.URL, error) {
+		return fixedURL, nil
+	}
 }
 
 // transportRequest is a wrapper around a *Request that adds
@@ -556,11 +569,25 @@ func (t *Transport) cancelRequest(key cancelKey, err error) bool {
 func (t *Transport) connectMethodForRequst(treq *transportRequest) (cm connectMethod, err error) {
 	cm.targetScheme = treq.URL.Scheme
 	cm.targetAddr = canonicalAddr(treq.URL)
-	// if t.Proxy != nil {
-	// 	cm.proxyURL, err = t.Proxy(treq.Request)
-	// }
+	if t.Proxy != nil {
+		cm.proxyURL, err = t.Proxy(treq.Request)
+	}
 	cm.onlyH1 = treq.requiresHTTP1()
 	return cm, err
+}
+
+// proxyAuth returns the Proxy-Authorization header to set
+// on requests, if applicable.
+func (cm *connectMethod) proxyAuth() string {
+	if cm.proxyURL == nil {
+		return ""
+	}
+	if u := cm.proxyURL.User; u != nil {
+		username := u.Username()
+		password, _ := u.Password()
+		return "Basic" + basicAuth(username, password)
+	}
+	return ""
 }
 
 // error values for debugging and testing, not seen by users.
@@ -1025,6 +1052,18 @@ func (q *wantConnQueue) cleanFront() (cleaned bool) {
 	}
 }
 
+func (t *Transport) customDialTLS(ctx context.Context, network, addr string) (conn net.Conn, err error) {
+	if t.DialTLSContext != nil {
+		conn, err = t.DialTLSContext(ctx, network, addr)
+	} else {
+		conn, err = t.DialTLS(network, addr)
+	}
+	if conn == nil && err == nil {
+		err = errors.New("net/http: Transport.DialTLS or DialTLSContext returned (nil, nil)")
+	}
+	return
+}
+
 // getConn dials and creates a new persistConn to the target as
 // specified in the connectMethod. This includes doing a proxy CONNECT
 // and/or setting up TLS.  If this doesn't return an error, the persistConn
@@ -1214,6 +1253,58 @@ func (t *Transport) decConnsPerHost(key connectMethodKey) {
 	}
 }
 
+// Add TLS to a persistent connection, i.e. negotiate a TLS session. If pconn is already a TLS
+// tunnel, this function establishes a nested TLS session inside the encrypted channel.
+// The remote endpoint's name may be overridden by TLSClientConfig.ServerName.
+func (pconn *persistConn) addTLS(ctx context.Context, name string, trace *httptrace.ClientTrace) error {
+	// Initiate TLS and check remote host name against certificate.
+	cfg := cloneTLSConfig(pconn.t.TLSClientConfig)
+	if cfg.ServerName == "" {
+		cfg.ServerName = name
+	}
+	if pconn.cacheKey.onlyH1 {
+		cfg.NextProtos = nil
+	}
+	plainConn := pconn.conn
+	tlsConn := tls.Client(plainConn, cfg)
+	errc := make(chan error, 2)
+	var timer *time.Timer // for canceling TLS handshake
+	if d := pconn.t.TLSHandshakeTimeout; d != 0 {
+		timer = time.AfterFunc(d, func() {
+			errc <- tlsHandshakeTimeoutError{}
+		})
+	}
+	go func() {
+		if trace != nil && trace.TLSHandshakeStart != nil {
+			trace.TLSHandshakeStart()
+		}
+		err := tlsConn.HandshakeContext(ctx)
+		if timer != nil {
+			timer.Stop()
+		}
+		errc <- err
+	}()
+	if err := <-errc; err != nil {
+		plainConn.Close()
+		if err == (tlsHandshakeTimeoutError{}) {
+			// Now that we have closed the connection,
+			// wait for the call to HandshakeContext to return.
+			<-errc
+		}
+		if trace != nil && trace.TLSHandshakeDone != nil {
+			trace.TLSHandshakeDone(tls.ConnectionState{}, err)
+		}
+		return err
+	}
+	cs := tlsConn.ConnectionState()
+	if trace != nil && trace.TLSHandshakeDone != nil {
+		trace.TLSHandshakeDone(cs, nil)
+	}
+	pconn.tlsState = &cs
+	pconn.conn = tlsConn
+	return nil
+}
+
 func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *persistConn, err error) {
 	pconn = &persistConn{
 		t:             t,
@@ -1224,7 +1315,7 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 		writeErrCh:    make(chan error, 1),
 		writeLoopDone: make(chan struct{}),
 	}
-	// trace := httptrace.ContextClientTrace(ctx)
+	trace := httptrace.ContextClientTrace(ctx)
 	wrapErr := func(err error) error {
 		if cm.proxyURL != nil {
 			// Return a typed error, per Issue 16997
@@ -1232,21 +1323,63 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 		}
 		return err
 	}
-
-	// TODO: Handle HTTPS.
-
-	conn, err := t.dial(ctx, "tcp", cm.addr())
-	if err != nil {
-		return nil, wrapErr(err)
+	if cm.scheme() == "https" && t.hasCustomTLSDialer() {
+		var err error
+		pconn.conn, err = t.customDialTLS(ctx, "tcp", cm.addr())
+		if err != nil {
+			return nil, wrapErr(err)
+		}
+		if tc, ok := pconn.conn.(*tls.Conn); ok {
+			// Handshake here, in case DialTLS didn't. TLSNextProto below
+			// depends on it for knowing the connection state.
+			if trace != nil && trace.TLSHandshakeStart != nil {
+				trace.TLSHandshakeStart()
+			}
+			if err := tc.HandshakeContext(ctx); err != nil {
+				go pconn.conn.Close()
+				if trace != nil && trace.TLSHandshakeDone != nil {
+					trace.TLSHandshakeDone(tls.ConnectionState{}, err)
+				}
+				return nil, err
+			}
+			cs := tc.ConnectionState()
+			if trace != nil && trace.TLSHandshakeDone != nil {
+				trace.TLSHandshakeDone(cs, nil)
+			}
+			pconn.tlsState = &cs
+		}
+	} else {
+		conn, err := t.dial(ctx, "tcp", cm.addr())
+		if err != nil {
+			return nil, wrapErr(err)
+		}
+		pconn.conn = conn
+		if cm.scheme() == "https" {
+			var firstTLSHost string
+			if firstTLSHost, _, err = net.SplitHostPort(cm.addr()); err != nil {
+				return nil, wrapErr(err)
+			}
+			if err = pconn.addTLS(ctx, firstTLSHost, trace); err != nil {
+				return nil, wrapErr(err)
+			}
+		}
 	}
-	pconn.conn = conn
-	// TODO: Handle HTTPS
 
 	// Proxy setup.
 	switch {
 	case cm.proxyURL == nil:
 		// Do nothing. Not using a proxy.
-		// TODO: Use a proxy.
+	case cm.proxyURL.Scheme == "socks5":
+		// TODO: Implement logic.
+	case cm.targetScheme == "http":
+		pconn.isProxy = true
+		if pa := cm.proxyAuth(); pa != "" {
+			pconn.mutateHeaderFunc = func(h Header) {
+				h.Set("Proxy-Authorization", pa)
+			}
+		}
+	case cm.targetScheme == "https":
+		// TODO: Implement logic.
 	}
 
 	// if cm.proxyURL != nil && cm.targetScheme == "https" {
@@ -1334,6 +1467,14 @@ func (cm *connectMethod) key() connectMethodKey {
 	}
 }
 
+// scheme returns the first hop scheme: http, https, or socks5
+func (cm *connectMethod) scheme() string {
+	if cm.proxyURL != nil {
+		return cm.proxyURL.Scheme
+	}
+	return cm.targetScheme
+}
+
 // addr returns the first hop "host:port" to which we need to TCP connect.
 func (cm *connectMethod) addr() string {
 	if cm.proxyURL != nil {
@@ -1367,10 +1508,10 @@ type persistConn struct {
 	// If it's non-nil, the rest of the fields are unused.
 	alt RoundTripper
 
-	t        *Transport
-	cacheKey connectMethodKey
-	conn     net.Conn
-	// tlsState  *tls.ConnectionState
+	t         *Transport
+	cacheKey  connectMethodKey
+	conn      net.Conn
+	tlsState  *tls.ConnectionState
 	br        *bufio.Reader       // from conn
 	bw        *bufio.Writer       // to conn
 	nwrite    int64               // bytes written
@@ -2303,6 +2444,22 @@ func (gz *gzipReader) Read(p []byte) (n int, err error) {
 
 func (gz *gzipReader) Close() error {
 	return gz.body.Close()
+}
+
+type tlsHandshakeTimeoutError struct{}
+
+func (tlsHandshakeTimeoutError) Timeout() bool   { return true }
+func (tlsHandshakeTimeoutError) Temporary() bool { return true }
+func (tlsHandshakeTimeoutError) Error() string   { return "net/http: TLS handshake timeout" }
+
+// cloneTLSConfig returns a shallow clone of cfg, or a new zero tls.Config if
+// cfg is nil. This is safe to call even if cfg is in active use by a TLS
+// client or server.
+func cloneTLSConfig(cfg *tls.Config) *tls.Config {
+	if cfg == nil {
+		return &tls.Config{}
+	}
+	return cfg.Clone()
 }
 
 type connLRU struct {

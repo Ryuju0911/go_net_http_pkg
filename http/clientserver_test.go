@@ -17,9 +17,9 @@ import (
 type testMode string
 
 const (
-	http1Mode = testMode("h1") // HTTP/1.1
-	// https1Mode = testMode("https1") // HTTPS/1.1
-	http2Mode = testMode("h2") // HTTP/2
+	http1Mode  = testMode("h1")     // HTTP/1.1
+	https1Mode = testMode("https1") // HTTPS/1.1
+	http2Mode  = testMode("h2")     // HTTP/2
 )
 
 type testNotParallelOpt struct{}
@@ -123,8 +123,8 @@ func newClientServerTest(t testing.TB, mode testMode, h Handler, opts ...any) *c
 	switch mode {
 	case http1Mode:
 		cst.ts.Start()
-	// case https1Mode:
-	// 	cst.ts.StartTLS()
+	case https1Mode:
+		cst.ts.StartTLS()
 	// case http2Mode:
 	// 	ExportHttp2ConfigureServer(cst.ts.Config, nil)
 	// 	cst.ts.TLS = cst.ts.Config.TLSConfig
