@@ -263,6 +263,34 @@ func TestHTTP10KeepAlive304Response(t *testing.T) {
 		HandlerFunc(send304))
 }
 
+// Test that the HTTPS server nicely rejects plaintext HTTP/1.x requests.
+func TestTLSServerRejectHTTPRequests(t *testing.T) {
+	// run(t, testTLSServerRejectHTTPRequests, []testMode{https1Mode, http2Mode})
+	run(t, testTLSServerRejectHTTPRequests, []testMode{https1Mode})
+}
+func testTLSServerRejectHTTPRequests(t *testing.T, mode testMode) {
+	ts := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		t.Error("unexpected HTTPS request")
+	}), func(ts *httptest.Server) {
+		var errBuf bytes.Buffer
+		ts.Config.ErrorLog = log.New(&errBuf, "", 0)
+	}).ts
+	conn, err := net.Dial("tcp", ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	io.WriteString(conn, "GET / HTTP/1.1\r\nHost: foo\r\n\r\n")
+	slurp, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantPrefix = "HTTP/1.0 400 Bad Request\r\n"
+	if !strings.HasPrefix(string(slurp), wantPrefix) {
+		t.Errorf("response = %q; wanted prefix %q", slurp, wantPrefix)
+	}
+}
+
 type serverExpectTest struct {
 	contentLength    int // of request body
 	chunked          bool

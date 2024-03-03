@@ -9,6 +9,7 @@ package http
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -234,6 +235,10 @@ type conn struct {
 	// It is populated immediately inside the (*conn).serve goroutine.
 	// This is the value of a Handler's (*Request).RemoteAddr.
 	remoteAddr string
+
+	// tlsState is the TLS connection state when using TLS.
+	// nil means not TLS.
+	tlsState *tls.ConnectionState
 
 	// werr is set to the first write error to rwc.
 	// It is set via checkConnErrorWriter{w}, where bufw writes.
@@ -770,6 +775,28 @@ func (srv *Server) maxHeaderBytes() int {
 
 func (srv *Server) initialReadLimitSize() int64 {
 	return int64(srv.maxHeaderBytes()) + 4096 // bufio slop
+}
+
+// tlsHandshakeTimeout returns the time limit permitted for the TLS
+// handshake, or zero for unlimited.
+//
+// It returns the minimum of any positive ReadHeaderTimeout,
+// ReadTimeout, or WriteTimeout.
+func (srv *Server) tlsHandshakeTimeout() time.Duration {
+	var ret time.Duration
+	for _, v := range [...]time.Duration{
+		srv.ReadHeaderTimeout,
+		srv.ReadTimeout,
+		srv.WriteTimeout,
+	} {
+		if v <= 0 {
+			continue
+		}
+		if ret == 0 || v < ret {
+			ret = v
+		}
+	}
+	return ret
 }
 
 // wrapper around io.ReadCloser which on first read, sends an
@@ -1646,6 +1673,17 @@ func (c *conn) closeWriteAndWait() {
 	time.Sleep(rstAvoidanceDelay)
 }
 
+// validNextProto reports whether the proto is a valid ALPN protocol name.
+// Everything is valid except the empty string and built-in protocol types,
+// so that those can't be overridden with alternate implementations.
+func validNextProto(proto string) bool {
+	switch proto {
+	case "", "http/1.1", "http/1.0":
+		return false
+	}
+	return true
+}
+
 const (
 	runHooks  = true
 	skipHooks = false
@@ -1735,7 +1773,44 @@ func (c *conn) serve(ctx context.Context) {
 		}
 	}()
 
-	// TODO: handle TLS.
+	if tlsConn, ok := c.rwc.(*tls.Conn); ok {
+		tlsT0 := c.server.tlsHandshakeTimeout()
+		if tlsT0 > 0 {
+			dl := time.Now().Add(tlsT0)
+			c.rwc.SetReadDeadline(dl)
+			c.rwc.SetWriteDeadline(dl)
+		}
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			// If the handshake failed due to the client not speaking
+			// TLS, assume they're speaking plaintext HTTP and write a
+			// 400 response on the TLS conn's underlying net.Conn.
+			if re, ok := err.(tls.RecordHeaderError); ok && re.Conn != nil && tlsRecordHeaderLooksLikeHTTP(re.RecordHeader) {
+				io.WriteString(re.Conn, "HTTP/1.0 400 Bad Request\r\n\r\nClient sent an HTTP request to an HTTPS server.\n")
+				re.Conn.Close()
+				return
+			}
+			c.server.logf("http: TLS handshake error from %s: %v", c.rwc.RemoteAddr(), err)
+			return
+		}
+		// Restore Conn-level deadlines.
+		if tlsT0 > 0 {
+			c.rwc.SetReadDeadline(time.Time{})
+			c.rwc.SetWriteDeadline(time.Time{})
+		}
+		c.tlsState = new(tls.ConnectionState)
+		*c.tlsState = tlsConn.ConnectionState()
+		if proto := c.tlsState.NegotiatedProtocol; validNextProto(proto) {
+			if fn := c.server.TLSNextProto[proto]; fn != nil {
+				h := initALPNRequest{ctx, tlsConn, serverHandler{c.server}}
+				// Mark freshly created HTTP/2 as active and prevent any server state hooks
+				// from being run on these connections. This prevents closeIdleConns from
+				// closing such connections. See issue https://golang.org/issue/39776.
+				c.setState(c.rwc, StateActive, skipHooks)
+				fn(c.server, tlsConn, h)
+			}
+			return
+		}
+	}
 
 	// HTTP/1.x from here on.
 
@@ -2539,6 +2614,17 @@ type Server struct {
 	// If zero, DefaultMaxHeaderBytes is used.
 	MaxHeaderBytes int
 
+	// TLSNextProto optionally specifies a function to take over
+	// ownership of the provided TLS connection when an ALPN
+	// protocol upgrade has occurred. The map key is the protocol
+	// name negotiated. The Handler argument should be used to
+	// handle HTTP requests and will initialize the Request's TLS
+	// and RemoteAddr if not already set. The connection is
+	// automatically closed when the function returns.
+	// If TLSNextProto is not nil, HTTP/2 support is not enabled
+	// automatically.
+	TLSNextProto map[string]func(*Server, *tls.Conn, Handler)
+
 	// ConnState specifies an optional callback function that is
 	// called when a client connection changes state. See the
 	// ConnState type and associated constants for details.
@@ -2962,6 +3048,35 @@ func (oc *onceCloseListener) Close() error {
 
 func (oc *onceCloseListener) close() { oc.closeErr = oc.Listener.Close() }
 
+// initALPNRequest is an HTTP handler that initializes certain
+// uninitialized fields in its *Request. Such partially-initialized
+// Requests come from ALPN protocol handlers.
+type initALPNRequest struct {
+	ctx context.Context
+	c   *tls.Conn
+	h   serverHandler
+}
+
+// BaseContext is an exported but unadvertised [http.Handler] method
+// recognized by x/net/http2 to pass down a context; the TLSNextProto
+// API predates context support so we shoehorn through the only
+// interface we have available.
+func (h initALPNRequest) BaseContext() context.Context { return h.ctx }
+
+func (h initALPNRequest) ServeHTTP(rw ResponseWriter, req *Request) {
+	if req.TLS == nil {
+		req.TLS = &tls.ConnectionState{}
+		*req.TLS = h.c.ConnectionState()
+	}
+	if req.Body == nil {
+		req.Body = NoBody
+	}
+	if req.RemoteAddr == "" {
+		req.RemoteAddr = h.c.RemoteAddr().String()
+	}
+	h.h.ServeHTTP(rw, req)
+}
+
 // checkConnErrorWriter writes to c.rwc and records any write errors to c.werr.
 // It only contains one field (and a pointer field at that), so it
 // fits in an interface value without an extra allocation.
@@ -2987,4 +3102,14 @@ func numLeadingCRorLF(v []byte) (n int) {
 		break
 	}
 	return
+}
+
+// tlsRecordHeaderLooksLikeHTTP reports whether a TLS record header
+// looks like it might've been a misdirected plaintext HTTP request.
+func tlsRecordHeaderLooksLikeHTTP(hdr [5]byte) bool {
+	switch string(hdr[:]) {
+	case "GET /", "HEAD ", "POST ", "PUT /", "OPTIO":
+		return true
+	}
+	return false
 }

@@ -7,10 +7,13 @@
 package httptest
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/http/internal/testcert"
 	"os"
 	"strings"
 	"sync"
@@ -23,22 +26,22 @@ type Server struct {
 	URL      string // base URL of form http://ipaddr:port with no trailing slash
 	Listener net.Listener
 
-	// // EnableHTTP2 controls whether HTTP/2 is enabled
-	// // on the server. It must be set between calling
-	// // NewUnstartedServer and calling Server.StartTLS.
-	// EnableHTTP2 bool
+	// EnableHTTP2 controls whether HTTP/2 is enabled
+	// on the server. It must be set between calling
+	// NewUnstartedServer and calling Server.StartTLS.
+	EnableHTTP2 bool
 
-	// // TLS is the optional TLS configuration, populated with a new config
-	// // after TLS is started. If set on an unstarted server before StartTLS
-	// // is called, existing fields are copied into the new config.
-	// TLS *tls.Config
+	// TLS is the optional TLS configuration, populated with a new config
+	// after TLS is started. If set on an unstarted server before StartTLS
+	// is called, existing fields are copied into the new config.
+	TLS *tls.Config
 
 	// Config may be changed after calling NewUnstartedServer and
 	// before Start or StartTLS.
 	Config *http.Server
 
-	// // certificate is a parsed version of the TLS config certificate, if present.
-	// certificate *x509.Certificate
+	// certificate is a parsed version of the TLS config certificate, if present.
+	certificate *x509.Certificate
 
 	// wg counts the number of outstanding HTTP requests on this server.
 	// Close blocks until all requests are finished.
@@ -110,6 +113,53 @@ func (s *Server) Start() {
 	}
 }
 
+// StartTLS starts TLS on a server from NewUnstartedServer.
+func (s *Server) StartTLS() {
+	if s.URL != "" {
+		panic("Server already started")
+	}
+	if s.client == nil {
+		s.client = &http.Client{}
+	}
+	cert, err := tls.X509KeyPair(testcert.LocalhostCert, testcert.LocalhostKey)
+	if err != nil {
+		panic(fmt.Sprintf("httptest: NewTLSServer: %v", err))
+	}
+
+	existingConfig := s.TLS
+	if existingConfig != nil {
+		s.TLS = existingConfig.Clone()
+	} else {
+		s.TLS = new(tls.Config)
+	}
+	if s.TLS.NextProtos == nil {
+		nextProtos := []string{"http/1.1"}
+		if s.EnableHTTP2 {
+			nextProtos = []string{"h2"}
+		}
+		s.TLS.NextProtos = nextProtos
+	}
+	if len(s.TLS.Certificates) == 0 {
+		s.TLS.Certificates = []tls.Certificate{cert}
+	}
+	s.certificate, err = x509.ParseCertificate(s.TLS.Certificates[0].Certificate[0])
+	if err != nil {
+		panic(fmt.Sprintf("httptest: NewTLSServer: %v", err))
+	}
+	certpool := x509.NewCertPool()
+	certpool.AddCert(s.certificate)
+	s.client.Transport = &http.Transport{
+		TLSClientConfig: &tls.Config{
+			RootCAs: certpool,
+		},
+		ForceAttemptHTTP2: s.EnableHTTP2,
+	}
+	s.Listener = tls.NewListener(s.Listener, s.TLS)
+	s.URL = "https://" + s.Listener.Addr().String()
+	s.wrap()
+	s.goServe()
+}
+
 type closeIdleTransport interface {
 	CloseIdleConnections()
 }
@@ -177,6 +227,12 @@ func (s *Server) logCloseHangDebugInfo() {
 		fmt.Fprintf(&buf, "  %T %p %v in state %v\n", c, c, c.RemoteAddr(), st)
 	}
 	log.Print(buf.String())
+}
+
+// Certificate returns the certificate used by the server, or nil if
+// the server doesn't use TLS.
+func (s *Server) Certificate() *x509.Certificate {
+	return s.certificate
 }
 
 // Client returns an HTTP client configured for making requests to the server.
