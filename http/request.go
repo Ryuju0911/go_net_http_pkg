@@ -1249,6 +1249,22 @@ func (r *Request) closeBody() error {
 	return r.Body.Close()
 }
 
+func (r *Request) isReplayable() bool {
+	if r.Body == nil || r.Body == NoBody || r.GetBody != nil {
+		switch valueOrDefault(r.Method, "GET") {
+		case "GET", "HEAD", "OPTIONS", "TRACE":
+			return true
+		}
+		// The Idempotency-Key, while non-standard, is widely used to
+		// mean a POST or other request is idempotent. See
+		// https://golang.org/issue/19943#issuecomment-421092421
+		if r.Header.has("Idempotency-Key") || r.Header.has("X-Idempotency-Key") {
+			return true
+		}
+	}
+	return false
+}
+
 // outgoingLength reports the Content-Length of this outgoing (Client) request.
 // It maps 0 into -1 (unknown) when the Body is non-nil.
 func (r *Request) outgoingLength() int64 {

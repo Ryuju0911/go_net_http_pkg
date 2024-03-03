@@ -447,23 +447,23 @@ func (t *Transport) roundTrip(req *Request) (*Response, error) {
 		// 		if t.removeIdleConn(pconn) {
 		// 			t.decConnsPerHost(pconn.cacheKey)
 		// 		}
-		// 	} else if !pconn.shouldRetryRequest(req, err) {
-		// 		// Issue 16465: return underlying net.Conn.Read error from peek,
-		// 		// as we've historically done.
-		// 		if e, ok := err.(nothingWrittenError); ok {
-		// 			err = e.error
-		// 		}
-		// 		if e, ok := err.(transportReadFromServerError); ok {
-		// 			err = e.err
-		// 		}
-		// 		if b, ok := req.Body.(*readTrackingBody); ok && !b.didClose {
-		// 			// Issue 49621: Close the request body if pconn.roundTrip
-		// 			// didn't do so already. This can happen if the pconn
-		// 			// write loop exits without reading the write request.
-		// 			req.closeBody()
-		// 		}
-		// 		return nil, err
-		// 	}
+		if !pconn.shouldRetryRequest(req, err) {
+			// Issue 16465: return underlying net.Conn.Read error from peek,
+			// as we've historically done.
+			if e, ok := err.(nothingWrittenError); ok {
+				err = e.error
+			}
+			if e, ok := err.(transportReadFromServerError); ok {
+				err = e.err
+			}
+			if b, ok := req.Body.(*readTrackingBody); ok && !b.didClose {
+				// Issue 49621: Close the request body if pconn.roundTrip
+				// didn't do so already. This can happen if the pconn
+				// write loop exits without reading the write request.
+				req.closeBody()
+			}
+			return nil, err
+		}
 		// 	testHookRoundTripRetried()
 
 		// Rewind the body if we're able to.
@@ -526,6 +526,56 @@ func rewindBody(req *Request) (rewound *Request, err error) {
 	newReq := *req
 	newReq.Body = &readTrackingBody{ReadCloser: body}
 	return &newReq, nil
+}
+
+// shouldRetryRequest reports whether we should retry sending a failed
+// HTTP request on a new connection. The non-nil input error is the
+// error from roundTrip.
+func (pc *persistConn) shouldRetryRequest(req *Request, err error) bool {
+	// if http2isNoCachedConnError(err) {
+	// 	// Issue 16582: if the user started a bunch of
+	// 	// requests at once, they can all pick the same conn
+	// 	// and violate the server's max concurrent streams.
+	// 	// Instead, match the HTTP/1 behavior for now and dial
+	// 	// again to get a new TCP connection, rather than failing
+	// 	// this request.
+	// 	return true
+	// }
+	if err == errMissingHost {
+		// User error.
+		return false
+	}
+	if !pc.isReused() {
+		// This was a fresh connection. There's no reason the server
+		// should've hung up on us.
+		//
+		// Also, if we retried now, we could loop forever
+		// creating new connections and retrying if the server
+		// is just hanging up on us because it doesn't like
+		// our request (as opposed to sending an error).
+		return false
+	}
+	if _, ok := err.(nothingWrittenError); ok {
+		// We never wrote anything, so it's safe to retry, if there's no body or we
+		// can "rewind" the body with GetBody.
+		return req.outgoingLength() == 0 || req.GetBody != nil
+	}
+	if !req.isReplayable() {
+		// Don't retry non-idempotent requests.
+		return false
+	}
+	if _, ok := err.(transportReadFromServerError); ok {
+		// We got some non-EOF net.Conn.Read failure reading
+		// the 1st response byte from the server.
+		return true
+	}
+	if err == errServerClosedIdle {
+		// The server replied with io.EOF while we were trying to
+		// read the response. Probably an unfortunately keep-alive
+		// timeout, just as the client was writing a request.
+		return true
+	}
+	return false // conservatively
 }
 
 // CloseIdleConnections closes any connections which were previously

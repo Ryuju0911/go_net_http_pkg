@@ -6,7 +6,9 @@ package http_test
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	. "net/http"
@@ -27,7 +29,7 @@ func TestNextProtoUpgrade(t *testing.T) {
 			t.Error("request with no RemoteAddr")
 		}
 		if r.Body == nil {
-			t.Errorf("request with nil body")
+			t.Errorf("request with nil Body")
 		}
 	}))
 	ts.TLS = &tls.Config{
@@ -55,31 +57,31 @@ func TestNextProtoUpgrade(t *testing.T) {
 		}
 	}
 
-	// // Request to an advertised but unhandled NPN protocol.
-	// // Server will hang up.
-	// {
-	// 	certPool := x509.NewCertPool()
-	// 	certPool.AddCert(ts.Certificate())
-	// 	tr := &Transport{
-	// 		TLSClientConfig: &tls.Config{
-	// 			RootCAs:    certPool,
-	// 			NextProtos: []string{"unhandled-proto"},
-	// 		},
-	// 	}
-	// 	defer tr.CloseIdleConnections()
-	// 	c := &Client{
-	// 		Transport: tr,
-	// 	}
-	// 	res, err := c.Get(ts.URL)
-	// 	if err == nil {
-	// 		defer res.Body.Close()
-	// 		var buf bytes.Buffer
-	// 		res.Write(&buf)
-	// 		t.Errorf("expected error on unhandled-proto request; got: %s", buf.Bytes())
-	// 	}
-	// }
+	// Request to an advertised but unhandled NPN protocol.
+	// Server will hang up.
+	{
+		certPool := x509.NewCertPool()
+		certPool.AddCert(ts.Certificate())
+		tr := &Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:    certPool,
+				NextProtos: []string{"unhandled-proto"},
+			},
+		}
+		defer tr.CloseIdleConnections()
+		c := &Client{
+			Transport: tr,
+		}
+		res, err := c.Get(ts.URL)
+		if err == nil {
+			defer res.Body.Close()
+			var buf bytes.Buffer
+			res.Write(&buf)
+			t.Errorf("expected error on unhandled-proto request; got: %s", buf.Bytes())
+		}
+	}
 
-	// Request using "tls-0.9" protocol, which we register here.
+	// Request using the "tls-0.9" protocol, which we register here.
 	// It is HTTP/0.9 over TLS.
 	{
 		c := ts.Client()
