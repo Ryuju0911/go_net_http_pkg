@@ -18,11 +18,13 @@ import (
 	"io"
 	"net"
 	. "net/http"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReuetRequest(t *testing.T) { run(t, testReuseRequest) }
@@ -327,6 +329,118 @@ func testTransportTreat101Terminal(t *testing.T, mode testMode) {
 	}
 }
 
+func TestTransportTLSHandshakeTimeout(t *testing.T) {
+	defer afterTest(t)
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	ln := newLocalListener(t)
+	defer ln.Close()
+	testdonec := make(chan struct{})
+	defer close(testdonec)
+
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		<-testdonec
+		c.Close()
+	}()
+
+	tr := &Transport{
+		Dial: func(_, _ string) (net.Conn, error) {
+			return net.Dial("tcp", ln.Addr().String())
+		},
+		TLSHandshakeTimeout: 250 * time.Millisecond,
+	}
+	cl := &Client{Transport: tr}
+	_, err := cl.Get("https://dummy.tld/")
+	if err == nil {
+		t.Error("expected error")
+		return
+	}
+	ue, ok := err.(*url.Error)
+	if !ok {
+		t.Errorf("expected url.Error; got %#v", err)
+		return
+	}
+	ne, ok := ue.Err.(net.Error)
+	if !ok {
+		t.Errorf("expected net.Error; got %#v", err)
+		return
+	}
+	if !ne.Timeout() {
+		t.Errorf("expected timeout error; got %v", err)
+	}
+	if !strings.Contains(err.Error(), "handshake timeout") {
+		t.Errorf("expected 'handshake timeout' in error; got %v", err)
+	}
+}
+
+// Trying to repro golang.org/issue/3514
+func TestTLSServerClosesConnection(t *testing.T) {
+	run(t, testTLSServerClosesConnection, []testMode{https1Mode})
+}
+func testTLSServerClosesConnection(t *testing.T, mode testMode) {
+	closedc := make(chan bool, 1)
+	ts := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		if strings.Contains(r.URL.Path, "keep-alive-then-die") {
+			conn, _, _ := w.(Hijacker).Hijack()
+			conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nfoo"))
+			conn.Close()
+			closedc <- true
+			return
+		}
+		fmt.Fprintf(w, "hello")
+	})).ts
+
+	c := ts.Client()
+	tr := c.Transport.(*Transport)
+
+	var nSuccess = 0
+	var errs []error
+	const trials = 20
+	for i := 0; i < trials; i++ {
+		tr.CloseIdleConnections()
+		res, err := c.Get(ts.URL + "/keep-alive-then-die")
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-closedc
+		slurp, err := io.ReadAll(res.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(slurp) != "foo" {
+			t.Errorf("Got %q, want foo", slurp)
+		}
+
+		// Now try again and see if we successfully
+		// pick a new connection.
+		res, err = c.Get(ts.URL + "/")
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		slurp, err = io.ReadAll(res.Body)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		nSuccess++
+	}
+	if nSuccess > 0 {
+		t.Logf("successes = %d of %d", nSuccess, trials)
+	} else {
+		t.Errorf("All runs failed:")
+	}
+	for _, err := range errs {
+		t.Logf("  err: %v", err)
+	}
+}
+
 // logWritesConn is a net.Conn that logs each Write call to writes
 // and then proxies to w.
 // It proxies Read calls to a reader it receives from rch.
@@ -417,6 +531,17 @@ func TestTransportFlushesBodyChunks(t *testing.T) {
 	if !reflect.DeepEqual(lw.writes, want) {
 		t.Errorf("Writes differed.\n Got: %q\nWant: %q\n", lw.writes, want)
 	}
+}
+
+func newLocalListener(t *testing.T) net.Listener {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		ln, err = net.Listen("tcp6", "[::1]:0")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ln
 }
 
 func TestTransportResponseBodyWritableOnProtocolSwitch(t *testing.T) {
