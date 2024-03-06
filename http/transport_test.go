@@ -13,7 +13,9 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -302,6 +305,245 @@ func testTransportGzip(t *testing.T, mode testMode) {
 		n, err = res.Body.Read(buf)
 		if n != 0 || err == nil {
 			t.Errorf("expected Read error after Close; got %d, %v", n, err)
+		}
+	}
+}
+
+func TestTransportProxy(t *testing.T) {
+	defer afterTest(t)
+	testCases := []struct{ siteMode, proxyMode testMode }{
+		{http1Mode, http1Mode},
+		{http1Mode, https1Mode},
+		{https1Mode, http1Mode},
+		{https1Mode, https1Mode},
+	}
+	for _, testCase := range testCases {
+		siteMode := testCase.siteMode
+		proxyMode := testCase.proxyMode
+		t.Run(fmt.Sprintf("site=%v/proxy=%v", siteMode, proxyMode), func(t *testing.T) {
+			siteCh := make(chan *Request, 1)
+			h1 := HandlerFunc(func(w ResponseWriter, r *Request) {
+				siteCh <- r
+			})
+			proxyCh := make(chan *Request, 1)
+			h2 := HandlerFunc(func(w ResponseWriter, r *Request) {
+				proxyCh <- r
+				// Implement an entire CONNECT proxy
+				if r.Method == "CONNECT" {
+					hijacker, ok := w.(Hijacker)
+					if !ok {
+						t.Errorf("hijack not allowed")
+						return
+					}
+					clientConn, _, err := hijacker.Hijack()
+					if err != nil {
+						t.Errorf("hijacking failed")
+						return
+					}
+					res := &Response{
+						StatusCode: StatusOK,
+						Proto:      "HTTP/1.1",
+						ProtoMajor: 1,
+						ProtoMinor: 1,
+						Header:     make(Header),
+					}
+
+					targetConn, err := net.Dial("tcp", r.URL.Host)
+					if err != nil {
+						t.Errorf("net.Dial(%q) failed: %v", r.URL.Host, err)
+						return
+					}
+
+					if err := res.Write(clientConn); err != nil {
+						t.Errorf("Writing 200 OK failed: %v", err)
+						return
+					}
+
+					go io.Copy(targetConn, clientConn)
+					go func() {
+						io.Copy(clientConn, targetConn)
+						targetConn.Close()
+					}()
+				}
+			})
+			ts := newClientServerTest(t, siteMode, h1).ts
+			proxy := newClientServerTest(t, proxyMode, h2).ts
+
+			pu, err := url.Parse(proxy.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// If neither server is HTTPS or both are, then c may be derived from either.
+			// If only one server is HTTPS, c must be derived from that server in order
+			// to ensure that it is configured to use the fake root CA from testcert.go.
+			c := proxy.Client()
+			if siteMode == https1Mode {
+				c = ts.Client()
+			}
+
+			c.Transport.(*Transport).Proxy = ProxyURL(pu)
+			if _, err := c.Head(ts.URL); err != nil {
+				t.Error(err)
+			}
+			got := <-proxyCh
+			c.Transport.(*Transport).CloseIdleConnections()
+			ts.Close()
+			if siteMode == https1Mode {
+				// First message should be a CONNECT, asking for a socket to the real server,
+				if got.Method != "CONNECT" {
+					t.Errorf("Wrong method for secure proxying: %q", got.Method)
+				}
+				gotHost := got.URL.Host
+				pu, err := url.Parse(ts.URL)
+				if err != nil {
+					t.Fatal("Invalid site URL")
+				}
+				if wantHost := pu.Host; gotHost != wantHost {
+					t.Errorf("Got CONNECT host %q, want %q", gotHost, wantHost)
+				}
+
+				// The next message on the channel should be from the site's server.
+				next := <-siteCh
+				if next.Method != "HEAD" {
+					t.Errorf("Wrong method at destination: %s", next.Method)
+				}
+				if nextURL := next.URL.String(); nextURL != "/" {
+					t.Errorf("Wrong URL at destination: %s", nextURL)
+				}
+			} else {
+				if got.Method != "HEAD" {
+					t.Errorf("Wrong method for destination: %q", got.Method)
+				}
+				gotURL := got.URL.String()
+				wantURL := ts.URL + "/"
+				if gotURL != wantURL {
+					t.Errorf("Got URL %q, want %q", gotURL, wantURL)
+				}
+			}
+		})
+	}
+}
+
+func TestOnProxyConnectResponse(t *testing.T) {
+
+	var tcases = []struct {
+		proxyStatusCode int
+		err             error
+	}{
+		{
+			StatusOK,
+			nil,
+		},
+		{
+			StatusForbidden,
+			errors.New("403"),
+		},
+	}
+	for _, tcase := range tcases {
+		h1 := HandlerFunc(func(w ResponseWriter, r *Request) {
+
+		})
+
+		h2 := HandlerFunc(func(w ResponseWriter, r *Request) {
+			// Implement an entire CONNECT proxy
+			if r.Method == "CONNECT" {
+				if tcase.proxyStatusCode != StatusOK {
+					w.WriteHeader(tcase.proxyStatusCode)
+					return
+				}
+				hijacker, ok := w.(Hijacker)
+				if !ok {
+					t.Errorf("hijack not allowed")
+					return
+				}
+				clientConn, _, err := hijacker.Hijack()
+				if err != nil {
+					t.Errorf("hijacking failed")
+					return
+				}
+				res := &Response{
+					StatusCode: StatusOK,
+					Proto:      "HTTP/1.1",
+					ProtoMajor: 1,
+					ProtoMinor: 1,
+					Header:     make(Header),
+				}
+
+				targetConn, err := net.Dial("tcp", r.URL.Host)
+				if err != nil {
+					t.Errorf("net.Dial(%q) failed: %v", r.URL.Host, err)
+					return
+				}
+
+				if err := res.Write(clientConn); err != nil {
+					t.Errorf("Writing 200 OK failed: %v", err)
+					return
+				}
+
+				go io.Copy(targetConn, clientConn)
+				go func() {
+					io.Copy(clientConn, targetConn)
+					targetConn.Close()
+				}()
+			}
+		})
+		ts := newClientServerTest(t, https1Mode, h1).ts
+		proxy := newClientServerTest(t, https1Mode, h2).ts
+
+		pu, err := url.Parse(proxy.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		c := proxy.Client()
+
+		var (
+			dials  atomic.Int32
+			closes atomic.Int32
+		)
+		c.Transport.(*Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := net.Dial(network, addr)
+			if err != nil {
+				return nil, err
+			}
+			dials.Add(1)
+			return noteCloseConn{
+				Conn: conn,
+				closeFunc: func() {
+					closes.Add(1)
+				},
+			}, nil
+		}
+
+		c.Transport.(*Transport).Proxy = ProxyURL(pu)
+		c.Transport.(*Transport).OnProxyConnectResponse = func(ctx context.Context, proxyURL *url.URL, connectReq *Request, connectRes *Response) error {
+			if proxyURL.String() != pu.String() {
+				t.Errorf("proxy url got %s, want %s", proxyURL, pu)
+			}
+
+			if "https://"+connectReq.URL.String() != ts.URL {
+				t.Errorf("connect url got %s, want %s", connectReq.URL, ts.URL)
+			}
+			return tcase.err
+		}
+		wantCloses := int32(0)
+		if _, err := c.Head(ts.URL); err != nil {
+			wantCloses = 1
+			if tcase.err != nil && !strings.Contains(err.Error(), tcase.err.Error()) {
+				t.Errorf("got %v, want %v", err, tcase.err)
+			}
+		} else {
+			if tcase.err != nil {
+				t.Errorf("got %v, want nil", err)
+			}
+		}
+		if got, want := dials.Load(), int32(1); got != want {
+			t.Errorf("got %v dials, want %v", got, want)
+		}
+		// #64804: If OnProxyConnectResponse returns an error, we should close the conn.
+		if got, want := closes.Load(), wantCloses; got != want {
+			t.Errorf("got %v closes, want %v", got, want)
 		}
 	}
 }

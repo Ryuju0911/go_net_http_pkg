@@ -8,6 +8,7 @@ package http_test
 
 import (
 	"log"
+	"net"
 	. "net/http"
 	"net/http/httptest"
 	"strings"
@@ -155,4 +156,14 @@ type testLogWriter struct {
 func (w testLogWriter) Write(b []byte) (int, error) {
 	w.t.Logf("server log: %v", strings.TrimSpace(string(b)))
 	return len(b), nil
+}
+
+type noteCloseConn struct {
+	net.Conn
+	closeFunc func()
+}
+
+func (x noteCloseConn) Close() error {
+	x.closeFunc()
+	return x.Conn.Close()
 }

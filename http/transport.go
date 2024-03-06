@@ -24,6 +24,7 @@ import (
 	"net/http/internal/ascii"
 	"net/textproto"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -119,10 +120,10 @@ type Transport struct {
 	// If Proxy is nil or returns a nil *URL, no proxy is used.
 	Proxy func(*Request) (*url.URL, error)
 
-	// // OnProxyConnectResponse is called when the Transport gets an HTTP response from
-	// // a proxy for a CONNECT request. It's called before the check for a 200 OK response.
-	// // If it returns an error, the request fails with that error.
-	// OnProxyConnectResponse func(ctx context.Context, proxyURL *url.URL, connectReq *Request, connectRes *Response) error
+	// OnProxyConnectResponse is called when the Transport gets an HTTP response from
+	// a proxy for a CONNECT request. It's called before the check for a 200 OK response.
+	// If it returns an error, the request fails with that error.
+	OnProxyConnectResponse func(ctx context.Context, proxyURL *url.URL, connectReq *Request, connectRes *Response) error
 
 	// DialContext specifies the dial function for creating unencrypted TCP connections.
 	// If DialContext is nil (and the deprecated Dial below is also nil),
@@ -242,19 +243,19 @@ type Transport struct {
 	// // automatically.
 	// TLSNextProto map[string]func(authority string, c *tls.Conn) RoundTripper
 
-	// // ProxyConnectHeader optionally specifies headers to send to
-	// // proxies during CONNECT requests.
-	// // To set the header dynamically, see GetProxyConnectHeader.
-	// ProxyConnectHeader Header
+	// ProxyConnectHeader optionally specifies headers to send to
+	// proxies during CONNECT requests.
+	// To set the header dynamically, see GetProxyConnectHeader.
+	ProxyConnectHeader Header
 
-	// // GetProxyConnectHeader optionally specifies a func to return
-	// // headers to send to proxyURL during a CONNECT request to the
-	// // ip:port target.
-	// // If it returns an error, the Transport's RoundTrip fails with
-	// // that error. It can return (nil, nil) to not add headers.
-	// // If GetProxyConnectHeader is non-nil, ProxyConnectHeader is
-	// // ignored.
-	// GetProxyConnectHeader func(ctx context.Context, proxyURL *url.URL, target string) (Header, error)
+	// GetProxyConnectHeader optionally specifies a func to return
+	// headers to send to proxyURL during a CONNECT request to the
+	// ip:port target.
+	// If it returns an error, the Transport's RoundTrip fails with
+	// that error. It can return (nil, nil) to not add headers.
+	// If GetProxyConnectHeader is non-nil, ProxyConnectHeader is
+	// ignored.
+	GetProxyConnectHeader func(ctx context.Context, proxyURL *url.URL, target string) (Header, error)
 
 	// MaxResponseHeaderBytes specifies a limit on how many
 	// response bytes are allowed in the server's response
@@ -1429,14 +1430,97 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 			}
 		}
 	case cm.targetScheme == "https":
-		// TODO: Implement logic.
+		conn := pconn.conn
+		var hdr Header
+		if t.GetProxyConnectHeader != nil {
+			var err error
+			hdr, err = t.GetProxyConnectHeader(ctx, cm.proxyURL, cm.targetAddr)
+			if err != nil {
+				conn.Close()
+				return nil, err
+			}
+		} else {
+			hdr = t.ProxyConnectHeader
+		}
+		if hdr == nil {
+			hdr = make(Header)
+		}
+		if pa := cm.proxyAuth(); pa != "" {
+			hdr = hdr.Clone()
+			hdr.Set("Proxy-Authorization", pa)
+		}
+		connectReq := &Request{
+			Method: "CONNECT",
+			URL:    &url.URL{Opaque: cm.targetAddr},
+			Host:   cm.targetAddr,
+			Header: hdr,
+		}
+
+		// If there's no done channel (no deadline or cancellation
+		// from the caller possible), at least set some (long)
+		// timeout here. This will make sure we don't block forever
+		// and leak a goroutine if the connection stops replying
+		// after the TCP connect.
+		connectCtx := ctx
+		if ctx.Done() == nil {
+			newCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+			defer cancel()
+			connectCtx = newCtx
+		}
+
+		didReadResponse := make(chan struct{}) // closed after CONNECT write+read is done or fails
+		var (
+			resp *Response
+			err  error // write or read error
+		)
+		// Write the CONNECT request & read the response.
+		go func() {
+			defer close(didReadResponse)
+			err = connectReq.Write(conn)
+			if err != nil {
+				return
+			}
+			// Okay to use and discard buffered reader here, because
+			// TLS server will not speak until spoken to.
+			br := bufio.NewReader(conn)
+			resp, err = ReadResponse(br, connectReq)
+		}()
+		select {
+		case <-connectCtx.Done():
+			conn.Close()
+			<-didReadResponse
+			return nil, connectCtx.Err()
+		case <-didReadResponse:
+			// resp or err now set
+		}
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+
+		if t.OnProxyConnectResponse != nil {
+			err = t.OnProxyConnectResponse(ctx, cm.proxyURL, connectReq, resp)
+			if err != nil {
+				conn.Close()
+				return nil, err
+			}
+		}
+
+		if resp.StatusCode != 200 {
+			_, text, ok := strings.Cut(resp.Status, " ")
+			conn.Close()
+			if !ok {
+				return nil, errors.New("unknown status code")
+			}
+			return nil, errors.New(text)
+		}
 	}
 
-	// if cm.proxyURL != nil && cm.targetScheme == "https" {
-	// 	if err := pconn.addTLS(ctx, cm.tlsHost(), trace); err != nil {
-	// 		return nil, err
-	// 	}
-	// }
+	if cm.proxyURL != nil && cm.targetScheme == "https" {
+		if err := pconn.addTLS(ctx, cm.tlsHost(), trace); err != nil {
+			return nil, err
+		}
+	}
 
 	// if s := pconn.tlsState; s != nil && s.NegotiatedProtocolIsMutual && s.NegotiatedProtocol != "" {
 	// 	if next, ok := t.TLSNextProto[s.NegotiatedProtocol]; ok {
@@ -1531,6 +1615,16 @@ func (cm *connectMethod) addr() string {
 		return canonicalAddr(cm.proxyURL)
 	}
 	return cm.targetAddr
+}
+
+// tlsHost returns the host name to match against the peer's
+// TLS certificate.
+func (cm *connectMethod) tlsHost() string {
+	h := cm.targetAddr
+	if hasPort(h) {
+		h = h[:strings.LastIndex(h, ":")]
+	}
+	return h
 }
 
 // connectMethodKey is the map key version of connectMethod, with a

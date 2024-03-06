@@ -931,7 +931,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	ctx, cancelCtx := context.WithCancel(ctx)
 	req.ctx = ctx
 	req.RemoteAddr = c.remoteAddr
-	// req.TLS = c.tlsState
+	req.TLS = c.tlsState
 	if body, ok := req.Body.(*body); ok {
 		body.doEarlyClose = true
 	}

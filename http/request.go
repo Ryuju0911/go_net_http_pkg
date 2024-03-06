@@ -430,6 +430,24 @@ func valueOrDefault(value, def string) string {
 // See https://codereview.appspot.com/7532043.
 const defaultUserAgent = "Go-http-client/1.1"
 
+// Write writes an HTTP/1.1 request, which is the header and body, in wire format.
+// This method consults the following fields of the request:
+//
+//	Host
+//	URL
+//	Method (defaults to "GET")
+//	Header
+//	ContentLength
+//	TransferEncoding
+//	Body
+//
+// If Body is present, Content-Length is <= 0 and [Request.TransferEncoding]
+// hasn't been set to "identity", Write adds "Transfer-Encoding:
+// chunked" to the header. Body is closed after it is sent.
+func (r *Request) Write(w io.Writer) error {
+	return r.write(w, false, nil, nil)
+}
+
 // errMissingHost is returned by Write when there is no Host or URL present in
 // the Request.
 var errMissingHost = errors.New("http: Request.Write on Request with no Host or URL set")
