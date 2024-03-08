@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"internal/godebug"
 	"io"
 	"log"
 	"math/rand"
@@ -2664,6 +2665,8 @@ type Server struct {
 	inShutdown atomic.Bool // true when server is in shutdown
 
 	disableKeepAlives atomic.Bool
+	nextProtoOnce     sync.Once // guards setupHTTP2_* init
+	nextProtoErr      error     // result of http2.ConfigureServer if used
 
 	mu         sync.Mutex
 	listeners  map[*net.Listener]struct{}
@@ -3081,6 +3084,21 @@ func ListenAndServe(addr string, handler Handler) error {
 	return server.ListenAndServe()
 }
 
+// shouldConfigureHTTP2ForServe reports whether Server.Serve should configure
+// automatic HTTP/2. (which sets up the srv.TLSNextProto map)
+func (srv *Server) shouldConfigureHTTP2ForServe() bool {
+	if srv.TLSConfig == nil {
+		// Compatibility with Go 1.6:
+		// If there's no TLSConfig, it's possible that the user just
+		// didn't set it on the http.Server, but did pass it to
+		// tls.NewListener and passed that listener to Serve.
+		// So we should configure HTTP/2 (to set up srv.TLSNextProto)
+		// in case the listener returns an "h2" *tls.Conn.
+		return true
+	}
+	return strSliceContains(srv.TLSConfig.NextProtos, http2NextProtoTLS)
+}
+
 // ListenAndServeTLS acts identically to [ListenAndServe], except that it
 // expects HTTPS connections. Additionally, files containing a certificate and
 // matching private key for the server must be provided. If the certificate
@@ -3123,6 +3141,48 @@ func (srv *Server) ListenAndServeTLS(certFile, keyFile string) error {
 	defer ln.Close()
 
 	return srv.ServeTLS(ln, certFile, keyFile)
+}
+
+// setupHTTP2_Serve is called from (*Server).Serve and conditionally
+// configures HTTP/2 on srv using a more conservative policy than
+// setupHTTP2_ServeTLS because Serve is called after tls.Listen,
+// and may be called concurrently. See shouldConfigureHTTP2ForServe.
+//
+// The tests named TestTransportAutomaticHTTP2* and
+// TestConcurrentServerServe in server_test.go demonstrate some
+// of the supported use cases and motivations.
+func (srv *Server) setupHTTP2_Serve() error {
+	srv.nextProtoOnce.Do(srv.onceSetNextProtoDefaults_Serve)
+	return srv.nextProtoErr
+}
+
+func (srv *Server) onceSetNextProtoDefaults_Serve() {
+	if srv.shouldConfigureHTTP2ForServe() {
+		srv.onceSetNextProtoDefaults()
+	}
+}
+
+var http2server = godebug.New("http2server")
+
+// onceSetNextProtoDefaults configures HTTP/2, if the user hasn't
+// configured otherwise. (by setting srv.TLSNextProto non-nil)
+// It must only be called via srv.nextProtoOnce (use srv.setupHTTP2_*).
+func (srv *Server) onceSetNextProtoDefaults() {
+	// if omitBundledHTTP2 {
+	// 	return
+	// }
+	if http2server.Value() == "0" {
+		http2server.IncNonDefault()
+		return
+	}
+	// Enable HTTP/2 by default if the user hasn't otherwise
+	// configured their TLSNextProto map.
+	if srv.TLSNextProto == nil {
+		conf := &http2Server{
+			NewWriteScheduler: func() http2WriteScheduler { return http2NewPriorityWriteScheduler(nil) },
+		}
+		srv.nextProtoErr = http2ConfigureServer(srv, conf)
+	}
 }
 
 // onceCloseListener wraps a net.Listener, protecting it from
