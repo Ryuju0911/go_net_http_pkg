@@ -3,7 +3,14 @@
 
 package http
 
-import ()
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"net"
+	"sync"
+	"time"
+)
 
 const (
 	// NextProtoTLS is the NPN/ALPN protocol negotiated during
@@ -78,10 +85,33 @@ type http2Server struct {
 	// // The errType consists of only ASCII word characters.
 	// CountError func(errType string)
 
-	// // Internal state. This is a pointer (rather than embedded directly)
-	// // so that we don't embed a Mutex in this struct, which will make the
-	// // struct non-copyable, which might break some callers.
-	// state *serverInternalState
+	// Internal state. This is a pointer (rather than embedded directly)
+	// so that we don't embed a Mutex in this struct, which will make the
+	// struct non-copyable, which might break some callers.
+	state *http2serverInternalState
+}
+
+type http2serverInternalState struct {
+	mu          sync.Mutex
+	activeConns map[*http2serverConn]struct{}
+}
+
+func (s *http2serverInternalState) registerConn(sc *http2serverConn) {
+	if s == nil {
+		return // if the server was used without calling ConfigureServer
+	}
+	s.mu.Lock()
+	s.activeConns[sc] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (s *http2serverInternalState) unregisterConn(sc *http2serverConn) {
+	if s == nil {
+		return // if the server was used without calling ConfigureServer
+	}
+	s.mu.Lock()
+	delete(s.activeConns, sc)
+	s.mu.Unlock()
 }
 
 // ConfigureServer adds HTTP/2 support to a net/http Server.
@@ -90,12 +120,210 @@ type http2Server struct {
 //
 // ConfigureServer must be called before s begins serving.
 func http2ConfigureServer(s *Server, conf *http2Server) error {
+	if s == nil {
+		panic("nil *http.Server")
+	}
+	if conf == nil {
+		conf = new(http2Server)
+	}
+	conf.state = &http2serverInternalState{activeConns: make(map[*http2serverConn]struct{})}
+	// if h1, h2 := s, conf; h2.IdleTimeout == 0 {
+	// 	if h1.IdleTimeout != 0 {
+	// 		h2.IdleTimeout = h1.IdleTimeout
+	// 	} else {
+	// 		h2.IdleTimeout = h1.ReadTimeout
+	// 	}
+	// }
+	// s.RegisterOnShutdown(conf.state.startGracefulShutdown)
+
+	if s.TLSConfig == nil {
+		s.TLSConfig = new(tls.Config)
+	} else if s.TLSConfig.CipherSuites != nil && s.TLSConfig.MinVersion < tls.VersionTLS13 {
+		// If they already provided a TLS 1.0–1.2 CipherSuite list, return an
+		// error if it is missing ECDHE_RSA_WITH_AES_128_GCM_SHA256 or
+		// ECDHE_ECDSA_WITH_AES_128_GCM_SHA256.
+		haveRequired := false
+		for _, cs := range s.TLSConfig.CipherSuites {
+			switch cs {
+			case tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				// Alternative MTI cipher to not discourage ECDSA-only servers.
+				// See http://golang.org/cl/30721 for further information.
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:
+				haveRequired = true
+			}
+		}
+		if !haveRequired {
+			return fmt.Errorf("http2: TLSConfig.CipherSuites is missing an HTTP/2-required AES_128_GCM_SHA256 cipher (need at least one of TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 or TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)")
+		}
+	}
+
+	// Note: not setting MinVersion to tls.VersionTLS12,
+	// as we don't want to interfere with HTTP/1.1 traffic
+	// on the user's server. We enforce TLS 1.2 later once
+	// we accept a connection. Ideally this should be done
+	// during next-proto selection, but using TLS <1.2 with
+	// HTTP/2 is still the client's bug.
+
+	s.TLSConfig.PreferServerCipherSuites = true
+
+	if !http2strSliceContains(s.TLSConfig.NextProtos, http2NextProtoTLS) {
+		s.TLSConfig.NextProtos = append(s.TLSConfig.NextProtos, http2NextProtoTLS)
+	}
+	if !http2strSliceContains(s.TLSConfig.NextProtos, "http/1.1") {
+		s.TLSConfig.NextProtos = append(s.TLSConfig.NextProtos, "http/1.1")
+	}
+
+	if s.TLSNextProto == nil {
+		s.TLSNextProto = map[string]func(*Server, *tls.Conn, Handler){}
+	}
+	protoHandler := func(hs *Server, c *tls.Conn, h Handler) {
+		// if testHookOnConn != nil {
+		// 	testHookOnConn()
+		// }
+		// The TLSNextProto interface predates contexts, so
+		// the net/http package passes down its per-connection
+		// base context via an exported but unadvertised
+		// method on the Handler. This is for internal
+		// net/http<=>http2 use only.
+		var ctx context.Context
+		type baseContexter interface {
+			BaseContext() context.Context
+		}
+		if bc, ok := h.(baseContexter); ok {
+			ctx = bc.BaseContext()
+		}
+		conf.ServeConn(c, &http2ServeConnOpts{
+			Context:    ctx,
+			Handler:    h,
+			BaseConfig: hs,
+		})
+	}
+	s.TLSNextProto[http2NextProtoTLS] = protoHandler
 	return nil
+}
+
+// ServerConnOpts are options for the Server.ServeConn method.
+type http2ServeConnOpts struct {
+	// Context is the base context to use.
+	// If nil, context.Background is used.
+	Context context.Context
+
+	// BaseConfig optionally sets the base configuration
+	// for values. If nil, defaults are used.
+	BaseConfig *Server
+
+	// Handler specifies which handler to use for processing
+	// requests. If nil, BaseConfig.Handler is used. If BaseConfig
+	// or BaseConfig.Handler is nil, http.DefaultServeMux is used.
+	Handler Handler
+
+	// // UpgradeRequest is an initial request received on a connection
+	// // undergoing an h2c upgrade. The request body must have been
+	// // completely read from the connection before calling ServeConn,
+	// // and the 101 Switching Protocols response written.
+	// UpgradeRequest *http.Request
+
+	// // Settings is the decoded contents of the HTTP2-Settings header
+	// // in an h2c upgrade request.
+	// Settings []byte
+
+	// // SawClientPreface is set if the HTTP/2 connection preface
+	// // has already been read from the connection.
+	// SawClientPreface bool
+}
+
+func (o *http2ServeConnOpts) context() context.Context {
+	if o != nil && o.Context != nil {
+		return o.Context
+	}
+	return context.Background()
+}
+
+func (o *http2ServeConnOpts) baseConfig() *Server {
+	if o != nil && o.Context != nil {
+		return o.BaseConfig
+	}
+	return new(Server)
+}
+
+// ServeConn serves HTTP/2 requests on the provided connection and
+// blocks until the connection is no longer readable.
+//
+// ServeConn starts speaking HTTP/2 assuming that c has not had any
+// reads or writes. It writes its initial settings frame and expects
+// to be able to read the preface and settings frame from the
+// client. If c has a ConnectionState method like a *tls.Conn, the
+// ConnectionState is used to verify the TLS ciphersuite and to set
+// the Request.TLS field in Handlers.
+//
+// ServeConn does not support h2c by itself. Any h2c support must be
+// implemented in terms of providing a suitably-behaving net.Conn.
+//
+// The opts parameter is optional. If nil, default values are used.
+func (s *http2Server) ServeConn(c net.Conn, opts *http2ServeConnOpts) {
+	baseCtx, cancel := http2serverConnBaseContext(c, opts)
+	defer cancel()
+
+	sc := &http2serverConn{
+		srv:     s,
+		hs:      opts.baseConfig(),
+		conn:    c,
+		baseCtx: baseCtx,
+	}
+
+	s.state.registerConn(sc)
+	defer s.state.unregisterConn(sc)
+
+	// The net/http package sets the write deadline from the
+	// http.Server.WriteTimeout during the TLS handshake, but then
+	// passes the connection off to us with the deadline already set.
+	// Write deadlines are set per stream in serverConn.newStream.
+	// Disarm the net.Conn write deadline here.
+	if sc.hs.WriteTimeout != 0 {
+		sc.conn.SetWriteDeadline(time.Time{})
+	}
+
+	if s.NewWriteScheduler != nil {
+		sc.writeSched = s.NewWriteScheduler()
+	} else {
+		sc.writeSched = http2newRoundRobinWriteScheduler()
+	}
+}
+
+func http2serverConnBaseContext(c net.Conn, opts *http2ServeConnOpts) (ctx context.Context, cancel func()) {
+	ctx, cancel = context.WithCancel(opts.context())
+	ctx = context.WithValue(ctx, LocalAddrContextKey, c.LocalAddr())
+	if hs := opts.baseConfig(); hs != nil {
+		ctx = context.WithValue(ctx, ServerContextKey, hs)
+	}
+	return
+}
+
+type http2serverConn struct {
+	// Immutable:
+	srv        *http2Server
+	hs         *Server
+	conn       net.Conn
+	baseCtx    context.Context
+	writeSched http2WriteScheduler
+}
+
+func http2strSliceContains(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // WriteScheduler is the interface implemented by HTTP/2 write schedulers.
 // Methods are never called concurrently.
 type http2WriteScheduler interface {
+}
+
+// writeQueue is used by implementations of WriteScheduler.
+type http2writeQueue struct {
 }
 
 // PriorityWriteSchedulerConfig configures a priorityWriteScheduler.
@@ -111,4 +339,16 @@ func http2NewPriorityWriteScheduler(cfg *http2PriorityWriteSchedulerConfig) http
 }
 
 type http2priorityWriteScheduler struct {
+}
+
+type http2roundRobinWriteScheduler struct {
+	// streams maps stream ID to a queue.
+	streams map[uint32]*http2writeQueue
+}
+
+func http2newRoundRobinWriteScheduler() http2WriteScheduler {
+	ws := &http2roundRobinWriteScheduler{
+		streams: make(map[uint32]*http2writeQueue),
+	}
+	return ws
 }
