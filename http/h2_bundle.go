@@ -4,19 +4,97 @@
 package http
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
+	"net/golang.org/x/net/http2/hpack"
 	"sync"
 	"time"
 )
+
+// inflowMinRefresh is the minimum number of bytes we'll send for a
+// flow control window update.
+const http2inflowMinRefresh = 4 << 10
+
+// inflow accounts for an inbound flow control window.
+// It tracks both the latest window sent to the peer (used for enforcement)
+// and the accumulated unsent window.
+type http2inflow struct {
+	avail  int32
+	unsent int32
+}
+
+// init sets the initial window.
+func (f *http2inflow) init(n int32) {
+	f.avail = n
+}
+
+// add adds n bytes to the window, with a maximum window size of max,
+// indicating that the peer can now send us more data.
+// For example, the user read from a {Request,Response} body and consumed
+// some of the buffered data, so the peer can now send more.
+// It returns the number of bytes to send in a WINDOW_UPDATE frame to the peer.
+// Window updates are accumulated and sent when the unsent capacity
+// is at least inflowMinRefresh or will at least double the peer's available window.
+func (f *http2inflow) add(n int) (connAdd int32) {
+	if n < 0 {
+		panic("negative update")
+	}
+	unsent := int64(f.unsent) + int64(n)
+	// "A sender MUST NOT allow a flow-control window to exceed 2^31-1 octets."
+	// RFC 7540 Section 6.9.1.
+	const maxWindow = 1<<31 - 1
+	if unsent+int64(f.avail) > maxWindow {
+		panic("flow control update exceeds maximum window size")
+	}
+	f.unsent = int32(unsent)
+	if f.unsent < http2inflowMinRefresh && f.unsent < f.avail {
+		// If there aren't at least inflowMinRefresh bytes of window to send,
+		// and this update won't at least double the window, buffer the update for later.
+		return 0
+	}
+	f.avail += f.unsent
+	f.unsent = 0
+	return int32(unsent)
+}
+
+// outflow is the outbound flow control window's size.
+type http2outflow struct {
+	_ http2incomparable
+
+	// n is the number of DATA bytes we're allowed to send.
+	// An outflow is kept both on a conn and a per-stream.
+	n int32
+}
+
+// add adds n bytes (positive or negative) to the flow control window.
+// It returns false if the sum would exceed 2^31-1.
+func (f *http2outflow) add(n int32) bool {
+	sum := f.n + n
+	if (sum > n) == (f.n > 0) {
+		f.n = sum
+		return true
+	}
+	return false
+}
 
 const (
 	// NextProtoTLS is the NPN/ALPN protocol negotiated during
 	// HTTP/2's TLS setup.
 	http2NextProtoTLS = "h2"
+
+	// https://httpwg.org/specs/rfc7540.html#SettingValues
+	http2initialHeaderTableSize = 4096
+
+	http2initialWindowSize = 65535 // 6.9.2 Initial Flow Control Window Size
 )
+
+// incomparable is a zero-width, non-comparable type. Adding it to a struct
+// makes that struct also non-comparable, and generally doesn't add
+// any size (as long as it's first).
+type http2incomparable [0]func()
 
 // Server is an HTTP/2 server.
 type http2Server struct {
@@ -41,11 +119,11 @@ type http2Server struct {
 	// // of 4096 is used.
 	// MaxDecoderHeaderTableSize uint32
 
-	// // MaxEncoderHeaderTableSize optionally specifies an upper limit for the
-	// // header compression table used for encoding request headers. Received
-	// // SETTINGS_HEADER_TABLE_SIZE settings are capped at this limit. If zero,
-	// // the default value of 4096 is used.
-	// MaxEncoderHeaderTableSize uint32
+	// MaxEncoderHeaderTableSize optionally specifies an upper limit for the
+	// header compression table used for encoding request headers. Received
+	// SETTINGS_HEADER_TABLE_SIZE settings are capped at this limit. If zero,
+	// the default value of 4096 is used.
+	MaxEncoderHeaderTableSize uint32
 
 	// // MaxReadFrameSize optionally specifies the largest frame
 	// // this server is willing to read. A valid value is between
@@ -89,6 +167,13 @@ type http2Server struct {
 	// so that we don't embed a Mutex in this struct, which will make the
 	// struct non-copyable, which might break some callers.
 	state *http2serverInternalState
+}
+
+func (s *http2Server) maxEncoderHeaderTableSize() uint32 {
+	if v := s.MaxEncoderHeaderTableSize; v > 0 {
+		return v
+	}
+	return http2initialHeaderTableSize
 }
 
 type http2serverInternalState struct {
@@ -288,6 +373,14 @@ func (s *http2Server) ServeConn(c net.Conn, opts *http2ServeConnOpts) {
 	} else {
 		sc.writeSched = http2newRoundRobinWriteScheduler()
 	}
+
+	// These start at the RFC-specified defaults. If there is a higher
+	// configured value for inflow, that will be updated when we send a
+	// WINDOW_UPDATE shortly after sending SETTINGS.
+	sc.flow.add(http2initialWindowSize)
+	sc.inflow.init(http2initialWindowSize)
+	sc.hpackEncoder = hpack.NewEncoder(&sc.headerWriteBuf)
+	sc.hpackEncoder.SetMaxDynamicTableSizeLimit(s.maxEncoderHeaderTableSize())
 }
 
 func http2serverConnBaseContext(c net.Conn, opts *http2ServeConnOpts) (ctx context.Context, cancel func()) {
@@ -305,7 +398,13 @@ type http2serverConn struct {
 	hs         *Server
 	conn       net.Conn
 	baseCtx    context.Context
+	flow       http2outflow // conn-wide (not stream-specific) outbound flow control
+	inflow     http2inflow  // conn-wide inbound flow control
 	writeSched http2WriteScheduler
+
+	// Owned by the writeFrameAsync goroutine:
+	headerWriteBuf bytes.Buffer
+	hpackEncoder   *hpack.Encoder
 }
 
 func http2strSliceContains(ss []string, s string) bool {
