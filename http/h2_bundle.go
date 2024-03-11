@@ -27,6 +27,9 @@ import (
 	"log"
 	"net"
 	"net/golang.org/x/net/http2/hpack"
+	"os"
+	"runtime"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -1027,6 +1030,149 @@ func (f *http2Framer) WriteGoAway(maxStreamID uint32, code http2ErrCode, debugDa
 	return f.endWrite()
 }
 
+var http2DebugGoroutines = os.Getenv("DEBUG_HTTP2_GOROUTINES") == "1"
+
+type http2goroutineLock uint64
+
+func http2newGoroutineLock() http2goroutineLock {
+	if !http2DebugGoroutines {
+		return 0
+	}
+	return http2goroutineLock(http2curGoroutineID())
+}
+
+func (g http2goroutineLock) check() {
+	if !http2DebugGoroutines {
+		return
+	}
+	if http2curGoroutineID() != uint64(g) {
+		panic("running on the wrong goroutine")
+	}
+}
+
+var http2goroutineSpace = []byte("goroutine ")
+
+func http2curGoroutineID() uint64 {
+	bp := http2littleBuf.Get().(*[]byte)
+	defer http2littleBuf.Put(bp)
+	b := *bp
+	b = b[:runtime.Stack(b, false)]
+	// Parse the 4707 of "gorotuine 4707 ["
+	b = bytes.TrimPrefix(b, http2goroutineSpace)
+	i := bytes.IndexByte(b, ' ')
+	if i < 0 {
+		panic(fmt.Sprintf("No space found in %q", b))
+	}
+	b = b[:i]
+	n, err := http2parseUintBytes(b, 10, 64)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse goroutine ID out of %q: %v", b, err))
+	}
+	return n
+}
+
+var http2littleBuf = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 64)
+		return &buf
+	},
+}
+
+// parseUintBytes is like strconv.ParseUint, but using a []byte.
+func http2parseUintBytes(s []byte, base int, bitSize int) (n uint64, err error) {
+	var cutoff, maxVal uint64
+
+	if bitSize == 0 {
+		bitSize = int(strconv.IntSize)
+	}
+
+	s0 := s
+	switch {
+	case len(s) < 1:
+		err = strconv.ErrSyntax
+		goto Error
+
+	case 2 <= base && base <= 36:
+		// valid base; nothing to do
+
+	case base == 0:
+		// Look for octal, hex prefix.
+		switch {
+		case s[0] == '0' && len(s) > 1 && (s[1] == 'x' || s[1] == 'X'):
+			base = 16
+			s = s[2:]
+			if len(s) < 1 {
+				err = strconv.ErrSyntax
+				goto Error
+			}
+		case s[0] == '0':
+			base = 8
+		default:
+			base = 10
+		}
+
+	default:
+		err = errors.New("invalid base " + strconv.Itoa(base))
+		goto Error
+	}
+
+	n = 0
+	cutoff = http2cutoff64(base)
+	maxVal = 1<<uint(bitSize) - 1
+
+	for i := 0; i < len(s); i++ {
+		var v byte
+		d := s[i]
+		switch {
+		case '0' <= d && d <= '9':
+			v = d - '0'
+		case 'a' <= d && d <= 'z':
+			v = d - 'a' + 10
+		case 'A' <= d && d <= 'Z':
+			v = d - 'A' + 10
+		default:
+			n = 0
+			err = strconv.ErrSyntax
+			goto Error
+		}
+		if int(v) >= base {
+			n = 0
+			err = strconv.ErrSyntax
+			goto Error
+		}
+
+		if n >= cutoff {
+			// n*base overflows
+			n = 1<<64 - 1
+			err = strconv.ErrRange
+			goto Error
+		}
+		n *= uint64(base)
+
+		n1 := n + uint64(v)
+		if n1 < n || n1 > maxVal {
+			// n+v overflows
+			n = 1<<64 - 1
+			err = strconv.ErrRange
+			goto Error
+		}
+		n = n1
+	}
+
+	return n, nil
+
+Error:
+	return n, &strconv.NumError{Func: "ParseUint", Num: string(s0), Err: err}
+}
+
+// Return the first number n such that n*base >= 1<<64.
+func http2cutoff64(base int) uint64 {
+	if base < 2 {
+		return 0
+	}
+	return (1<<64-1)/uint64(base) + 1
+}
+
 var (
 	http2VerboseLogs bool
 	// logFrameWrites bool
@@ -1390,7 +1536,7 @@ func (s *http2Server) ServeConn(c net.Conn, opts *http2ServeConnOpts) {
 		// advMaxStreams:               s.maxConcurrentStreams(),
 		// initialStreamSendWindowSize: initialWindowSize,
 		// maxFrameSize:                initialMaxFrameSize,
-		// serveG:                      newGoroutineLock(),
+		serveG: http2newGoroutineLock(),
 		// pushEnabled:                 true,
 		// sawClientPreface:            opts.SawClientPreface,
 	}
@@ -1519,14 +1665,14 @@ func (sc *http2serverConn) rejectConn(err http2ErrCode, debug string) {
 
 type http2serverConn struct {
 	// Immutable:
-	srv     *http2Server
-	hs      *Server
-	conn    net.Conn
-	bw      *http2bufferedWriter // writing to conn
-	handler Handler
-	baseCtx context.Context
-	framer  *http2Framer
-	// doneServing      chan struct{}          // closed when serverConn.serve ends
+	srv         *http2Server
+	hs          *Server
+	conn        net.Conn
+	bw          *http2bufferedWriter // writing to conn
+	handler     Handler
+	baseCtx     context.Context
+	framer      *http2Framer
+	doneServing chan struct{} // closed when serverConn.serve ends
 	// readFrameCh      chan readFrameResult   // written by serverConn.readFrames
 	// wantWriteFrameCh chan FrameWriteRequest // from handlers -> serve
 	// wroteFrameCh     chan frameWriteResult  // from writeFrameAsync -> serve, tickles more frame writes
@@ -1538,8 +1684,8 @@ type http2serverConn struct {
 	remoteAddrStr string
 	writeSched    http2WriteScheduler
 
-	// // Everything following is owned by the serve loop; use serveG.check():
-	// serveG                      goroutineLock // used to verify funcs are on serve()
+	// Everything following is owned by the serve loop; use serveG.check():
+	serveG http2goroutineLock // used to verify funcs are on serve()
 	// pushEnabled                 bool
 	// sawClientPreface            bool // preface has already been read, used in h2c upgrade
 	// sawFirstSettings            bool // got the initial SETTINGS frame after the preface
@@ -1590,6 +1736,15 @@ func (sc *http2serverConn) maxHeaderListSize() uint32 {
 	return uint32(n + typicalHeaders*perFieldOverhead)
 }
 
+// stream represents a stream. This is the minimal metadata needed by
+// the serve goroutine. Most of the actual stream state is owned by
+// the http.Handler's goroutine in the responseWriter. Because the
+// responseWriter's responseWriterState is recycled at the end of a
+// handler, this struct intentionally has no pointer to the
+// *responseWriter{,State} itself, as the Handler ending nils out the
+// responseWriter's state field.
+type http2stream struct{}
+
 func (sc *http2serverConn) vlogf(format string, args ...interface{}) {
 	if http2VerboseLogs {
 		sc.logf(format, args...)
@@ -1605,8 +1760,26 @@ func (sc *http2serverConn) logf(format string, args ...interface{}) {
 }
 
 func (sc *http2serverConn) serve() {
+	sc.serveG.check()
+	// defer sc.notePanic()
+	defer sc.conn.Close()
+	// defer sc.closeAllStreamsOnConnClose()
+	// defer sc.stopShutdownTimer()
+	defer close(sc.doneServing) // unblocks handlers trying to send
 
+	if http2VerboseLogs {
+		sc.vlogf("http2: server connection from %v on %p", sc.conn.RemoteAddr(), sc.hs)
+	}
+
+	// sc.writeFrame()
 }
+
+// func (sc *serverConn) writeFrame(wr FrameWriteRequest) {
+// 	sc.serveG.check()
+
+// 	// If true, wr will not be written and wr.done will not be signaled.
+// 	var ignoreWrite bool
+// }
 
 func http2strSliceContains(ss []string, s string) bool {
 	for _, v := range ss {
@@ -1621,6 +1794,9 @@ func http2strSliceContains(ss []string, s string) bool {
 // Methods are never called concurrently.
 type http2WriteScheduler interface {
 }
+
+// FrameWriteRequest is a request for write a frame.
+type http2FrameWriteRequest struct{}
 
 // writeQueue is used by implementations of WriteScheduler.
 type http2writeQueue struct {
