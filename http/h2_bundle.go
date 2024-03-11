@@ -4,10 +4,13 @@
 package http
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/golang.org/x/net/http2/hpack"
 	"sync"
@@ -80,6 +83,123 @@ func (f *http2outflow) add(n int32) bool {
 	return false
 }
 
+// A Frame is the base interface implemented by all frame types.
+// Callers will generally type-assert the specific frame type:
+// *HeadersFrame, *SettingsFrame, *WindowUpdateFrame, etc.
+//
+// Frames are only valid until the next call to Framer.ReadFrame.
+type http2Frame interface {
+}
+
+// A Framer reads and writes Frames.
+type http2Framer struct {
+	r io.Reader
+	// lastFrame Frame
+	// errDetail error
+
+	// countError is a non-nil func that's called on a frame parse
+	// error with some unique error path token. It's initialized
+	// from Transport.CountError or Server.CountError.
+	countError func(errToken string)
+
+	// // lastHeaderStream is non-zero if the last frame was an
+	// // unfinished HEADERS/CONTINUATION.
+	// lastHeaderStream uint32
+
+	maxReadSize uint32
+	// headerBuf   [frameHeaderLen]byte
+
+	// TODO: let getReadBuf be configurable, and use a less memory-pinning
+	// allocator in server.go to minimize memory pinned for many idle conns.
+	// Will probably also need to make frame invalidation have a hook too.
+	getReadBuf func(size uint32) []byte
+	readBuf    []byte // cache for default getReadBuf
+
+	// maxWriteSize uint32 // zero means unlimited; TODO: implement
+
+	w io.Writer
+	// wbuf []byte
+
+	// // AllowIllegalWrites permits the Framer's Write methods to
+	// // write frames that do not conform to the HTTP/2 spec. This
+	// // permits using the Framer to test other HTTP/2
+	// // implementations' conformance to the spec.
+	// // If false, the Write methods will prefer to return an error
+	// // rather than comply.
+	// AllowIllegalWrites bool
+
+	// // AllowIllegalReads permits the Framer's ReadFrame method
+	// // to return non-compliant frames or frame orders.
+	// // This is for testing and permits using the Framer to test
+	// // other HTTP/2 implementations' conformance to the spec.
+	// // It is not compatible with ReadMetaHeaders.
+	// AllowIllegalReads bool
+
+	// ReadMetaHeaders if non-nil causes ReadFrame to merge
+	// HEADERS and CONTINUATION frames together and return
+	// MetaHeadersFrame instead.
+	ReadMetaHeaders *hpack.Decoder
+
+	// MaxHeaderListSize is the http2 MAX_HEADER_LIST_SIZE.
+	// It's used only if ReadMetaHeaders is set; 0 means a sane default
+	// (currently 16MB)
+	// If the limit is hit, MetaHeadersFrame.Truncated is set true.
+	MaxHeaderListSize uint32
+
+	// // TODO: track which type of frame & with which flags was sent
+	// // last. Then return an error (unless AllowIllegalWrites) if
+	// // we're in the middle of a header block and a
+	// // non-Continuation or Continuation on a different stream is
+	// // attempted to be written.
+
+	// logReads, logWrites bool
+
+	// debugFramer       *Framer // only use for logging written writes
+	// debugFramerBuf    *bytes.Buffer
+	debugReadLoggerf  func(string, ...interface{})
+	debugWriteLoggerf func(string, ...interface{})
+
+	// frameCache *frameCache // nil if frames aren't reused (default)
+}
+
+const (
+	http2minMaxFrameSize = 1 << 14
+	http2maxFrameSize    = 1<<24 - 1
+)
+
+// NewFramer returns a Framer that writes frames to w and reads them from r.
+func http2NewFramer(w io.Writer, r io.Reader) *http2Framer {
+	fr := &http2Framer{
+		w:          w,
+		r:          r,
+		countError: func(string) {},
+		// logReads:          logFrameReads,
+		// logWrites:         logFrameWrites,
+		debugReadLoggerf:  log.Printf,
+		debugWriteLoggerf: log.Printf,
+	}
+	fr.getReadBuf = func(size uint32) []byte {
+		if cap(fr.readBuf) >= int(size) {
+			return fr.readBuf[:size]
+		}
+		fr.readBuf = make([]byte, size)
+		return fr.readBuf
+	}
+	fr.SetMaxReadFrameSize(http2maxFrameSize)
+	return fr
+}
+
+// SetMaxReadFrameSize sets the maximum size of a frame
+// that will be read by a subsequent call to ReadFrame.
+// It is the caller's responsibility to advertise this
+// limit with a SETTINGS frame.
+func (fr *http2Framer) SetMaxReadFrameSize(v uint32) {
+	if v >= http2maxFrameSize {
+		v = http2maxFrameSize
+	}
+	fr.maxReadSize = v
+}
+
 const (
 	// NextProtoTLS is the NPN/ALPN protocol negotiated during
 	// HTTP/2's TLS setup.
@@ -89,7 +209,45 @@ const (
 	http2initialHeaderTableSize = 4096
 
 	http2initialWindowSize = 65535 // 6.9.2 Initial Flow Control Window Size
+
+	http2defaultMaxReadFrameSize = 1 << 20
 )
+
+// bufferedWriter is a buffered writer that writes to w.
+// Its buffered writer is lazily allocated as needed, to minimize
+// idle memory usage with many connections.
+type http2bufferedWriter struct {
+	_  http2incomparable
+	w  io.Writer     // immutable
+	bw *bufio.Writer // non-nil when data is buffered
+}
+
+func http2newBufferedWriter(w io.Writer) *http2bufferedWriter {
+	return &http2bufferedWriter{w: w}
+}
+
+// bufWriterPoolBufferSize is the size of bufio.Writer's
+// buffers created using bufWriterPool.
+//
+// TODO: pick a less arbitrary value? this is a bit under
+// (3 x typical 1500 byte MTU) at least. Other than that,
+// not much thought went into it.
+const http2bufWriterPoolBufferSize = 4 << 10
+
+var http2bufWriterPool = sync.Pool{
+	New: func() interface{} {
+		return bufio.NewWriterSize(nil, http2bufWriterPoolBufferSize)
+	},
+}
+
+func (w *http2bufferedWriter) Write(p []byte) (n int, err error) {
+	if w.bw == nil {
+		bw := http2bufWriterPool.Get().(*bufio.Writer)
+		bw.Reset(w.w)
+		w.bw = bw
+	}
+	return w.bw.Write(p)
+}
 
 // incomparable is a zero-width, non-comparable type. Adding it to a struct
 // makes that struct also non-comparable, and generally doesn't add
@@ -112,12 +270,12 @@ type http2Server struct {
 	// // the HTTP/2 spec's recommendations.
 	// MaxConcurrentStreams uint32
 
-	// // MaxDecoderHeaderTableSize optionally specifies the http2
-	// // SETTINGS_HEADER_TABLE_SIZE to send in the initial settings frame. It
-	// // informs the remote endpoint of the maximum size of the header compression
-	// // table used to decode header blocks, in octets. If zero, the default value
-	// // of 4096 is used.
-	// MaxDecoderHeaderTableSize uint32
+	// MaxDecoderHeaderTableSize optionally specifies the http2
+	// SETTINGS_HEADER_TABLE_SIZE to send in the initial settings frame. It
+	// informs the remote endpoint of the maximum size of the header compression
+	// table used to decode header blocks, in octets. If zero, the default value
+	// of 4096 is used.
+	MaxDecoderHeaderTableSize uint32
 
 	// MaxEncoderHeaderTableSize optionally specifies an upper limit for the
 	// header compression table used for encoding request headers. Received
@@ -125,11 +283,11 @@ type http2Server struct {
 	// the default value of 4096 is used.
 	MaxEncoderHeaderTableSize uint32
 
-	// // MaxReadFrameSize optionally specifies the largest frame
-	// // this server is willing to read. A valid value is between
-	// // 16k and 16M, inclusive. If zero or otherwise invalid, a
-	// // default value is used.
-	// MaxReadFrameSize uint32
+	// MaxReadFrameSize optionally specifies the largest frame
+	// this server is willing to read. A valid value is between
+	// 16k and 16M, inclusive. If zero or otherwise invalid, a
+	// default value is used.
+	MaxReadFrameSize uint32
 
 	// // PermitProhibitedCipherSuites, if true, permits the use of
 	// // cipher suites prohibited by the HTTP/2 spec.
@@ -157,16 +315,30 @@ type http2Server struct {
 	// If nil, a default scheduler is chosen.
 	NewWriteScheduler func() http2WriteScheduler
 
-	// // CountError, if non-nil, is called on HTTP/2 server errors.
-	// // It's intended to increment a metric for monitoring, such
-	// // as an expvar or Prometheus metric.
-	// // The errType consists of only ASCII word characters.
-	// CountError func(errType string)
+	// CountError, if non-nil, is called on HTTP/2 server errors.
+	// It's intended to increment a metric for monitoring, such
+	// as an expvar or Prometheus metric.
+	// The errType consists of only ASCII word characters.
+	CountError func(errType string)
 
 	// Internal state. This is a pointer (rather than embedded directly)
 	// so that we don't embed a Mutex in this struct, which will make the
 	// struct non-copyable, which might break some callers.
 	state *http2serverInternalState
+}
+
+func (s *http2Server) maxReadFrameSize() uint32 {
+	if v := s.MaxReadFrameSize; v >= http2minMaxFrameSize && v <= http2maxFrameSize {
+		return v
+	}
+	return http2defaultMaxReadFrameSize
+}
+
+func (s *http2Server) maxDecoderHeaderTableSize() uint32 {
+	if v := s.MaxDecoderHeaderTableSize; v > 0 {
+		return v
+	}
+	return http2initialHeaderTableSize
 }
 
 func (s *http2Server) maxEncoderHeaderTableSize() uint32 {
@@ -331,6 +503,18 @@ func (o *http2ServeConnOpts) baseConfig() *Server {
 	return new(Server)
 }
 
+func (o *http2ServeConnOpts) handler() Handler {
+	if o != nil {
+		if o.Handler != nil {
+			return o.Handler
+		}
+		if o.BaseConfig != nil && o.BaseConfig.Handler != nil {
+			return o.BaseConfig.Handler
+		}
+	}
+	return DefaultServeMux
+}
+
 // ServeConn serves HTTP/2 requests on the provided connection and
 // blocks until the connection is no longer readable.
 //
@@ -350,10 +534,27 @@ func (s *http2Server) ServeConn(c net.Conn, opts *http2ServeConnOpts) {
 	defer cancel()
 
 	sc := &http2serverConn{
-		srv:     s,
-		hs:      opts.baseConfig(),
-		conn:    c,
-		baseCtx: baseCtx,
+		srv:           s,
+		hs:            opts.baseConfig(),
+		conn:          c,
+		baseCtx:       baseCtx,
+		remoteAddrStr: c.RemoteAddr().String(),
+		bw:            http2newBufferedWriter(c),
+		handler:       opts.handler(),
+		// streams:                     make(map[uint32]*stream),
+		// readFrameCh:                 make(chan readFrameResult),
+		// wantWriteFrameCh:            make(chan FrameWriteRequest, 8),
+		// serveMsgCh:                  make(chan interface{}, 8),
+		// wroteFrameCh:                make(chan frameWriteResult, 1), // buffered; one send in writeFrameAsync
+		// bodyReadCh:                  make(chan bodyReadMsg),         // buffering doesn't matter either way
+		// doneServing:                 make(chan struct{}),
+		// clientMaxStreams:            math.MaxUint32, // Section 6.5.2: "Initially, there is no limit to this value"
+		// advMaxStreams:               s.maxConcurrentStreams(),
+		// initialStreamSendWindowSize: initialWindowSize,
+		// maxFrameSize:                initialMaxFrameSize,
+		// serveG:                      newGoroutineLock(),
+		// pushEnabled:                 true,
+		// sawClientPreface:            opts.SawClientPreface,
 	}
 
 	s.state.registerConn(sc)
@@ -381,6 +582,19 @@ func (s *http2Server) ServeConn(c net.Conn, opts *http2ServeConnOpts) {
 	sc.inflow.init(http2initialWindowSize)
 	sc.hpackEncoder = hpack.NewEncoder(&sc.headerWriteBuf)
 	sc.hpackEncoder.SetMaxDynamicTableSizeLimit(s.maxEncoderHeaderTableSize())
+
+	fr := http2NewFramer(sc.bw, c)
+	if s.CountError != nil {
+		fr.countError = s.CountError
+	}
+	fr.ReadMetaHeaders = hpack.NewDecoder(s.maxDecoderHeaderTableSize(), nil)
+	fr.MaxHeaderListSize = sc.maxHeaderListSize()
+	fr.SetMaxReadFrameSize(s.maxReadFrameSize())
+	sc.framer = fr
+
+	// TODO
+
+	sc.serve()
 }
 
 func http2serverConnBaseContext(c net.Conn, opts *http2ServeConnOpts) (ctx context.Context, cancel func()) {
@@ -394,17 +608,79 @@ func http2serverConnBaseContext(c net.Conn, opts *http2ServeConnOpts) (ctx conte
 
 type http2serverConn struct {
 	// Immutable:
-	srv        *http2Server
-	hs         *Server
-	conn       net.Conn
-	baseCtx    context.Context
-	flow       http2outflow // conn-wide (not stream-specific) outbound flow control
-	inflow     http2inflow  // conn-wide inbound flow control
-	writeSched http2WriteScheduler
+	srv     *http2Server
+	hs      *Server
+	conn    net.Conn
+	bw      *http2bufferedWriter // writing to conn
+	handler Handler
+	baseCtx context.Context
+	framer  *http2Framer
+	// doneServing      chan struct{}          // closed when serverConn.serve ends
+	// readFrameCh      chan readFrameResult   // written by serverConn.readFrames
+	// wantWriteFrameCh chan FrameWriteRequest // from handlers -> serve
+	// wroteFrameCh     chan frameWriteResult  // from writeFrameAsync -> serve, tickles more frame writes
+	// bodyReadCh       chan bodyReadMsg       // from handlers -> serve
+	// serveMsgCh       chan interface{}       // misc messages & code to send to / run on the serve loop
+	flow   http2outflow // conn-wide (not stream-specific) outbound flow control
+	inflow http2inflow  // conn-wide inbound flow control
+	// tlsState         *tls.ConnectionState   // shared by all handlers, like net/http
+	remoteAddrStr string
+	writeSched    http2WriteScheduler
+
+	// // Everything following is owned by the serve loop; use serveG.check():
+	// serveG                      goroutineLock // used to verify funcs are on serve()
+	// pushEnabled                 bool
+	// sawClientPreface            bool // preface has already been read, used in h2c upgrade
+	// sawFirstSettings            bool // got the initial SETTINGS frame after the preface
+	// needToSendSettingsAck       bool
+	// unackedSettings             int    // how many SETTINGS have we sent without ACKs?
+	// queuedControlFrames         int    // control frames in the writeSched queue
+	// clientMaxStreams            uint32 // SETTINGS_MAX_CONCURRENT_STREAMS from client (our PUSH_PROMISE limit)
+	// advMaxStreams               uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
+	// curClientStreams            uint32 // number of open streams initiated by the client
+	// curPushedStreams            uint32 // number of open streams initiated by server push
+	// curHandlers                 uint32 // number of running handler goroutines
+	// maxClientStreamID           uint32 // max ever seen from client (odd), or 0 if there have been no client requests
+	// maxPushPromiseID            uint32 // ID of the last push promise (even), or 0 if there have been no pushes
+	// streams                     map[uint32]*stream
+	// unstartedHandlers           []unstartedHandler
+	// initialStreamSendWindowSize int32
+	// maxFrameSize                int32
+	// peerMaxHeaderListSize       uint32            // zero means unknown (default)
+	// canonHeader                 map[string]string // http2-lower-case -> Go-Canonical-Case
+	// canonHeaderKeysSize         int               // canonHeader keys size in bytes
+	// writingFrame                bool              // started writing a frame (on serve goroutine or separate)
+	// writingFrameAsync           bool              // started a frame on its own goroutine but haven't heard back on wroteFrameCh
+	// needsFrameFlush             bool              // last frame write wasn't a flush
+	// inGoAway                    bool              // we've started to or sent GOAWAY
+	// inFrameScheduleLoop         bool              // whether we're in the scheduleFrameWrite loop
+	// needToSendGoAway            bool              // we need to schedule a GOAWAY frame write
+	// goAwayCode                  ErrCode
+	// shutdownTimer               *time.Timer // nil until used
+	// idleTimer                   *time.Timer // nil if unused
 
 	// Owned by the writeFrameAsync goroutine:
 	headerWriteBuf bytes.Buffer
 	hpackEncoder   *hpack.Encoder
+
+	// // Used by startGracefulShutdown.
+	// shutdownOnce sync.Once
+}
+
+func (sc *http2serverConn) maxHeaderListSize() uint32 {
+	n := sc.hs.MaxHeaderBytes
+	if n <= 0 {
+		n = DefaultMaxHeaderBytes
+	}
+	// http2's count is in a slightly different unit and includes 32 bytes per pair.
+	// So, take the net/http.Server value and pad it up a bit, assuming 10 headers.
+	const perFieldOverhead = 32 // per http2 spec
+	const typicalHeaders = 10   // conservative
+	return uint32(n + typicalHeaders*perFieldOverhead)
+}
+
+func (sc *http2serverConn) serve() {
+
 }
 
 func http2strSliceContains(ss []string, s string) bool {
