@@ -714,6 +714,14 @@ func (e http2ErrCode) String() string {
 	return fmt.Sprintf("unknown error code 0x%x", uint32(e))
 }
 
+// StreamError is an error that only affects one stream within an
+// HTTP/2 connection.
+type http2StreamError struct {
+	StreamID uint32
+	Code     http2ErrCode
+	Cause    error // optional additional detail
+}
+
 // inflowMinRefresh is the minimum number of bytes we'll send for a
 // flow control window update.
 const http2inflowMinRefresh = 4 << 10
@@ -976,6 +984,8 @@ func (f *http2Framer) endWrite() error {
 
 func (f *http2Framer) writeBytes(v []byte) { f.wbuf = append(f.wbuf, v...) }
 
+func (f *http2Framer) writeUint16(v uint16) { f.wbuf = append(f.wbuf, byte(v>>8), byte(v)) }
+
 func (f *http2Framer) writeUint32(v uint32) {
 	f.wbuf = append(f.wbuf, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
@@ -1021,6 +1031,20 @@ func (fr *http2Framer) SetMaxReadFrameSize(v uint32) {
 // ErrFrameTooLarge is returned from Framer.ReadFrame when the peer
 // sends a frame that is larger than declared with SetMaxReadFrameSize.
 var http2ErrFrameTooLarge = errors.New("http2: frame too large")
+
+// WriteSettings writes a SETTINGS frame with zero or more settings
+// specified and the ACK bit not set.
+//
+// It will perform exactly one Write to the underlying Writer.
+// It is the caller's responsibility to not call other Write methods concurrently.
+func (f *http2Framer) WriteSettings(settings ...http2Setting) error {
+	f.startWrite(http2FrameSettings, 0, 0)
+	for _, s := range settings {
+		f.writeUint16(uint16(s.ID))
+		f.writeUint32(s.Val)
+	}
+	return f.endWrite()
+}
 
 func (f *http2Framer) WriteGoAway(maxStreamID uint32, code http2ErrCode, debugData []byte) error {
 	f.startWrite(http2FrameGoAway, 0, 0)
@@ -1193,6 +1217,38 @@ const (
 	http2defaultMaxReadFrameSize = 1 << 20
 )
 
+// Setting is a setting parameter: which setting it is, and its value.
+type http2Setting struct {
+	// ID is which setting is being set.
+	// See https://httpwg.org/specs/rfc7540.html#SettingFormat
+	ID http2SettingID
+
+	// Val is the value.
+	Val uint32
+}
+
+// A SettingID is an HTTP/2 setting as defined in
+// https://httpwg.org/specs/rfc7540.html#iana-settings
+type http2SettingID uint16
+
+const (
+	http2SettingHeaderTableSize      http2SettingID = 0x1
+	http2SettingEnablePush           http2SettingID = 0x2
+	http2SettingMaxConcurrentStreams http2SettingID = 0x3
+	http2SettingInitialWindowSize    http2SettingID = 0x4
+	http2SettingMaxFrameSize         http2SettingID = 0x5
+	http2SettingMaxHeaderListSize    http2SettingID = 0x6
+)
+
+var http2settingName = map[http2SettingID]string{
+	http2SettingHeaderTableSize:      "HEADER_TABLE_SIZE",
+	http2SettingEnablePush:           "ENABLE_PUSH",
+	http2SettingMaxConcurrentStreams: "MAX_CONCURRENT_STREAMS",
+	http2SettingInitialWindowSize:    "INITIAL_WINDOW_SIZE",
+	http2SettingMaxFrameSize:         "MAX_FRAME_SIZE",
+	http2SettingMaxHeaderListSize:    "MAX_HEADER_LIST_SIZE",
+}
+
 // bufferedWriter is a buffered writer that writes to w.
 // Its buffered writer is lazily allocated as needed, to minimize
 // idle memory usage with many connections.
@@ -1238,6 +1294,14 @@ type http2connectionStater interface {
 // any size (as long as it's first).
 type http2incomparable [0]func()
 
+const (
+	// prefaceTimeout         = 10 * time.Second
+	// firstSettingsTimeout   = 2 * time.Second // should be in-flight with preface anyway
+	// handlerChunkWriteSize  = 4 << 10
+	http2defaultMaxStreams = 250 // TODO: make this 100 as the GFE seems to?
+	// maxQueuedControlFrames = 10000
+)
+
 // Server is an HTTP/2 server.
 type http2Server struct {
 	// // MaxHandlers limits the number of http.Handler ServeHTTP goroutines
@@ -1246,13 +1310,13 @@ type http2Server struct {
 	// // TODO: implement
 	// MaxHandlers int
 
-	// // MaxConcurrentStreams optionally specifies the number of
-	// // concurrent streams that each client may have open at a
-	// // time. This is unrelated to the number of http.Handler goroutines
-	// // which may be active globally, which is MaxHandlers.
-	// // If zero, MaxConcurrentStreams defaults to at least 100, per
-	// // the HTTP/2 spec's recommendations.
-	// MaxConcurrentStreams uint32
+	// MaxConcurrentStreams optionally specifies the number of
+	// concurrent streams that each client may have open at a
+	// time. This is unrelated to the number of http.Handler goroutines
+	// which may be active globally, which is MaxHandlers.
+	// If zero, MaxConcurrentStreams defaults to at least 100, per
+	// the HTTP/2 spec's recommendations.
+	MaxConcurrentStreams uint32
 
 	// MaxDecoderHeaderTableSize optionally specifies the http2
 	// SETTINGS_HEADER_TABLE_SIZE to send in the initial settings frame. It
@@ -1289,11 +1353,11 @@ type http2Server struct {
 	// // used instead.
 	// MaxUploadBufferPerConnection int32
 
-	// // MaxUploadBufferPerStream is the size of the initial flow control
-	// // window for each stream. The HTTP/2 spec does not allow this to
-	// // be larger than 2^32-1. If the value is zero or larger than the
-	// // maximum, a default value will be used instead.
-	// MaxUploadBufferPerStream int32
+	// MaxUploadBufferPerStream is the size of the initial flow control
+	// window for each stream. The HTTP/2 spec does not allow this to
+	// be larger than 2^32-1. If the value is zero or larger than the
+	// maximum, a default value will be used instead.
+	MaxUploadBufferPerStream int32
 
 	// NewWriteScheduler constructs a write scheduler for a connection.
 	// If nil, a default scheduler is chosen.
@@ -1311,11 +1375,25 @@ type http2Server struct {
 	state *http2serverInternalState
 }
 
+func (s *http2Server) initialStreamRecvWindowSize() int32 {
+	if s.MaxUploadBufferPerStream > 0 {
+		return s.MaxUploadBufferPerStream
+	}
+	return 1 << 20
+}
+
 func (s *http2Server) maxReadFrameSize() uint32 {
 	if v := s.MaxReadFrameSize; v >= http2minMaxFrameSize && v <= http2maxFrameSize {
 		return v
 	}
 	return http2defaultMaxReadFrameSize
+}
+
+func (s *http2Server) maxConcurrentStreams() uint32 {
+	if v := s.MaxConcurrentStreams; v > 0 {
+		return v
+	}
+	return http2defaultMaxStreams
 }
 
 func (s *http2Server) maxDecoderHeaderTableSize() uint32 {
@@ -1533,7 +1611,7 @@ func (s *http2Server) ServeConn(c net.Conn, opts *http2ServeConnOpts) {
 		// bodyReadCh:                  make(chan bodyReadMsg),         // buffering doesn't matter either way
 		// doneServing:                 make(chan struct{}),
 		// clientMaxStreams:            math.MaxUint32, // Section 6.5.2: "Initially, there is no limit to this value"
-		// advMaxStreams:               s.maxConcurrentStreams(),
+		advMaxStreams: s.maxConcurrentStreams(),
 		// initialStreamSendWindowSize: initialWindowSize,
 		// maxFrameSize:                initialMaxFrameSize,
 		serveG: http2newGoroutineLock(),
@@ -1691,9 +1769,9 @@ type http2serverConn struct {
 	// sawFirstSettings            bool // got the initial SETTINGS frame after the preface
 	// needToSendSettingsAck       bool
 	// unackedSettings             int    // how many SETTINGS have we sent without ACKs?
-	// queuedControlFrames         int    // control frames in the writeSched queue
+	queuedControlFrames int // control frames in the writeSched queue
 	// clientMaxStreams            uint32 // SETTINGS_MAX_CONCURRENT_STREAMS from client (our PUSH_PROMISE limit)
-	// advMaxStreams               uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
+	advMaxStreams uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
 	// curClientStreams            uint32 // number of open streams initiated by the client
 	// curPushedStreams            uint32 // number of open streams initiated by server push
 	// curHandlers                 uint32 // number of running handler goroutines
@@ -1706,12 +1784,12 @@ type http2serverConn struct {
 	// peerMaxHeaderListSize       uint32            // zero means unknown (default)
 	// canonHeader                 map[string]string // http2-lower-case -> Go-Canonical-Case
 	// canonHeaderKeysSize         int               // canonHeader keys size in bytes
-	// writingFrame                bool              // started writing a frame (on serve goroutine or separate)
-	// writingFrameAsync           bool              // started a frame on its own goroutine but haven't heard back on wroteFrameCh
-	// needsFrameFlush             bool              // last frame write wasn't a flush
-	// inGoAway                    bool              // we've started to or sent GOAWAY
-	// inFrameScheduleLoop         bool              // whether we're in the scheduleFrameWrite loop
-	// needToSendGoAway            bool              // we need to schedule a GOAWAY frame write
+	writingFrame        bool // started writing a frame (on serve goroutine or separate)
+	writingFrameAsync   bool // started a frame on its own goroutine but haven't heard back on wroteFrameCh
+	needsFrameFlush     bool // last frame write wasn't a flush
+	inGoAway            bool // we've started to or sent GOAWAY
+	inFrameScheduleLoop bool // whether we're in the scheduleFrameWrite loop
+	// needToSendGoAway    bool // we need to schedule a GOAWAY frame write
 	// goAwayCode                  ErrCode
 	// shutdownTimer               *time.Timer // nil until used
 	// idleTimer                   *time.Timer // nil if unused
@@ -1743,7 +1821,35 @@ func (sc *http2serverConn) maxHeaderListSize() uint32 {
 // handler, this struct intentionally has no pointer to the
 // *responseWriter{,State} itself, as the Handler ending nils out the
 // responseWriter's state field.
-type http2stream struct{}
+type http2stream struct {
+	// immutable:
+	// sc        *serverConn
+	id uint32
+	// body      *pipe       // non-nil if expecting DATA frames
+	// cw        closeWaiter // closed wait stream transitions to closed state
+	// ctx       context.Context
+	// cancelCtx func()
+
+	// // owned by serverConn's serve loop:
+	// bodyBytes        int64   // body bytes seen so far
+	// declBodyBytes    int64   // or -1 if undeclared
+	// flow             outflow // limits writing from Handler to client
+	// inflow           inflow  // what the client is allowed to POST/etc to us
+	// state streamState
+	// resetQueued      bool        // RST_STREAM queued for write; set by sc.resetStream
+	// gotTrailerHeader bool        // HEADER frame for trailers was seen
+	// wroteHeaders     bool        // whether we wrote headers (not status 100)
+	// readDeadline     *time.Timer // nil if unused
+	// writeDeadline    *time.Timer // nil if unused
+	// closeErr         error       // set before cw is closed
+
+	// trailer    http.Header // accumulated trailers
+	// reqTrailer http.Header // handler's Request.Trailer
+}
+
+func (sc *http2serverConn) Framer() *http2Framer { return sc.framer }
+
+func (sc *http2serverConn) Flush() error { return sc.bw.bw.Flush() }
 
 func (sc *http2serverConn) vlogf(format string, args ...interface{}) {
 	if http2VerboseLogs {
@@ -1759,6 +1865,13 @@ func (sc *http2serverConn) logf(format string, args ...interface{}) {
 	}
 }
 
+// frameWriteResult is the message passed from writeFrameAsync to the serve goroutine.
+type http2frameWriteResult struct {
+	_   http2incomparable
+	wr  http2FrameWriteRequest // what was written (or attempted)
+	err error                  // result of the writeFrame call
+}
+
 func (sc *http2serverConn) serve() {
 	sc.serveG.check()
 	// defer sc.notePanic()
@@ -1771,15 +1884,151 @@ func (sc *http2serverConn) serve() {
 		sc.vlogf("http2: server connection from %v on %p", sc.conn.RemoteAddr(), sc.hs)
 	}
 
-	// sc.writeFrame()
+	sc.writeFrame(http2FrameWriteRequest{
+		write: http2writeSettings{
+			{http2SettingMaxFrameSize, sc.srv.maxReadFrameSize()},
+			{http2SettingMaxConcurrentStreams, sc.advMaxStreams},
+			{http2SettingMaxHeaderListSize, sc.maxHeaderListSize()},
+			{http2SettingHeaderTableSize, sc.srv.maxDecoderHeaderTableSize()},
+			{http2SettingInitialWindowSize, uint32(sc.srv.initialStreamRecvWindowSize())},
+		},
+	})
 }
 
-// func (sc *serverConn) writeFrame(wr FrameWriteRequest) {
-// 	sc.serveG.check()
+func (sc *http2serverConn) writeFrame(wr http2FrameWriteRequest) {
+	sc.serveG.check()
 
-// 	// If true, wr will not be written and wr.done will not be signaled.
-// 	var ignoreWrite bool
-// }
+	// If true, wr will not be written and wr.done will not be signaled.
+	var ignoreWrite bool
+
+	// // We are not allowed to write frames on closed streams. RFC 7540 Section
+	// // 5.1.1 says: "An endpoint MUST NOT send frames other than PRIORITY on
+	// // a closed stream." Our server never sends PRIORITY, so that exception
+	// // does not apply.
+	// //
+	// // The serverConn might close an open stream while the stream's handler
+	// // is still running. For example, the server might close a stream when it
+	// // receives bad data from the client. If this happens, the handler might
+	// // attempt to write a frame after the stream has been closed (since the
+	// // handler hasn't yet been notified of the close). In this case, we simply
+	// // ignore the frame. The handler will notice that the stream is closed when
+	// // it waits for the frame to be written.
+	// //
+	// // As an exception to this rule, we allow sending RST_STREAM after close.
+	// // This allows us to immediately reject new streams without tracking any
+	// // state for those streams (except for the queued RST_STREAM frame). This
+	// // may result in duplicate RST_STREAMs in some cases, but the client should
+	// // ignore those.
+	// if wr.StreamID() != 0 {
+	// 	_, isReset := wr.write.(StreamError)
+	// 	if state, _ := sc.state(wr.StreamID()); state == stateClosed && !isReset {
+	// 		ignoreWrite = true
+	// 	}
+	// }
+
+	// // Don't send a 100-continue response if we've already sent headers.
+	// // See golang.org/issue/14030.
+	// switch wr.write.(type) {
+	// case *writeResHeaders:
+	// 	wr.stream.wroteHeaders = true
+	// case write100ContinueHeadersFrame:
+	// 	if wr.stream.wroteHeaders {
+	// 		// We do not need to notify wr.done because this frame is
+	// 		// never written with wr.done != nil.
+	// 		if wr.done != nil {
+	// 			panic("wr.done != nil for write100ContinueHeadersFrame")
+	// 		}
+	// 		ignoreWrite = true
+	// 	}
+	// }
+
+	if !ignoreWrite {
+		if wr.isControl() {
+			sc.queuedControlFrames++
+			// For extra safety, detect wraparounds, which should not happen,
+			// and pull the plug.
+			if sc.queuedControlFrames < 0 {
+				sc.conn.Close()
+			}
+		}
+		sc.writeSched.Push(wr)
+	}
+	sc.scheduleFrameWrite()
+}
+
+// startFrameWrite starts a goroutine to write wr (in a separate
+// goroutine since that might block on the network), and updates the
+// serve goroutine's state about the world, updated from info in wr.
+func (sc *http2serverConn) startFrameWrite(wr http2FrameWriteRequest) {
+	sc.serveG.check()
+	if sc.writingFrame {
+		panic("internal error: can only be writing one frame at a time")
+	}
+
+	sc.writingFrame = true
+	sc.needsFrameFlush = true
+	if wr.write.staysWithinBuffer(sc.bw.bw.Available()) {
+		sc.writingFrameAsync = false
+		err := wr.write.writeFrame(sc)
+		sc.wroteFrame(http2frameWriteResult{wr: wr, err: err})
+	}
+}
+
+// wroteFrame is called on the serve goroutine with the result of
+// whatever happened on writeFrameAsync.
+func (sc *http2serverConn) wroteFrame(res http2frameWriteResult) {
+	sc.serveG.check()
+	if !sc.writingFrame {
+		panic("internal error: expected to be already writing a frame")
+	}
+	sc.writingFrame = false
+	sc.writingFrameAsync = false
+
+	// TODO
+
+	// // Reply (if requested) to unblock the ServeHTTP goroutine.
+	// wr.replyToWriter(res.err)
+
+	sc.scheduleFrameWrite()
+}
+
+// scheduleFrameWrite tickles the frame writing scheduler.
+//
+// If a frame is already being written, nothing happens. This will be called again
+// when the frame is done being written.
+//
+// If a frame isn't being written and we need to send one, the best frame
+// to send is selected by writeSched.
+//
+// If a frame isn't being written and there's nothing else to send, we
+// flush the write buffer.
+func (sc *http2serverConn) scheduleFrameWrite() {
+	sc.serveG.check()
+	if sc.writingFrame || sc.inFrameScheduleLoop {
+		return
+	}
+	sc.inFrameScheduleLoop = true
+	for !sc.writingFrameAsync {
+		// TODO
+		// if !sc.inGoAway || sc.goAwayCode == ErrCodeNo {
+		if !sc.inGoAway {
+			if wr, ok := sc.writeSched.Pop(); ok {
+				if wr.isControl() {
+					sc.queuedControlFrames--
+				}
+				sc.startFrameWrite(wr)
+				continue
+			}
+		}
+		if sc.needsFrameFlush {
+			sc.startFrameWrite(http2FrameWriteRequest{write: http2flushFrameWriter{}})
+			sc.needsFrameFlush = false // after startFrameWrite, since it sets this true
+			continue
+		}
+		break
+	}
+	sc.inFrameScheduleLoop = false
+}
 
 func http2strSliceContains(ss []string, s string) bool {
 	for _, v := range ss {
@@ -1790,34 +2039,181 @@ func http2strSliceContains(ss []string, s string) bool {
 	return false
 }
 
+// writeFramer is implemented by any type that is used to write frames.
+type http2writeFramer interface {
+	writeFrame(http2writeContext) error
+
+	// staysWithinBuffer reports whether this writer promises that
+	// it will only write less than or equal to size bytes, and it
+	// won't Flush the write context.
+	staysWithinBuffer(size int) bool
+}
+
+// writeContext is the interface needed by the various frame writer
+// types below. All the writeFrame methods below are scheduled via the
+// frame writing scheduler (see writeScheduler in writesched.go).
+//
+// This interface is implemented by *serverConn.
+//
+// TODO: decide whether to a) use this in the client code (which didn't
+// end up using this yet, because it has a simpler design, not
+// currently implementing priorities), or b) delete this and
+// make the server code a bit more concrete.
+type http2writeContext interface {
+	Framer() *http2Framer
+	Flush() error
+	// CloseConn() error
+	// // HeaderEncoder returns an HPACK encoder that writes to the
+	// // returned buffer.
+	// HeaderEncoder() (*hpack.Encoder, *bytes.Buffer)
+}
+
+type http2flushFrameWriter struct{}
+
+func (http2flushFrameWriter) writeFrame(ctx http2writeContext) error {
+	return ctx.Flush()
+}
+
+func (http2flushFrameWriter) staysWithinBuffer(max int) bool { return false }
+
+type http2writeData struct {
+	streamID  uint32
+	p         []byte
+	endStream bool
+}
+
+type http2writeSettings []http2Setting
+
+func (s http2writeSettings) staysWithinBuffer(max int) bool {
+	const settingSize = 6 // uint16 + uint32
+	return http2frameHeaderLen+settingSize*len(s) <= max
+}
+
+func (s http2writeSettings) writeFrame(ctx http2writeContext) error {
+	return ctx.Framer().WriteSettings([]http2Setting(s)...)
+}
+
 // WriteScheduler is the interface implemented by HTTP/2 write schedulers.
 // Methods are never called concurrently.
 type http2WriteScheduler interface {
+	// // OpenStream opens a new stream in the write scheduler.
+	// // It is illegal to call this with streamID=0 or with a streamID that is
+	// // already open -- the call may panic.
+	// OpenStream(streamID uint32, options OpenStreamOptions)
+
+	// // CloseStream closes a stream in the write scheduler. Any frames queued on
+	// // this stream should be discarded. It is illegal to call this on a stream
+	// // that is not open -- the call may panic.
+	// CloseStream(streamID uint32)
+
+	// // AdjustStream adjusts the priority of the given stream. This may be called
+	// // on a stream that has not yet been opened or has been closed. Note that
+	// // RFC 7540 allows PRIORITY frames to be sent on streams in any state. See:
+	// // https://tools.ietf.org/html/rfc7540#section-5.1
+	// AdjustStream(streamID uint32, priority PriorityParam)
+
+	// Push queues a frame in the scheduler. In most cases, this will not be
+	// called with wr.StreamID()!=0 unless that stream is currently open. The one
+	// exception is RST_STREAM frames, which may be sent on idle or closed streams.
+	Push(wr http2FrameWriteRequest)
+
+	// Pop dequeues the next frame to write. Returns false if no frames can
+	// be written. Frames with a given wr.StreamID() are Pop'd in the same
+	// order they are Push'd, except RST_STREAM frames. No frames should be
+	// discarded except by CloseStream.
+	Pop() (wr http2FrameWriteRequest, ok bool)
 }
 
 // FrameWriteRequest is a request for write a frame.
-type http2FrameWriteRequest struct{}
+type http2FrameWriteRequest struct {
+	// write is the interface value that does the writing, once the
+	// WriteScheduler has selected this frame to write. The write
+	// functions are all defined in write.go.
+	write http2writeFramer
+
+	// stream is the stream on which this frame will be written.
+	// nil for non-stream frames like PING and SETTINGS.
+	// nil for RST_STREAM streams, which use the StreamError.StreamID field instead.
+	stream *http2stream
+
+	// // done, if non-nil, must be a buffered channel with space for
+	// // 1 message and is sent the return value from write (or an
+	// // earlier error) when the frame has been written.
+	// done chan error
+}
+
+// StreamID returns the id of the stream this frame will be written to.
+// 0 is used for non-stream frames such as PING and SETTINGS.
+func (wr http2FrameWriteRequest) StreamID() uint32 {
+	if wr.stream == nil {
+		// if se, ok := wr.write.(StreamError); ok {
+		// 	// (*serverConn).resetStream doesn't set
+		// 	// stream because it doesn't necessarily have
+		// 	// one. So special case this type of write
+		// 	// message.
+		// 	return se.StreamID
+		// }
+		return 0
+	}
+	return wr.stream.id
+}
+
+func (wr http2FrameWriteRequest) DataSize() int {
+	// if wd, ok := wr.write.(*writeData); ok {
+	// 	return len(wd.p)
+	// }
+	return 0
+}
+
+// isControl reports whether wr is a control frame for MaxQueuedControlFrames
+// purposes. That includes non-stream frames and RST_STREAM frames.
+func (wr http2FrameWriteRequest) isControl() bool {
+	return wr.stream == nil
+}
 
 // writeQueue is used by implementations of WriteScheduler.
 type http2writeQueue struct {
+	s          []http2FrameWriteRequest
+	prev, next *http2writeQueue
+}
+
+func (q *http2writeQueue) empty() bool { return len(q.s) == 0 }
+
+func (q *http2writeQueue) push(wr http2FrameWriteRequest) {
+	q.s = append(q.s, wr)
+}
+
+func (q *http2writeQueue) shift() http2FrameWriteRequest {
+	if len(q.s) == 0 {
+		panic("invalid use of queue")
+	}
+	wr := q.s[0]
+	// TODO: less copy-happy queue.
+	copy(q.s, q.s[1:])
+	q.s[len(q.s)-1] = http2FrameWriteRequest{}
+	q.s = q.s[:len(q.s)-1]
+	return wr
 }
 
 // PriorityWriteSchedulerConfig configures a priorityWriteScheduler.
 type http2PriorityWriteSchedulerConfig struct {
 }
 
-// NewPriorityWriteScheduler constructs a WriteScheduler that schedules
-// frames by following HTTP/2 priorities as described in RFC 7540 Section 5.3.
-// If cfg is nil, default options are used.
-func http2NewPriorityWriteScheduler(cfg *http2PriorityWriteSchedulerConfig) http2WriteScheduler {
-	ws := &http2priorityWriteScheduler{}
-	return ws
-}
+// // NewPriorityWriteScheduler constructs a WriteScheduler that schedules
+// // frames by following HTTP/2 priorities as described in RFC 7540 Section 5.3.
+// // If cfg is nil, default options are used.
+// func NewPriorityWriteScheduler(cfg *PriorityWriteSchedulerConfig) WriteScheduler {
+// 	ws := &priorityWriteScheduler{}
+// 	return ws
+// }
 
 type http2priorityWriteScheduler struct {
 }
 
 type http2roundRobinWriteScheduler struct {
+	// control contains control frames (SETTINGS, PING, etc.).
+	control http2writeQueue
+
 	// streams maps stream ID to a queue.
 	streams map[uint32]*http2writeQueue
 }
@@ -1827,4 +2223,45 @@ func http2newRoundRobinWriteScheduler() http2WriteScheduler {
 		streams: make(map[uint32]*http2writeQueue),
 	}
 	return ws
+}
+
+func (ws *http2roundRobinWriteScheduler) Push(wr http2FrameWriteRequest) {
+	if wr.isControl() {
+		ws.control.push(wr)
+		return
+	}
+	q := ws.streams[wr.StreamID()]
+	if q == nil {
+		// This is a closed stream.
+		// wr should not be a HEADERS or DATA frame.
+		// We push the request onto the control queue.
+		if wr.DataSize() > 0 {
+			panic("add DATA on non-open stream")
+		}
+		ws.control.push(wr)
+		return
+	}
+	q.push(wr)
+}
+
+func (ws *http2roundRobinWriteScheduler) Pop() (http2FrameWriteRequest, bool) {
+	// Control and RST_STREAM frames first.
+	if !ws.control.empty() {
+		return ws.control.shift(), true
+	}
+	// if ws.head == nil {
+	// 	return FrameWriteRequest{}, false
+	// }
+	// q := ws.head
+	// for {
+	// 	if wr, ok := q.consume(math.MaxInt32); ok {
+	// 		ws.head = q.next
+	// 		return wr, true
+	// 	}
+	// 	q = q.next
+	// 	if q == ws.head {
+	// 		break
+	// 	}
+	// }
+	return http2FrameWriteRequest{}, false
 }
