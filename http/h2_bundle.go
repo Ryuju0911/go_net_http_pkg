@@ -896,16 +896,16 @@ const (
 type http2frameParser func(fc *http2frameCache, fh http2FrameHeader, countError func(string), payload []byte) (http2Frame, error)
 
 var http2frameParsers = map[http2FrameType]http2frameParser{
-	http2FrameData:      http2parseDataFrame,
-	http2FrameHeaders:   http2parseHeadersFrame,
-	http2FramePriority:  http2parsePriorityFrame,
-	http2FrameRSTStream: http2parseRSTStreamFrame,
-	http2FrameSettings:  http2parseSettingsFrame,
-	// FramePushPromise:  parsePushPromise,
-	// FramePing:         parsePingFrame,
-	// FrameGoAway:       parseGoAwayFrame,
-	// FrameWindowUpdate: parseWindowUpdateFrame,
-	// FrameContinuation: parseContinuationFrame,
+	http2FrameData:         http2parseDataFrame,
+	http2FrameHeaders:      http2parseHeadersFrame,
+	http2FramePriority:     http2parsePriorityFrame,
+	http2FrameRSTStream:    http2parseRSTStreamFrame,
+	http2FrameSettings:     http2parseSettingsFrame,
+	http2FramePushPromise:  http2parsePushPromise,
+	http2FramePing:         http2parsePingFrame,
+	http2FrameGoAway:       http2parseGoAwayFrame,
+	http2FrameWindowUpdate: http2parseWindowUpdateFrame,
+	http2FrameContinuation: http2parseContinuationFrame,
 }
 
 func http2typeFrameParser(t http2FrameType) http2frameParser {
@@ -1292,6 +1292,55 @@ func (f *http2Framer) WriteSettings(settings ...http2Setting) error {
 	return f.endWrite()
 }
 
+// A PingFrame is a mechanism for measuring a minimal round trip time
+// from the sender, as well as determining whether an idle connection
+// is still functional.
+// See https://httpwg.org/specs/rfc7540.html#rfc.section.6.7
+type http2PingFrame struct {
+	http2FrameHeader
+	Data [8]byte
+}
+
+func http2parsePingFrame(_ *http2frameCache, fh http2FrameHeader, countError func(string), payload []byte) (http2Frame, error) {
+	if len(payload) != 8 {
+		countError("frame_ping_length")
+		return nil, http2ConnectionError(http2ErrCodeFrameSize)
+	}
+	if fh.StreamID != 0 {
+		countError("frame_ping_has_stream")
+		return nil, http2ConnectionError(http2ErrCodeProtocol)
+	}
+	f := &http2PingFrame{http2FrameHeader: fh}
+	copy(f.Data[:], payload)
+	return f, nil
+}
+
+// A GoAwayFrame informs the remote peer to stop creating streams on this connection.
+// See https://httpwg.org/specs/rfc7540.html#rfc.section.6.8
+type http2GoAwayFrame struct {
+	http2FrameHeader
+	LastStreamID uint32
+	ErrCode      http2ErrCode
+	debugData    []byte
+}
+
+func http2parseGoAwayFrame(_ *http2frameCache, fh http2FrameHeader, countError func(string), p []byte) (http2Frame, error) {
+	if fh.StreamID != 0 {
+		countError("frame_goaway_has_stream")
+		return nil, http2ConnectionError(http2ErrCodeProtocol)
+	}
+	if len(p) < 8 {
+		countError("frame_goaway_short")
+		return nil, http2ConnectionError(http2ErrCodeFrameSize)
+	}
+	return &http2GoAwayFrame{
+		http2FrameHeader: fh,
+		LastStreamID:     binary.BigEndian.Uint32(p[:4]) & (1<<31 - 1),
+		ErrCode:          http2ErrCode(binary.BigEndian.Uint32(p[4:8])),
+		debugData:        p[8:],
+	}, nil
+}
+
 func (f *http2Framer) WriteGoAway(maxStreamID uint32, code http2ErrCode, debugData []byte) error {
 	f.startWrite(http2FrameGoAway, 0, 0)
 	f.writeUint32(maxStreamID & (1<<31 - 1))
@@ -1309,6 +1358,39 @@ type http2UnknownFrame struct {
 
 func http2parseUnknownFrame(_ *http2frameCache, fh http2FrameHeader, countError func(string), p []byte) (http2Frame, error) {
 	return &http2UnknownFrame{fh, p}, nil
+}
+
+// A WindowUpdateFrame is used to implement flow control.
+// See https://httpwg.org/specs/rfc7540.html#rfc.section.6.9
+type http2WindowUpdateFrame struct {
+	http2FrameHeader
+	Increment uint32 // never read with high bit set
+}
+
+func http2parseWindowUpdateFrame(_ *http2frameCache, fh http2FrameHeader, countError func(string), p []byte) (http2Frame, error) {
+	if len(p) != 4 {
+		countError("frame_windowupdate_bad_len")
+		return nil, http2ConnectionError(http2ErrCodeFrameSize)
+	}
+	inc := binary.BigEndian.Uint32(p[:4]) & 0x7fffffff // mask off high reserved bit
+	if inc == 0 {
+		// A receiver MUST treat the receipt of a
+		// WINDOW_UPDATE frame with an flow control window
+		// increment of 0 as a stream error (Section 5.4.2) of
+		// type PROTOCOL_ERROR; errors on the connection flow
+		// control window MUST be treated as a connection
+		// error (Section 5.4.1).
+		if fh.StreamID == 0 {
+			countError("frame_windowupdate_zero_inc_conn")
+			return nil, http2ConnectionError(http2ErrCodeProtocol)
+		}
+		countError("frame_windowupdate_zero_inc_stream")
+		return nil, http2streamError(fh.StreamID, http2ErrCodeProtocol)
+	}
+	return &http2WindowUpdateFrame{
+		http2FrameHeader: fh,
+		Increment:        inc,
+	}, nil
 }
 
 // WriteWindowUpdate writes a WINDOW_UPDATE frame.
@@ -1440,6 +1522,69 @@ func http2parseRSTStreamFrame(_ *http2frameCache, fh http2FrameHeader, countErro
 		return nil, http2ConnectionError(http2ErrCodeProtocol)
 	}
 	return &http2RSTStreamFrame{fh, http2ErrCode(binary.BigEndian.Uint32(p[:4]))}, nil
+}
+
+// A PushPromiseFrame is used to initiate a server stream.
+// See https://httpwg.org/specs/rfc7540.html#rfc.section.6.6
+type http2PushPromiseFrame struct {
+	http2FrameHeader
+	PromiseID     uint32
+	headerFragBuf []byte // not owned
+}
+
+func http2parsePushPromise(_ *http2frameCache, fh http2FrameHeader, countError func(string), p []byte) (_ http2Frame, err error) {
+	pp := &http2PushPromiseFrame{
+		http2FrameHeader: fh,
+	}
+	if pp.StreamID == 0 {
+		// PUSH_PROMISE frames MUST be associated with an existing,
+		// peer-initiated stream. The stream identifier of a
+		// PUSH_PROMISE frame indicates the stream it is associated
+		// with. If the stream identifier field specifies the value
+		// 0x0, a recipient MUST respond with a connection error
+		// (Section 5.4.1) of type PROTOCOL_ERROR.
+		countError("frame_pushpromise_zero_stream")
+		return nil, http2ConnectionError(http2ErrCodeProtocol)
+	}
+	// The PUSH_PROMISE frame includes optional padding.
+	// Padding fields and flags are identical to those defined for DATA frames
+	var padLength uint8
+	if fh.Flags.Has(http2FlagPushPromisePadded) {
+		if p, padLength, err = http2readByte(p); err != nil {
+			countError("frame_pushpromise_pad_short")
+			return
+		}
+	}
+
+	p, pp.PromiseID, err = http2readUint32(p)
+	if err != nil {
+		countError("frame_pushpromise_promiseid_short")
+		return
+	}
+	pp.PromiseID = pp.PromiseID & (1<<31 - 1)
+
+	if int(padLength) > len(p) {
+		// like the DATA frame, error out if padding is longer than the body.
+		countError("frame_pushpromise_pad_too_big")
+		return nil, http2ConnectionError(http2ErrCodeProtocol)
+	}
+	pp.headerFragBuf = p[:len(p)-int(padLength)]
+	return pp, nil
+}
+
+// A ContinuationFrame is used to continue a sequence of header block fragments.
+// See https://httpwg.org/specs/rfc7540.html#rfc.section.6.10
+type http2ContinuationFrame struct {
+	http2FrameHeader
+	headerFragBuf []byte
+}
+
+func http2parseContinuationFrame(_ *http2frameCache, fh http2FrameHeader, countError func(string), p []byte) (http2Frame, error) {
+	if fh.StreamID == 0 {
+		countError("frame_continuation_zero_stream")
+		return nil, http2connError{http2ErrCodeProtocol, "CONTINUATION frame with stream ID 0"}
+	}
+	return &http2ContinuationFrame{fh, p}, nil
 }
 
 func http2readByte(p []byte) (remain []byte, b byte, err error) {
