@@ -723,6 +723,17 @@ type http2StreamError struct {
 	Cause    error // optional additional detail
 }
 
+func http2streamError(id uint32, code http2ErrCode) http2StreamError {
+	return http2StreamError{StreamID: id, Code: code}
+}
+
+func (e http2StreamError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("stream error: stream ID %d; %v; %v", e.StreamID, e.Code, e.Cause)
+	}
+	return fmt.Sprintf("stream error: stream ID %d; %v", e.StreamID, e.Code)
+}
+
 // connError represents an HTTP/2 ConnectionError error code, along
 // with a string (for debugging) explaining why.
 //
@@ -877,8 +888,8 @@ const (
 type http2frameParser func(fc *http2frameCache, fh http2FrameHeader, countError func(string), payload []byte) (http2Frame, error)
 
 var http2frameParsers = map[http2FrameType]http2frameParser{
-	http2FrameData: http2parseDataFrame,
-	// FrameHeaders: parseHeadersFrame,
+	http2FrameData:    http2parseDataFrame,
+	http2FrameHeaders: http2parseHeadersFrame,
 	// FramePriority:     parsePriorityFrame,
 	// FrameRSTStream:    parseRSTStreamFrame,
 	// FrameSettings:     parseSettingsFrame,
@@ -1230,11 +1241,88 @@ func (f *http2Framer) WriteWindowUpdate(streamID uint32, incr uint32) error {
 	return f.endWrite()
 }
 
+// A HeadersFrame is used to open a stream and additionaly carries a
+// header block flagment.
+type http2HeadersFrame struct {
+	http2FrameHeader
+
+	// Priority is set if FlagHeadersPriority is set in the FrameHeader.
+	Priority http2PriorityParam
+
+	headerFragBuf []byte // not owned
+}
+
+func http2parseHeadersFrame(_ *http2frameCache, fh http2FrameHeader, countError func(string), p []byte) (_ http2Frame, err error) {
+	hf := &http2HeadersFrame{
+		http2FrameHeader: fh,
+	}
+	if fh.StreamID == 0 {
+		// HEADERS frames MUST be associated with a stream. If a HEADERS frame
+		// is received whose stream identifier field is 0x0, the recipient MUST
+		// respond with a connection error (Section 5.4.1) of type
+		// PROTOCOL_ERROR.
+		countError("frame_headers_zero_stream")
+		return nil, http2connError{http2ErrCodeProtocol, "HEADERS frame with stream ID 0"}
+	}
+	var padLength uint8
+	if fh.Flags.Has(http2FlagHeadersPadded) {
+		if p, padLength, err = http2readByte(p); err != nil {
+			countError("frame_headers_pad_short")
+			return
+		}
+	}
+	if fh.Flags.Has(http2FlagHeadersPriority) {
+		var v uint32
+		p, v, err = http2readUint32(p)
+		if err != nil {
+			countError("frame_headers_prio_short")
+			return nil, err
+		}
+		hf.Priority.StreamDep = v & 0x7fffffff
+		hf.Priority.Exclusive = (v != hf.Priority.StreamDep) // high big was set
+		p, hf.Priority.Weight, err = http2readByte(p)
+		if err != nil {
+			countError("frame_headers_prio_weight_short")
+			return nil, err
+		}
+	}
+	if len(p)-int(padLength) < 0 {
+		countError("frame_headers_pad_too_big")
+		return nil, http2streamError(fh.StreamID, http2ErrCodeProtocol)
+	}
+	hf.headerFragBuf = p[:len(p)-int(padLength)]
+	return hf, nil
+}
+
+// PriorityParam are the stream prioritzation parameters.
+type http2PriorityParam struct {
+	// StreamDep is a 31-bit stream identifier for the
+	// stream that this stream depends on. Zero means no
+	// dependency.
+	StreamDep uint32
+
+	// Exclusive is whether the dependency is exclusive.
+	Exclusive bool
+
+	// Weight is the stream's zero-indexed weight. It should be
+	// set together with StreamDep, or neither should be set. Per
+	// the spec, "Add one to the value to obtain a weight between
+	// 1 and 256."
+	Weight uint8
+}
+
 func http2readByte(p []byte) (remain []byte, b byte, err error) {
 	if len(p) == 0 {
 		return nil, 0, io.ErrUnexpectedEOF
 	}
 	return p[1:], p[0], nil
+}
+
+func http2readUint32(p []byte) (remain []byte, v uint32, err error) {
+	if len(p) < 4 {
+		return nil, 0, io.ErrUnexpectedEOF
+	}
+	return p[4:], binary.BigEndian.Uint32(p[:4]), nil
 }
 
 var http2DebugGoroutines = os.Getenv("DEBUG_HTTP2_GOROUTINES") == "1"
