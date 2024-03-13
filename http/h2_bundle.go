@@ -888,9 +888,9 @@ const (
 type http2frameParser func(fc *http2frameCache, fh http2FrameHeader, countError func(string), payload []byte) (http2Frame, error)
 
 var http2frameParsers = map[http2FrameType]http2frameParser{
-	http2FrameData:    http2parseDataFrame,
-	http2FrameHeaders: http2parseHeadersFrame,
-	// FramePriority:     parsePriorityFrame,
+	http2FrameData:     http2parseDataFrame,
+	http2FrameHeaders:  http2parseHeadersFrame,
+	http2FramePriority: http2parsePriorityFrame,
 	// FrameRSTStream:    parseRSTStreamFrame,
 	// FrameSettings:     parseSettingsFrame,
 	// FramePushPromise:  parsePushPromise,
@@ -1294,6 +1294,13 @@ func http2parseHeadersFrame(_ *http2frameCache, fh http2FrameHeader, countError 
 	return hf, nil
 }
 
+// A PriorityFrame specifies the sender-advised priority of a stream.
+// See https://httpwg.org/specs/rfc7540.html#rfc.section.6.3
+type http2PriorityFrame struct {
+	http2FrameHeader
+	http2PriorityParam
+}
+
 // PriorityParam are the stream prioritzation parameters.
 type http2PriorityParam struct {
 	// StreamDep is a 31-bit stream identifier for the
@@ -1309,6 +1316,27 @@ type http2PriorityParam struct {
 	// the spec, "Add one to the value to obtain a weight between
 	// 1 and 256."
 	Weight uint8
+}
+
+func http2parsePriorityFrame(_ *http2frameCache, fh http2FrameHeader, countError func(string), payload []byte) (http2Frame, error) {
+	if fh.StreamID == 0 {
+		countError("frame_priority_zero_stream")
+		return nil, http2connError{http2ErrCodeProtocol, "PRIORITY frame with stream ID 0"}
+	}
+	if len(payload) != 5 {
+		countError("frame_priority_bad_length")
+		return nil, http2connError{http2ErrCodeFrameSize, fmt.Sprintf("PRIORITY frame payload size was %d; want 5", len(payload))}
+	}
+	v := binary.BigEndian.Uint32(payload[:4])
+	streamID := v & 0x7fffffff // mask off high bit
+	return &http2PriorityFrame{
+		http2FrameHeader: fh,
+		http2PriorityParam: http2PriorityParam{
+			Weight:    payload[4],
+			StreamDep: streamID,
+			Exclusive: streamID != v, // was high bit set?
+		},
+	}, nil
 }
 
 func http2readByte(p []byte) (remain []byte, b byte, err error) {
