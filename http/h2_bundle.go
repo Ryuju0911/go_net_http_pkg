@@ -715,6 +715,14 @@ func (e http2ErrCode) String() string {
 	return fmt.Sprintf("unknown error code 0x%x", uint32(e))
 }
 
+// ConnectionError is an error that results in the termination of the
+// entire connection.
+type http2ConnectionError http2ErrCode
+
+func (e http2ConnectionError) Error() string {
+	return fmt.Sprintf("connection error: %s", http2ErrCode(e))
+}
+
 // StreamError is an error that only affects one stream within an
 // HTTP/2 connection.
 type http2StreamError struct {
@@ -888,11 +896,11 @@ const (
 type http2frameParser func(fc *http2frameCache, fh http2FrameHeader, countError func(string), payload []byte) (http2Frame, error)
 
 var http2frameParsers = map[http2FrameType]http2frameParser{
-	http2FrameData:     http2parseDataFrame,
-	http2FrameHeaders:  http2parseHeadersFrame,
-	http2FramePriority: http2parsePriorityFrame,
-	// FrameRSTStream:    parseRSTStreamFrame,
-	// FrameSettings:     parseSettingsFrame,
+	http2FrameData:      http2parseDataFrame,
+	http2FrameHeaders:   http2parseHeadersFrame,
+	http2FramePriority:  http2parsePriorityFrame,
+	http2FrameRSTStream: http2parseRSTStreamFrame,
+	http2FrameSettings:  http2parseSettingsFrame,
 	// FramePushPromise:  parsePushPromise,
 	// FramePing:         parsePingFrame,
 	// FrameGoAway:       parseGoAwayFrame,
@@ -935,6 +943,12 @@ type http2FrameHeader struct {
 // Header returns h. It exists so FrameHeaders can be embedded in other
 // specific frame types and implement the Frame interface
 func (h http2FrameHeader) Header() http2FrameHeader { return h }
+
+func (h *http2FrameHeader) checkValid() {
+	if !h.valid {
+		panic("Frame accessor called on non-owned Frame")
+	}
+}
 
 func (h *http2FrameHeader) invalidate() { h.valid = false }
 
@@ -1194,6 +1208,76 @@ func http2parseDataFrame(fc *http2frameCache, fh http2FrameHeader, countError fu
 	return f, nil
 }
 
+// A SettingsFrame conveys configuration parameters that affect how
+// endpoints communicate, such as preferences and constraints on peer
+// behavior.
+//
+// See https://httpwg.org/specs/rfc7540.html#SETTINGS
+type http2SettingsFrame struct {
+	http2FrameHeader
+	p []byte
+}
+
+func http2parseSettingsFrame(_ *http2frameCache, fh http2FrameHeader, countError func(string), p []byte) (http2Frame, error) {
+	if fh.Flags.Has(http2FlagSettingsAck) && fh.Length > 0 {
+		// When this (ACK 0x1) bit is set, the payload of the
+		// SETTINGS frame MUST be empty. Receipt of a
+		// SETTINGS frame with the ACK flag set and a length
+		// field value other than 0 MUST be treated as a
+		// connection error (Section 5.4.1) of type
+		// FRAME_SIZE_ERROR.
+		countError("frame_settings_ack_with_length")
+		return nil, http2ConnectionError(http2ErrCodeFrameSize)
+	}
+	if fh.StreamID != 0 {
+		// SETTINGS frames always apply to a connection,
+		// never a single stream. The stream identifier for a
+		// SETTINGS frame MUST be zero (0x0).  If an endpoint
+		// receives a SETTINGS frame whose stream identifier
+		// field is anything other than 0x0, the endpoint MUST
+		// respond with a connection error (Section 5.4.1) of
+		// type PROTOCOL_ERROR.
+		countError("frame_settings_has_stream")
+		return nil, http2ConnectionError(http2ErrCodeProtocol)
+	}
+	if len(p)%6 != 0 {
+		countError("frame_settings_mod_6")
+		// Expecting even number of 6 byte settings.
+		return nil, http2ConnectionError(http2ErrCodeFrameSize)
+	}
+	f := &http2SettingsFrame{http2FrameHeader: fh, p: p}
+	if v, ok := f.Value(http2SettingInitialWindowSize); ok && v > (1<<31)-1 {
+		countError("frame_settings_window_size_too_big")
+		// Values above the maximum flow control window size of 2^31 - 1 MUST
+		// be treated as a connection error (Section 5.4.1) of type
+		// FLOW_CONTROL_ERROR.
+		return nil, http2ConnectionError(http2ErrCodeFlowControl)
+	}
+	return f, nil
+}
+
+func (f *http2SettingsFrame) Value(id http2SettingID) (v uint32, ok bool) {
+	f.checkValid()
+	for i := 0; i < f.NumSettings(); i++ {
+		if s := f.Setting(i); s.ID == id {
+			return s.Val, true
+		}
+	}
+	return 0, false
+}
+
+// Setting returns the setting from the frame at the given 0-based index.
+// The index must be >= 0 and less than f.NumSettings().
+func (f *http2SettingsFrame) Setting(i int) http2Setting {
+	buf := f.p
+	return http2Setting{
+		ID:  http2SettingID(binary.BigEndian.Uint16(buf[i*6 : i*6+2])),
+		Val: binary.BigEndian.Uint32(buf[i*6+2 : i*6+6]),
+	}
+}
+
+func (f *http2SettingsFrame) NumSettings() int { return len(f.p) / 6 }
+
 // WriteSettings writes a SETTINGS frame with zero or more settings
 // specified and the ACK bit not set.
 //
@@ -1337,6 +1421,25 @@ func http2parsePriorityFrame(_ *http2frameCache, fh http2FrameHeader, countError
 			Exclusive: streamID != v, // was high bit set?
 		},
 	}, nil
+}
+
+// A RSTStreamFrame allows for abnormal termination of a stream.
+// See https://httpwg.org/specs/rfc7540.html#rfc.section.6.4
+type http2RSTStreamFrame struct {
+	http2FrameHeader
+	ErrCode http2ErrCode
+}
+
+func http2parseRSTStreamFrame(_ *http2frameCache, fh http2FrameHeader, countError func(string), p []byte) (http2Frame, error) {
+	if len(p) != 4 {
+		countError("frame_rststream_bad_len")
+		return nil, http2ConnectionError(http2ErrCodeFrameSize)
+	}
+	if fh.StreamID == 0 {
+		countError("frame_rststream_zero_stream")
+		return nil, http2ConnectionError(http2ErrCodeProtocol)
+	}
+	return &http2RSTStreamFrame{fh, http2ErrCode(binary.BigEndian.Uint32(p[:4]))}, nil
 }
 
 func http2readByte(p []byte) (remain []byte, b byte, err error) {
