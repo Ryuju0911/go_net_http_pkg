@@ -1088,6 +1088,15 @@ func (g http2goroutineLock) check() {
 	}
 }
 
+func (g http2goroutineLock) checkNotOn() {
+	if !http2DebugGoroutines {
+		return
+	}
+	if http2curGoroutineID() == uint64(g) {
+		panic("running on the wrong goroutine")
+	}
+}
+
 var http2goroutineSpace = []byte("goroutine ")
 
 func http2curGoroutineID() uint64 {
@@ -1355,10 +1364,10 @@ type http2Server struct {
 	// cipher suites prohibited by the HTTP/2 spec.
 	PermitProhibitedCipherSuites bool
 
-	// // IdleTimeout specifies how long until idle clients should be
-	// // closed with a GOAWAY frame. PING frames are not considered
-	// // activity for the purposes of IdleTimeout.
-	// IdleTimeout time.Duration
+	// IdleTimeout specifies how long until idle clients should be
+	// closed with a GOAWAY frame. PING frames are not considered
+	// activity for the purposes of IdleTimeout.
+	IdleTimeout time.Duration
 
 	// MaxUploadBufferPerConnection is the size of the initial flow
 	// control window for each connections. The HTTP/2 spec does not
@@ -1467,13 +1476,13 @@ func http2ConfigureServer(s *Server, conf *http2Server) error {
 		conf = new(http2Server)
 	}
 	conf.state = &http2serverInternalState{activeConns: make(map[*http2serverConn]struct{})}
-	// if h1, h2 := s, conf; h2.IdleTimeout == 0 {
-	// 	if h1.IdleTimeout != 0 {
-	// 		h2.IdleTimeout = h1.IdleTimeout
-	// 	} else {
-	// 		h2.IdleTimeout = h1.ReadTimeout
-	// 	}
-	// }
+	if h1, h2 := s, conf; h2.IdleTimeout == 0 {
+		if h1.IdleTimeout != 0 {
+			h2.IdleTimeout = h1.IdleTimeout
+		} else {
+			h2.IdleTimeout = h1.ReadTimeout
+		}
+	}
 	// s.RegisterOnShutdown(conf.state.startGracefulShutdown)
 
 	if s.TLSConfig == nil {
@@ -1627,10 +1636,10 @@ func (s *http2Server) ServeConn(c net.Conn, opts *http2ServeConnOpts) {
 		// streams:                     make(map[uint32]*stream),
 		// readFrameCh:                 make(chan readFrameResult),
 		// wantWriteFrameCh:            make(chan FrameWriteRequest, 8),
-		// serveMsgCh:                  make(chan interface{}, 8),
+		serveMsgCh: make(chan interface{}, 8),
 		// wroteFrameCh:                make(chan frameWriteResult, 1), // buffered; one send in writeFrameAsync
 		// bodyReadCh:                  make(chan bodyReadMsg),         // buffering doesn't matter either way
-		// doneServing:                 make(chan struct{}),
+		doneServing: make(chan struct{}),
 		// clientMaxStreams:            math.MaxUint32, // Section 6.5.2: "Initially, there is no limit to this value"
 		advMaxStreams: s.maxConcurrentStreams(),
 		// initialStreamSendWindowSize: initialWindowSize,
@@ -1776,7 +1785,7 @@ type http2serverConn struct {
 	// wantWriteFrameCh chan FrameWriteRequest // from handlers -> serve
 	// wroteFrameCh     chan frameWriteResult  // from writeFrameAsync -> serve, tickles more frame writes
 	// bodyReadCh       chan bodyReadMsg       // from handlers -> serve
-	// serveMsgCh       chan interface{}       // misc messages & code to send to / run on the serve loop
+	serveMsgCh    chan interface{}     // misc messages & code to send to / run on the serve loop
 	flow          http2outflow         // conn-wide (not stream-specific) outbound flow control
 	inflow        http2inflow          // conn-wide inbound flow control
 	tlsState      *tls.ConnectionState // shared by all handlers, like net/http
@@ -1813,7 +1822,7 @@ type http2serverConn struct {
 	// needToSendGoAway    bool // we need to schedule a GOAWAY frame write
 	// goAwayCode                  ErrCode
 	// shutdownTimer               *time.Timer // nil until used
-	// idleTimer                   *time.Timer // nil if unused
+	idleTimer *time.Timer // nil if unused
 
 	// Owned by the writeFrameAsync goroutine:
 	headerWriteBuf bytes.Buffer
@@ -1872,6 +1881,15 @@ func (sc *http2serverConn) Framer() *http2Framer { return sc.framer }
 
 func (sc *http2serverConn) Flush() error { return sc.bw.bw.Flush() }
 
+// setConnState calls the net/http ConnState hook for this connection, if configured.
+// Note that the net/http package does StateNew and StateClosed for us.
+// There is currently no plan for StateHijacked or hijacking HTTP/2 connections.
+func (sc *http2serverConn) setConnState(state ConnState) {
+	if sc.hs.ConnState != nil {
+		sc.hs.ConnState(sc.conn, state)
+	}
+}
+
 func (sc *http2serverConn) vlogf(format string, args ...interface{}) {
 	if http2VerboseLogs {
 		sc.logf(format, args...)
@@ -1920,6 +1938,43 @@ func (sc *http2serverConn) serve() {
 	// If a higher value is configured, we add more tokens.
 	if diff := sc.srv.initialConnRecvWindowSize() - http2initialWindowSize; diff > 0 {
 		sc.sendWindowUpdate(nil, int(diff))
+	}
+
+	// if err := sc.readPreface(); err != nil {
+	// 	sc.condlogf(err, "http2: server: error reading preface from client %v: %v", sc.conn.RemoteAddr(), err)
+	// 	return
+	// }
+	// Now that we've got the preface, get us out of the
+	// "StateNew" state. We can't go directly to idle, though.
+	// Active means we read some data and anticipate a request. We'll
+	// do another Active when we get a HEADERS frame.
+	sc.setConnState(StateActive)
+	sc.setConnState(StateIdle)
+
+	if sc.srv.IdleTimeout != 0 {
+		sc.idleTimer = time.AfterFunc(sc.srv.IdleTimeout, sc.onIdleTimer)
+		defer sc.idleTimer.Stop()
+	}
+}
+
+type http2serverMessage int
+
+// Message values sent to serveMsgCh.
+var (
+	// settingsTimerMsg    = new(serverMessage)
+	http2idleTimerMsg = new(http2serverMessage)
+	// shutdownTimerMsg    = new(serverMessage)
+	// gracefulShutdownMsg = new(serverMessage)
+	// handlerDoneMsg      = new(serverMessage)
+)
+
+func (sc *http2serverConn) onIdleTimer() { sc.sendServeMsg(http2idleTimerMsg) }
+
+func (sc *http2serverConn) sendServeMsg(msg interface{}) {
+	sc.serveG.checkNotOn() // NOT
+	select {
+	case sc.serveMsgCh <- msg:
+	case <-sc.doneServing:
 	}
 }
 
