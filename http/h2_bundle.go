@@ -886,13 +886,13 @@ type http2Framer struct {
 	w    io.Writer
 	wbuf []byte
 
-	// // AllowIllegalWrites permits the Framer's Write methods to
-	// // write frames that do not conform to the HTTP/2 spec. This
-	// // permits using the Framer to test other HTTP/2
-	// // implementations' conformance to the spec.
-	// // If false, the Write methods will prefer to return an error
-	// // rather than comply.
-	// AllowIllegalWrites bool
+	// AllowIllegalWrites permits the Framer's Write methods to
+	// write frames that do not conform to the HTTP/2 spec. This
+	// permits using the Framer to test other HTTP/2
+	// implementations' conformance to the spec.
+	// If false, the Write methods will prefer to return an error
+	// rather than comply.
+	AllowIllegalWrites bool
 
 	// // AllowIllegalReads permits the Framer's ReadFrame method
 	// // to return non-compliant frames or frame orders.
@@ -1051,6 +1051,20 @@ func (f *http2Framer) WriteGoAway(maxStreamID uint32, code http2ErrCode, debugDa
 	f.writeUint32(maxStreamID & (1<<31 - 1))
 	f.writeUint32(uint32(code))
 	f.writeBytes(debugData)
+	return f.endWrite()
+}
+
+// WriteWindowUpdate writes a WINDOW_UPDATE frame.
+// The increment value must be between 1 and 2,147,483,647, inclusive.
+// If the Stream ID is zero, the window update applies to the
+// connection as a whole.
+func (f *http2Framer) WriteWindowUpdate(streamID uint32, incr uint32) error {
+	// "The legal range for the increment to the flow control window is 1 to 2^31-1 (2,147,483,647) octets."
+	if (incr < 1 || incr > 2147483647) && !f.AllowIllegalWrites {
+		return errors.New("illegal window increment value")
+	}
+	f.startWrite(http2FrameWindowUpdate, 0, streamID)
+	f.writeUint32(incr)
 	return f.endWrite()
 }
 
@@ -1346,12 +1360,12 @@ type http2Server struct {
 	// // activity for the purposes of IdleTimeout.
 	// IdleTimeout time.Duration
 
-	// // MaxUploadBufferPerConnection is the size of the initial flow
-	// // control window for each connections. The HTTP/2 spec does not
-	// // allow this to be smaller than 65535 or larger than 2^32-1.
-	// // If the value is outside this range, a default value will be
-	// // used instead.
-	// MaxUploadBufferPerConnection int32
+	// MaxUploadBufferPerConnection is the size of the initial flow
+	// control window for each connections. The HTTP/2 spec does not
+	// allow this to be smaller than 65535 or larger than 2^32-1.
+	// If the value is outside this range, a default value will be
+	// used instead.
+	MaxUploadBufferPerConnection int32
 
 	// MaxUploadBufferPerStream is the size of the initial flow control
 	// window for each stream. The HTTP/2 spec does not allow this to
@@ -1373,6 +1387,13 @@ type http2Server struct {
 	// so that we don't embed a Mutex in this struct, which will make the
 	// struct non-copyable, which might break some callers.
 	state *http2serverInternalState
+}
+
+func (s *http2Server) initialConnRecvWindowSize() int32 {
+	if s.MaxUploadBufferPerConnection >= http2initialWindowSize {
+		return s.MaxUploadBufferPerConnection
+	}
+	return 1 << 20
 }
 
 func (s *http2Server) initialStreamRecvWindowSize() int32 {
@@ -1768,7 +1789,7 @@ type http2serverConn struct {
 	// sawClientPreface            bool // preface has already been read, used in h2c upgrade
 	// sawFirstSettings            bool // got the initial SETTINGS frame after the preface
 	// needToSendSettingsAck       bool
-	// unackedSettings             int    // how many SETTINGS have we sent without ACKs?
+	unackedSettings     int // how many SETTINGS have we sent without ACKs?
 	queuedControlFrames int // control frames in the writeSched queue
 	// clientMaxStreams            uint32 // SETTINGS_MAX_CONCURRENT_STREAMS from client (our PUSH_PROMISE limit)
 	advMaxStreams uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
@@ -1834,7 +1855,7 @@ type http2stream struct {
 	// bodyBytes        int64   // body bytes seen so far
 	// declBodyBytes    int64   // or -1 if undeclared
 	// flow             outflow // limits writing from Handler to client
-	// inflow           inflow  // what the client is allowed to POST/etc to us
+	inflow http2inflow // what the client is allowed to POST/etc to us
 	// state streamState
 	// resetQueued      bool        // RST_STREAM queued for write; set by sc.resetStream
 	// gotTrailerHeader bool        // HEADER frame for trailers was seen
@@ -1893,6 +1914,13 @@ func (sc *http2serverConn) serve() {
 			{http2SettingInitialWindowSize, uint32(sc.srv.initialStreamRecvWindowSize())},
 		},
 	})
+	sc.unackedSettings++
+
+	// Each connection starts with initialWindowSize inflow tokens.
+	// If a higher value is configured, we add more tokens.
+	if diff := sc.srv.initialConnRecvWindowSize() - http2initialWindowSize; diff > 0 {
+		sc.sendWindowUpdate(nil, int(diff))
+	}
 }
 
 func (sc *http2serverConn) writeFrame(wr http2FrameWriteRequest) {
@@ -2030,6 +2058,26 @@ func (sc *http2serverConn) scheduleFrameWrite() {
 	sc.inFrameScheduleLoop = false
 }
 
+// st may be nil for conn-level
+func (sc *http2serverConn) sendWindowUpdate(st *http2stream, n int) {
+	sc.serveG.check()
+	var streamID uint32
+	var send int32
+	if st == nil {
+		send = sc.inflow.add(n)
+	} else {
+		streamID = st.id
+		send = st.inflow.add(n)
+	}
+	if send == 0 {
+		return
+	}
+	sc.writeFrame(http2FrameWriteRequest{
+		write:  http2writeWindowUpdate{streamID: streamID, n: uint32(send)},
+		stream: st,
+	})
+}
+
 func http2strSliceContains(ss []string, s string) bool {
 	for _, v := range ss {
 		if v == s {
@@ -2091,6 +2139,17 @@ func (s http2writeSettings) staysWithinBuffer(max int) bool {
 
 func (s http2writeSettings) writeFrame(ctx http2writeContext) error {
 	return ctx.Framer().WriteSettings([]http2Setting(s)...)
+}
+
+type http2writeWindowUpdate struct {
+	streamID uint32 // or 0 for conn-level
+	n        uint32
+}
+
+func (wu http2writeWindowUpdate) staysWithinBuffer(max int) bool { return http2frameHeaderLen+4 <= max }
+
+func (wu http2writeWindowUpdate) writeFrame(ctx http2writeContext) error {
+	return ctx.Framer().WriteWindowUpdate(wu.streamID, wu.n)
 }
 
 // WriteScheduler is the interface implemented by HTTP/2 write schedulers.
