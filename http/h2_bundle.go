@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -722,6 +723,22 @@ type http2StreamError struct {
 	Cause    error // optional additional detail
 }
 
+// connError represents an HTTP/2 ConnectionError error code, along
+// with a string (for debugging) explaining why.
+//
+// Errors of this type are only returned by the frame parser functions
+// and converted into ConnectionError(Code), after stashing away
+// the Reason into the Framer's errDetail field, accessible via
+// the (*Framer).ErrorDetail method.
+type http2connError struct {
+	Code   http2ErrCode // the ConnectionError error code
+	Reason string       // additional reason
+}
+
+func (e http2connError) Error() string {
+	return fmt.Sprintf("http2: connection error: %v: %v", e.Code, e.Reason)
+}
+
 // inflowMinRefresh is the minimum number of bytes we'll send for a
 // flow control window update.
 const http2inflowMinRefresh = 4 << 10
@@ -824,6 +841,11 @@ var http2frameName = map[http2FrameType]string{
 // The meaning of flags varies depending on the frame type.
 type http2Flags uint8
 
+// Has reports whether f contains all (0 or more) flags in v.
+func (f http2Flags) Has(v http2Flags) bool {
+	return (f & v) == v
+}
+
 // Frame-specific FrameHeader flag bits.
 const (
 	// Data Frame
@@ -849,19 +871,95 @@ const (
 	http2FlagPushPromisePadded     http2Flags = 0x8
 )
 
+// a frameParser parses a frame given its FrameHeader and payload
+// bytes. The length of payload will always equal fh.Length (which
+// might be 0).
+type http2frameParser func(fc *http2frameCache, fh http2FrameHeader, countError func(string), payload []byte) (http2Frame, error)
+
+var http2frameParsers = map[http2FrameType]http2frameParser{
+	http2FrameData: http2parseDataFrame,
+	// FrameHeaders: parseHeadersFrame,
+	// FramePriority:     parsePriorityFrame,
+	// FrameRSTStream:    parseRSTStreamFrame,
+	// FrameSettings:     parseSettingsFrame,
+	// FramePushPromise:  parsePushPromise,
+	// FramePing:         parsePingFrame,
+	// FrameGoAway:       parseGoAwayFrame,
+	// FrameWindowUpdate: parseWindowUpdateFrame,
+	// FrameContinuation: parseContinuationFrame,
+}
+
+func http2typeFrameParser(t http2FrameType) http2frameParser {
+	if f := http2frameParsers[t]; f != nil {
+		return f
+	}
+	return http2parseUnknownFrame
+}
+
+// A FrameHeader is the 9 byte header of all HTTP/2 frames.
+//
+// See https://httpwg.org/specs/rfc7540.html#FrameHeader
+type http2FrameHeader struct {
+	valid bool // caller can access []byte fields in the Frame
+
+	// Type is the 1 byte frame type. There are ten standard frame
+	// types, but extension frame types may be written by WriteRawFrame
+	// and will be returned by ReadFrame (as UnknownFrame).
+	Type http2FrameType
+
+	// Flags are the 1 byte of 8 potential bit flags per frame.
+	// They are specific to the frame type.
+	Flags http2Flags
+
+	// Length is the length of the frame, not including the 9 byte header.
+	// The maximum size is one byte less than 16MB (uint24), but only
+	// frames up to 16KB are allowed without peer agreement.
+	Length uint32
+
+	// StreamID is which stream this frame is for. Certain frames
+	// are not stream-specific, in which case this field is 0.
+	StreamID uint32
+}
+
+// Header returns h. It exists so FrameHeaders can be embedded in other
+// specific frame types and implement the Frame interface
+func (h http2FrameHeader) Header() http2FrameHeader { return h }
+
+func (h *http2FrameHeader) invalidate() { h.valid = false }
+
+func http2readFrameHeader(buf []byte, r io.Reader) (http2FrameHeader, error) {
+	_, err := io.ReadFull(r, buf[:http2frameHeaderLen])
+	if err != nil {
+		return http2FrameHeader{}, nil
+	}
+	return http2FrameHeader{
+		Length:   (uint32(buf[0])<<16 | uint32(buf[1]<<8) | uint32(buf[2])),
+		Type:     http2FrameType(buf[3]),
+		Flags:    http2Flags(buf[4]),
+		StreamID: binary.BigEndian.Uint32(buf[5:]) & (1<<31 - 1),
+		valid:    true,
+	}, nil
+}
+
 // A Frame is the base interface implemented by all frame types.
 // Callers will generally type-assert the specific frame type:
 // *HeadersFrame, *SettingsFrame, *WindowUpdateFrame, etc.
 //
 // Frames are only valid until the next call to Framer.ReadFrame.
 type http2Frame interface {
+	Header() http2FrameHeader
+
+	// invalidate is called by Framer.ReadFrame to make this
+	// frame's buffers as being invalid, since the subsequent
+	// frame will reuse them.
+	invalidate()
 }
 
 // A Framer reads and writes Frames.
 type http2Framer struct {
-	r io.Reader
-	// lastFrame Frame
-	// errDetail error
+	r         io.Reader
+	lastFrame http2Frame
+	errDetail error
 
 	// countError is a non-nil func that's called on a frame parse
 	// error with some unique error path token. It's initialized
@@ -873,7 +971,7 @@ type http2Framer struct {
 	// lastHeaderStream uint32
 
 	maxReadSize uint32
-	// headerBuf   [frameHeaderLen]byte
+	headerBuf   [http2frameHeaderLen]byte
 
 	// TODO: let getReadBuf be configurable, and use a less memory-pinning
 	// allocator in server.go to minimize memory pinned for many idle conns.
@@ -925,7 +1023,7 @@ type http2Framer struct {
 	debugReadLoggerf  func(string, ...interface{})
 	debugWriteLoggerf func(string, ...interface{})
 
-	// frameCache *frameCache // nil if frames aren't reused (default)
+	frameCache *http2frameCache // nil if frames aren't reused (default)
 }
 
 func (f *http2Framer) startWrite(ftype http2FrameType, flags http2Flags, streamID uint32) {
@@ -995,6 +1093,17 @@ const (
 	http2maxFrameSize    = 1<<24 - 1
 )
 
+type http2frameCache struct {
+	dataFrame http2DataFrame
+}
+
+func (fc *http2frameCache) getDataFrame() *http2DataFrame {
+	if fc == nil {
+		return &http2DataFrame{}
+	}
+	return &fc.dataFrame
+}
+
 // NewFramer returns a Framer that writes frames to w and reads them from r.
 func http2NewFramer(w io.Writer, r io.Reader) *http2Framer {
 	fr := &http2Framer{
@@ -1032,6 +1141,48 @@ func (fr *http2Framer) SetMaxReadFrameSize(v uint32) {
 // sends a frame that is larger than declared with SetMaxReadFrameSize.
 var http2ErrFrameTooLarge = errors.New("http2: frame too large")
 
+// A DataFrame conveys arbitrary, variable-length sequences of octets
+// associated with a stream.
+// See https://httpwg.org/specs/rfc7540.html#rfc.section.6.1
+type http2DataFrame struct {
+	http2FrameHeader
+	data []byte
+}
+
+func http2parseDataFrame(fc *http2frameCache, fh http2FrameHeader, countError func(string), payload []byte) (http2Frame, error) {
+	if fh.StreamID == 0 {
+		// DATA frames MUST be associated with a stream. If a
+		// DATA frame is received whose stream identifier
+		// field is 0x0, the recipient MUST respond with a
+		// connection error (Section 5.4.1) of type
+		// PROTOCOL_ERROR.
+		countError("frame_data_stream_0")
+		return nil, http2connError{http2ErrCodeProtocol, "DATA frame with stream ID 0"}
+	}
+	f := fc.getDataFrame()
+	f.http2FrameHeader = fh
+
+	var padSize byte
+	if fh.Flags.Has(http2FlagDataPadded) {
+		var err error
+		payload, padSize, err = http2readByte(payload)
+		if err != nil {
+			countError("frame_data_byte_short")
+			return nil, err
+		}
+	}
+	if int(padSize) > len(payload) {
+		// If the length of the padding is greater than the
+		// length of the frame payload, the recipient MUST
+		// treat this as a connection error.
+		// Filed: https://github.com/http2/http2-spec/issues/610
+		countError("frame_data_pad_too_big")
+		return nil, http2connError{http2ErrCodeProtocol, "pad size larger than data payload"}
+	}
+	f.data = payload[:len(payload)-int(padSize)]
+	return f, nil
+}
+
 // WriteSettings writes a SETTINGS frame with zero or more settings
 // specified and the ACK bit not set.
 //
@@ -1054,6 +1205,17 @@ func (f *http2Framer) WriteGoAway(maxStreamID uint32, code http2ErrCode, debugDa
 	return f.endWrite()
 }
 
+// An UnknownFrame is the frame type returned when the frame type is unknown
+// or no specific frame type parser exists.
+type http2UnknownFrame struct {
+	http2FrameHeader
+	p []byte
+}
+
+func http2parseUnknownFrame(_ *http2frameCache, fh http2FrameHeader, countError func(string), p []byte) (http2Frame, error) {
+	return &http2UnknownFrame{fh, p}, nil
+}
+
 // WriteWindowUpdate writes a WINDOW_UPDATE frame.
 // The increment value must be between 1 and 2,147,483,647, inclusive.
 // If the Stream ID is zero, the window update applies to the
@@ -1066,6 +1228,13 @@ func (f *http2Framer) WriteWindowUpdate(streamID uint32, incr uint32) error {
 	f.startWrite(http2FrameWindowUpdate, 0, streamID)
 	f.writeUint32(incr)
 	return f.endWrite()
+}
+
+func http2readByte(p []byte) (remain []byte, b byte, err error) {
+	if len(p) == 0 {
+		return nil, 0, io.ErrUnexpectedEOF
+	}
+	return p[1:], p[0], nil
 }
 
 var http2DebugGoroutines = os.Getenv("DEBUG_HTTP2_GOROUTINES") == "1"
@@ -1271,6 +1440,13 @@ var http2settingName = map[http2SettingID]string{
 	http2SettingMaxFrameSize:         "MAX_FRAME_SIZE",
 	http2SettingMaxHeaderListSize:    "MAX_HEADER_LIST_SIZE",
 }
+
+// A gate lets two goroutines coordinate their activities.
+type http2gate chan struct{}
+
+func (g http2gate) Done() { g <- struct{}{} }
+
+func (g http2gate) Wait() { <-g }
 
 // bufferedWriter is a buffered writer that writes to w.
 // Its buffered writer is lazily allocated as needed, to minimize
@@ -1955,6 +2131,8 @@ func (sc *http2serverConn) serve() {
 		sc.idleTimer = time.AfterFunc(sc.srv.IdleTimeout, sc.onIdleTimer)
 		defer sc.idleTimer.Stop()
 	}
+
+	// go sc.readFrames() // closed by defer sc.Conn.Close above
 }
 
 type http2serverMessage int
